@@ -1,0 +1,21 @@
+{
+  "name": "omo-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "bun": ">=1.3.0" },
+  "scripts": {
+    "build": "bun build src/web/app.ts --target browser --outdir dist --minify",
+    "start": "bun run build && bun src/main.ts",
+    "check": "tsc --noEmit",
+    "test": "bun test",
+    "verify:native": "bun scripts/verify-native.ts"
+  },
+  "dependencies": {
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.0",
+    "typescript": "^5.9.3"
+  }
+}
