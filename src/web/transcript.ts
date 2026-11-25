@@ -215,6 +215,10 @@ type RenderInput = {
 };
 const pageSize = 80;
 
+type TraceTargets = {
+  readonly user?: HTMLElement; readonly assistant?: HTMLElement; readonly tool?: HTMLElement;
+};
+
 export class Transcript {
   private readonly cache = new Map<string, Cached>();
   private readonly openFolds = new Map<string, readonly number[]>();
@@ -232,9 +236,14 @@ export class Transcript {
   private displayed?: readonly TranscriptEntry[];
   private indexed?: readonly TranscriptEntry[];
   private indexedLength = 0;
+  private trace?: (targets: TraceTargets) => void;
 
   constructor(private readonly root: HTMLElement, private readonly scroller: HTMLElement, private readonly empty: HTMLElement) {
     this.status.setAttribute("role", "status");
+  }
+
+  observeTrace(update: (targets: TraceTargets) => void): void {
+    this.trace = update;
   }
 
   reset(): void {
@@ -254,6 +263,7 @@ export class Transcript {
     this.status.textContent = "";
     this.empty.hidden = false;
     this.scroller.scrollTop = 0;
+    this.trace?.({});
   }
 
   render(entries: readonly TranscriptEntry[], liveKey: string, tools: ReadonlyMap<string, ToolTrace>, forceBottom = false): void {
@@ -286,9 +296,10 @@ export class Transcript {
     const { entries, liveKey, tools } = this.latest;
     const { scrollTop, scrollHeight, clientHeight } = this.scroller;
     const active = document.activeElement;
-    const toolFocus = active instanceof HTMLElement && this.root.contains(active) && active.closest(".tool-details") ? active : undefined;
+    const rowFocus = active instanceof HTMLElement && this.root.contains(active)
+      && (active.closest(".tool-details") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
     const nearEnd = scrollHeight - clientHeight - scrollTop < 72;
-    const follow = this.forceBottom || (nearEnd && !toolFocus);
+    const follow = this.forceBottom || (nearEnd && !rowFocus);
     this.forceBottom = false;
     const boundary = expand && this.older.nextElementSibling instanceof HTMLElement ? this.older.nextElementSibling : undefined;
     const previousTop = boundary?.getBoundingClientRect().top;
@@ -344,6 +355,7 @@ export class Transcript {
       this.cache.delete(key);
     }
     const usedTools = new Set<string>();
+    let latestTool: HTMLElement | undefined;
     const renderTool = (key: string, call?: Wire, tool?: ToolTrace, result?: Wire): HTMLElement | undefined => {
       if (usedTools.has(key)) return;
       usedTools.add(key);
@@ -354,6 +366,9 @@ export class Transcript {
         this.toolViews.set(key, view);
       }
       view.update(call, tool, result);
+      if (this.trace && (tool?.id || str(call?.id) || str(call?.name) || str(result?.toolCallId) || str(result?.toolName))) {
+        latestTool = view.node;
+      }
       return view.node;
     };
     if (this.older.parentNode !== this.root) this.root.prepend(this.status, this.older);
@@ -361,6 +376,8 @@ export class Transcript {
     const label = `加载更早消息（${this.start} 条）`;
     if (this.older.textContent !== label) this.older.textContent = label;
     let next = this.older.nextElementSibling;
+    let latestUser: HTMLElement | undefined;
+    let latestAssistant: HTMLElement | undefined;
     for (const row of rows) {
       const after = next?.nextElementSibling ?? null;
       const { message } = row;
@@ -375,6 +392,14 @@ export class Transcript {
           const result = this.results.get(id);
           return renderTool(id ? `id:${id}` : `part:${row.key}:${index}`, part, tools.get(id), result === undefined ? undefined : entries[result]?.message);
         });
+        if (this.trace && (message.role === "user" || message.role === "assistant")) {
+          const rendered = this.cache.get(row.key)?.view.parts;
+          if (rendered?.some(({ part, node }) => node && part.type !== "toolCall" && part.type !== "thinking"
+            && (part.type !== "text" || str(part.text).trim()))) {
+            if (message.role === "user") latestUser = node;
+            else latestAssistant = node;
+          }
+        }
       }
       if (!node) continue;
       if (next && next.parentNode !== this.root) next = after;
@@ -386,8 +411,9 @@ export class Transcript {
       view.node.remove();
       this.toolViews.delete(key);
     }
-    if (toolFocus && document.activeElement === document.body && this.root.contains(toolFocus)) toolFocus.focus({ preventScroll: true });
+    if (rowFocus && document.activeElement === document.body && this.root.contains(rowFocus)) rowFocus.focus({ preventScroll: true });
     this.empty.hidden = total > 0;
+    this.trace?.({ user: latestUser, assistant: latestAssistant, tool: latestTool?.querySelector("summary") ?? undefined });
     if (expand) {
       if (loaded) this.status.textContent = `已加载 ${loaded} 条更早消息。`;
       if (boundary && this.root.contains(boundary) && previousTop !== undefined) {

@@ -21,6 +21,12 @@ const dialog = (id: string) => byId(id, HTMLDialogElement);
 const api = new Api();
 const stream = new Transcript(box("messages"), box("transcript"), box("no-messages"));
 const interactions = new Interactions(box("interactions"));
+const trace = box("session-trace");
+const traceControls = {
+  user: btn("trace-jump-user"), assistant: btn("trace-jump-assistant"),
+  tool: btn("trace-jump-tool"), request: btn("jump-to-request"),
+};
+const traceTargets = new Map<HTMLButtonElement, HTMLElement>();
 const prompt = byId("prompt", HTMLTextAreaElement);
 const mode = sel("prompt-mode");
 const chooser = dialog("new-dialog");
@@ -447,6 +453,19 @@ function syncSelect(node: HTMLSelectElement, choices: readonly (readonly [string
   if (node.selectedIndex < 0) node.value = "";
 }
 
+function setTraceTarget(control: HTMLButtonElement, target?: HTMLElement): void {
+  const before = traceTargets.get(control);
+  if (before === target) return;
+  before?.removeAttribute("id");
+  if (target) {
+    const destination = control.getAttribute("aria-controls");
+    if (destination) target.id = destination;
+    traceTargets.set(control, target);
+  } else traceTargets.delete(control);
+  control.hidden = !target;
+  trace.hidden = box("active-session").hidden || !traceTargets.size;
+}
+
 function renderView(): void {
   const view = current;
   const session = view?.session;
@@ -457,6 +476,10 @@ function renderView(): void {
   box("welcome").hidden = Boolean(view);
   box("inactive-session").hidden = !view || available;
   box("active-session").hidden = !available;
+  if (!available) {
+    trace.hidden = true;
+    for (const control of Object.values(traceControls)) setTraceTarget(control);
+  }
   box("composer-shell").hidden = !available;
   prompt.disabled = !available || session?.active !== true;
   const title = box("session-title");
@@ -574,10 +597,10 @@ function renderView(): void {
   box("activity-row").hidden = !activity;
   box("activity-row").dataset.pending = String(view.requests.size > 0);
   if (box("activity").textContent !== activity) box("activity").textContent = activity;
-  btn("jump-to-request").hidden = !view.requests.size;
   notice(box("compose-error"), (commandMode ? draft.commandError : draft.error) || view.optionsError ||
     (!manager.open && release?.status === "failed" ? release.error : ""));
   interactions.render(view.requests, online && !pending, (id, answer) => answerRequest(view, id, answer));
+  setTraceTarget(traceControls.request, interactions.first);
 }
 
 function requestsFrom(state: Wire): Map<string, Wire> {
@@ -1723,12 +1746,17 @@ function listen(): void {
     const view = current;
     if (view) void runAction(view, { action: "abort" }, "停止", text => { draftFor(view.session.id).error = text; renderView(); });
   });
-  btn("jump-to-request").addEventListener("click", () => {
-    const first = box("interactions").querySelector("form");
-    if (!first) return;
-    first.tabIndex = -1;
-    first.focus();
-    first.scrollIntoView({ block: "nearest" });
+  stream.observeTrace(({ user, assistant, tool }) => {
+    setTraceTarget(traceControls.user, user);
+    setTraceTarget(traceControls.assistant, assistant);
+    setTraceTarget(traceControls.tool, tool);
+  });
+  for (const control of Object.values(traceControls)) control.addEventListener("click", () => {
+    const target = traceTargets.get(control);
+    if (trace.hidden || !target?.isConnected) return;
+    if (target.tagName !== "SUMMARY") target.tabIndex = -1;
+    target.focus({ preventScroll: true });
+    target.scrollIntoView({ block: "nearest", inline: "nearest" });
   });
   sel("model").addEventListener("change", () => {
     const view = current;

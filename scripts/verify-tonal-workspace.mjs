@@ -15,6 +15,8 @@ const evidence = resolve(process.env.OMO_WORKSPACE_EVIDENCE ?? "artifacts/qa/ton
 const detectorPath = process.env.OMO_WORKSPACE_DETECT;
 const detector = detectorPath ? await import(pathToFileURL(resolve(detectorPath)).href) : undefined;
 const phase = process.argv.includes("--baseline") ? "before" : "after";
+const assertTrace = phase === "after" && !process.argv.includes("--measure-ledger-baseline");
+const mobileNarrow = { width: 320, height: 740, deviceScaleFactor: 1, mobile: true, hasTouch: true };
 const root = await mkdtemp(join(tmpdir(), "omo-tonal-workspace-"));
 const cwd = join(root, "workspace");
 const storageRoot = join(root, "profile");
@@ -68,6 +70,16 @@ try {
     assert.equal(layout.document, 0, `Page scrolls horizontally at ${layout.width}px`);
     assert.equal(layout.transcript, 0, `Transcript scrolls horizontally at ${layout.width}px`);
   };
+  const assertTraceTargets = async (count) => {
+    const controls = await page.evaluate(() => [...document.querySelectorAll("#session-trace button:not([hidden])")]
+      .map(control => {
+        const { width, height, left, right } = control.getBoundingClientRect();
+        return { width, height, left, right, viewport: innerWidth };
+      }));
+    assert.equal(controls.length, count);
+    assert(controls.every(({ width, height, left, right, viewport }) => width >= 44 && height >= 44 && left >= 0 && right <= viewport),
+      "Each live mobile trace target is an on-screen touch target at least 44px square");
+  };
   const capture = async (name) => {
     await assertNoOverflow();
     for (const theme of ["light", "dark"]) {
@@ -110,6 +122,26 @@ try {
   await visible("#messages .tool-details[data-state=running]");
   await page.locator("#prompt").fill("待原生确认后，继续核对配置。");
   await capture("desktop-awaiting-approval");
+  const density = await page.evaluate(() => Object.fromEntries(
+    ["#transcript", "#composer-shell", "#interactions form", "#session-list .session-link"]
+      .map(selector => [selector, Math.round(document.querySelector(selector).getBoundingClientRect().height)]),
+  ));
+  await Bun.write(join(evidence, "pending-desktop-dimensions.json"), JSON.stringify(density, null, 2));
+  console.log("WORKSPACE_DENSITY", JSON.stringify(density));
+  if (assertTrace) {
+    const trace = await page.evaluate(() => document.querySelector("#session-trace")?.getClientRects().length);
+    assert(trace, "Active transcript exposes a session trace, not just stacked messages");
+    assert(density["#transcript"] >= 593 && density["#composer-shell"] <= 213 && density["#interactions form"] <= 236,
+      `Desktop should keep at least 593px for the transcript and compact the composer and approval: ${JSON.stringify(density)}`);
+    await page.locator("#trace-jump-user").press("Enter");
+    assert(await page.evaluate(() => document.activeElement.matches("#messages .message--user")),
+      "The trace focuses the actual recent user message");
+    await page.locator("#trace-jump-tool").press("Enter");
+    assert(await page.evaluate(() => document.activeElement.matches("#messages .tool-details summary") &&
+      document.activeElement.closest("details").dataset.state === "running" && !document.activeElement.closest("details").open),
+    "The trace points to the actual running tool, without expanding it");
+    assert.equal(await page.evaluate(() => document.querySelector("#prompt").value), "待原生确认后，继续核对配置。");
+  }
   await open();
   await capture("desktop-inspector");
   const desktop = await page.evaluate(() => {
@@ -162,6 +194,10 @@ try {
   assert.equal(await page.evaluate(() => document.querySelector("#details-dialog").open), false);
   assert.equal(await page.evaluate(() => document.activeElement.id), "details-button");
   assert.equal(await page.evaluate(() => document.querySelector("#prompt").value), "审批完成后再发送的草稿");
+  if (assertTrace) {
+    const height = await page.evaluate(() => document.querySelector("#session-trace").getBoundingClientRect().height);
+    assert(height <= 46, `At 390px the pending trace fits in one 44px control row, got ${height}px`);
+  }
   await capture("phone-awaiting-approval");
   await click("#jump-to-request");
   assert(await page.evaluate(() => document.activeElement.matches("#interactions form")));
@@ -174,7 +210,7 @@ try {
   await open();
   await close();
 
-  await omowright.emulate(page, { width: 320, height: 740, deviceScaleFactor: 1, mobile: true, hasTouch: true });
+  await omowright.emulate(page, mobileNarrow);
   await assertNoOverflow();
   const metrics = await page.evaluate(() => {
     const send = document.querySelector("#stop").getBoundingClientRect();
@@ -183,11 +219,39 @@ try {
   });
   assert(metrics.stopWidth >= 44 && metrics.stopHeight >= 44 && metrics.composerBottom <= metrics.viewport,
     "Stop remains a reachable touch target and fits at 320px");
+  if (assertTrace) await assertTraceTargets(3);
   await page.locator(".request-form select").selectOption("Deny");
   await click(".request-form button[type=submit]");
   await visible("#messages", "Synthetic approval settled.");
   assert.equal(await page.evaluate(() => document.querySelector(".request-form")), null);
   assert.equal(await page.evaluate(() => document.querySelector("#prompt").value), "审批完成后再发送的草稿");
+  if (assertTrace) {
+    await omowright.emulate(page, "desktop-1440");
+    await capture("desktop-settled");
+    await visible("#trace-jump-assistant:not([hidden])");
+    await page.locator("#trace-jump-assistant").press("Enter");
+    assert(await page.evaluate(() => document.activeElement.matches("#messages .message") &&
+      document.activeElement.textContent.includes("Synthetic approval settled.")),
+    "The reply target points to the actual settled assistant message");
+    assert.equal(await page.evaluate(() => document.querySelector("#jump-to-request").getClientRects().length), 0,
+      "Resolved approvals are not left in the trace");
+    await page.locator("#prompt").fill("再次确认后执行。tool-lifecycle-approval");
+    await click("#send:not(:disabled)");
+    await visible("#interactions", "Synthetic write approval");
+    await omowright.emulate(page, mobileNarrow);
+    await assertNoOverflow();
+    await assertTraceTargets(4);
+    const height = await page.evaluate(() => document.querySelector("#session-trace").getBoundingClientRect().height);
+    assert(height <= 46, `At 320px four trace targets fit one 44px control row, got ${height}px`);
+    await omowright.emulate(page, "desktop-1440");
+    await click("#new-sidebar:not(:disabled)");
+    await page.locator("#new-name").fill("隔离的新会话");
+    await click("#create:not(:disabled)");
+    await visible("#session-title", "隔离的新会话");
+    await visible("#no-messages");
+    assert.equal(await page.evaluate(() => document.querySelector("#trace-jump-tool").getClientRects().length), 0,
+      "A new session never keeps a tool target from the previous session");
+  }
   console.log("TONAL_WORKSPACE_BROWSER_OK desktop-inspector-nonmodal four-views phone-modal focus-restored draft-preserved reflow-320 approval-settled");
 } finally {
   try { await browser?.close(); } finally {

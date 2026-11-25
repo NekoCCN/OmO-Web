@@ -22,11 +22,17 @@ const format = (value: unknown): string => {
 };
 const bool = (value: unknown): string => typeof value === "boolean" ? value ? "开启" : "关闭" : "";
 
-function values(pairs: readonly (readonly [string, string])[]): HTMLElement {
+function values(pairs: readonly (readonly [string, string])[], sharedUnavailable = false): HTMLElement {
   const result = el("dl", "details-list small numerical");
   for (const [label, value] of pairs) if (value) {
     const unreported = value === NO_SIGNAL || value === "未报告" || value === "已报告，无数值";
-    result.append(el("dt", "", label), el("dd", unreported ? "metric-unreported" : "", value));
+    const cell = el("dd", unreported ? "metric-unreported" : "");
+    if (sharedUnavailable && value === NO_SIGNAL) {
+      const dash = el("span", "", "—");
+      dash.setAttribute("aria-hidden", "true");
+      cell.append(dash, el("span", "sr-only", NO_SIGNAL));
+    } else cell.textContent = value;
+    result.append(el("dt", "", label), cell);
   }
   return result.childElementCount ? result : el("p", "small muted", "当前没有可用数据。");
 }
@@ -39,7 +45,7 @@ function part(title: string, ...children: Node[]): HTMLElement {
 
 function metricGroup(title: string, rows: readonly (readonly [string, string])[]): HTMLElement {
   const group = el("div", "metric-group stack");
-  group.append(el("p", "metric-label small", title), values(rows));
+  group.append(el("p", "metric-label small", title), values(rows, true));
   return group;
 }
 
@@ -112,6 +118,9 @@ function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
       ["本会话内核堆", kernelHeap !== undefined ? formatBytes(kernelHeap) : (memoryKnown ? "未报告" : NO_SIGNAL)],
       ["本会话内核数", kernelCount !== undefined ? format(kernelCount) : (memoryKnown ? "未报告" : NO_SIGNAL)],
     ]));
+  if (section.querySelector(".metric-unreported [aria-hidden='true']")) {
+    section.append(el("p", "metric-key small", "— 表示原生未报告"));
+  }
   section.classList.add("runtime-metrics");
   return section;
 }

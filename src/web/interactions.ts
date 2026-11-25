@@ -62,22 +62,23 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   const method = str(request.method);
   const title = str(request.title);
   const permission = Boolean(request.toolCallId) && method !== "question";
-  const node = el("form", "panel stack request-form");
+  const node = el("form", "request-form");
   const label = method === "question" ? "待回答问题" : permission ? "工具批准" : "等待你的决定";
-  const heading = el("h2", "", label);
-  node.append(heading);
-  if (title) node.append(el("p", "plain", title));
-  if (str(request.message)) node.append(el("p", "plain muted", str(request.message)));
+  node.setAttribute("aria-label", label);
+  const heading = el(title ? "p" : "h2", "request-kind", label);
+  const copy = el("div", "request-copy");
+  if (title) copy.append(el("h2", "plain request-title", title));
+  if (str(request.message)) copy.append(el("p", "plain", str(request.message)));
   const remote = object(request.remoteOrigin);
   const origin = str(remote.deviceName) || str(remote.deviceId);
-  if (origin) node.append(el("p", "small muted break", `请求设备：${origin}`));
-  if (permission) node.append(el("p", "small muted path", `工具调用：${str(request.toolCallId)}`));
+  if (origin) copy.append(el("p", "small muted break", `请求设备：${origin}`));
+  if (permission) copy.append(el("p", "small muted path", `工具调用：${str(request.toolCallId)}`));
 
-  const fields = el("div", "stack stack--tight");
+  const fields = el("div", "stack stack--tight request-fields");
   const status = el("p", "notice error small");
   status.setAttribute("role", "alert");
   status.hidden = true;
-  const actions = el("div", "row");
+  const actions = el("div", "row request-actions");
   let sending = false;
   const send = async (answer: Answer) => {
     if (sending || node.dataset.offline === "true") return;
@@ -145,7 +146,11 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
     if (answer) void send(answer);
     else notice(status, "请至少填写一项回答或选择一个操作。");
   });
-  node.append(fields, status, actions);
+  const controls = el("div", method === "select" ? "request-controls request-controls--choice" : "request-controls");
+  controls.append(fields, actions);
+  const body = el("div", "request-body");
+  body.append(copy, controls, status);
+  node.append(heading, body);
   return node;
 }
 
@@ -153,6 +158,10 @@ export class Interactions {
   private readonly nodes = new Map<string, HTMLFormElement>();
 
   constructor(private readonly root: HTMLElement) {}
+
+  get first(): HTMLFormElement | undefined {
+    return this.nodes.values().next().value;
+  }
 
   render(requests: ReadonlyMap<string, Wire>, online: boolean, submit: Submit): void {
     for (const [id, node] of this.nodes) if (!requests.has(id)) {

@@ -70,6 +70,17 @@
           </button>
         </div>
       </header>
+      <nav id="session-trace" class="session-trace" aria-labelledby="session-trace-label" hidden>
+        <div class="trace-inner">
+          <span id="session-trace-label">会话轨迹</span>
+          <div class="trace-links">
+            <button type="button" class="button button--quiet trace-node" id="trace-jump-user" aria-label="跳至最近的用户输入" aria-controls="trace-entry-user" hidden>输入</button>
+            <button type="button" class="button button--quiet trace-node" id="trace-jump-assistant" aria-label="跳至最近的助手回复" aria-controls="trace-entry-assistant" hidden>回复</button>
+            <button type="button" class="button button--quiet trace-node" id="trace-jump-tool" aria-label="跳至最近的工具摘要" aria-controls="trace-entry-tool" hidden>工具</button>
+            <button type="button" class="button button--quiet trace-node" id="jump-to-request" aria-controls="trace-entry-request" hidden>查看待答项</button>
+          </div>
+        </div>
+      </nav>
       <div id="banner" class="banner" hidden>
         <p id="banner-text" class="error small" role="alert"></p>
         <button type="button" class="button button--quiet" id="retry">重新连接</button>
@@ -109,12 +120,11 @@
           <p id="compose-error" class="notice error small" role="alert" hidden></p>
           <div id="activity-row" class="row small activity" hidden>
             <p id="activity" role="status"></p>
-            <button type="button" class="button button--quiet" id="jump-to-request" hidden>查看待答项</button>
           </div>
           <div id="attachments" class="row attachments" aria-label="待发送图片" hidden></div>
           <div class="compose-box">
             <label for="prompt" id="prompt-label" class="sr-only">消息</label>
-            <textarea id="prompt" rows="2" placeholder="输入消息…" aria-describedby="composer-hint"></textarea>
+            <textarea id="prompt" rows="1" placeholder="输入消息…" aria-describedby="composer-hint"></textarea>
             <div class="compose-toolbar">
               <button class="button button--quiet mobile-only" id="compose-options-button" type="button" aria-expanded="false" aria-controls="compose-options">选项</button>
               <div class="row compose-options" id="compose-options" role="group" aria-label="模型、思考与发送方式">
