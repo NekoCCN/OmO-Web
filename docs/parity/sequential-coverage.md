@@ -8,10 +8,12 @@
 
 | 能力 | 当前证据 | 结论边界 |
 | --- | --- | --- |
-| 启动主工作台的私有原生宿主 | 隔离 `HOME` 与 profile、实际 `src/main.ts`、真实 OmO；浏览器 API 能创建会话；关服务后私有 socket 目录消失（`PRODUCTION_ENTRY_NATIVE_OK`、`PRODUCTION_ENTRY_CLEAN_EXIT_OK`） | 不是共享宿主、多端并发或新版本兼容证明。 |
+| 启动主工作台的私有原生宿主 | 隔离 `HOME` 与 profile、实际 `src/main.ts`、真实 OmO；默认使用非监听的私有 stdio 宿主，普通 CLI 不会自动附着到 Web 宿主。 | 共享的是原生日志，不是同一个运行中的宿主。不是任意进程都必须遵守的文件锁。 |
 | 在 Web 主输入框使用内建 slash | 隔离的真实 Chromium → Web → OmO。`/name` 改名；`/session` 打开详情；`/fork` 呈现实际可选用户消息；`/copy` 将原生最后一条助手回复写入并读回 Chromium 剪贴板；`/thinking` 改变当前档位且未改写 profile；`/settings` 拒绝，整个场景只有一条普通消息进入回环模型 | 确认这些行为；其余命令形式不能套用此浏览器结果。 |
-| 同一对话顺序换端 | `scripts/verify-session-handoff.ts --browser --slash` 实际点击两个 Web 入口，和真实 CLI 来回换端。验证同 ID 和日志、活跃持有者拒绝、忙时交接拒绝、服务重启、原生改名、选中分支、每条用户输入仅一次；执行返回的终端命令时，即使有不同的继承配置也能进入原 profile | Web 创建时默认仍用 Web 存储目录；用 Web 提供的 `omo --session` 命令进入该会话。不是 `/resume` 暂停引擎回合的等价，也不把 CLI 手动操作算成 Web 能力。 |
+| 同一对话顺序换端 | `scripts/verify-session-handoff.ts --browser --slash` 验证双方持有时拒绝另一端进入、忙时拒绝交接，以及换端后同 ID、日志与活动分支。普通侧栏可只读发现 CLI 会话；Web 新建的默认原生日志也能被同 profile 的 `omo -c` 或会话选择器发现。 | 需要默认原生日志布局；既有 Web 私有日志不自动迁移，自定义 `sessionDir` 不共享。用「转到 CLI」先释放 Web 持有，再在终端打开。 |
 | 从续聊中的 CLI 原会话 Fork / Clone | 同一脚本实际使用 CLI 来源的原生选点，得到两个独立 Web 会话；Fork 只回填草稿，Clone 含当前上下文，源文件字节未变、没有额外模型请求 | 分支与复制会产生新会话；与复用原会话是两种不同操作。 |
+| 原生审批模式与人类提问 | 在真实 Chromium 切换询问、Auto、无审批；验证取消确认不生效、项目内外操作不同、无审批仍需手动回答原生结构化问题，关闭后重新打开恢复询问。 | 不改全局配置，不代答，不把 Auto 当沙箱。 |
+| 运行视图 | 主工作台直达 Subagent、DAG、Todo；隔离浏览器使用实际 CLI Todo 与原生 CTX、堆内存、缓存计数，另以隔离任务数据验证 Subagent/DAG 快照。 | 快照只读；长期记忆仅显示当前分支的已记录召回状态，不是 CLI `MEMORY` 的完整工作区面板。 |
 
 现有 Web 仍不是全量 TUI 替代：原生登录/凭据、共享与发布、全局设置和扩展安装、任意 TUI 组件、后台调度与整套管理命令等并没有作为普通 Web 能力交付。本机终端路径不计作 Web 覆盖。
 

@@ -3,6 +3,7 @@ import { appendFile, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, syml
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { sessionDirName } from "../src/cli-history.ts";
 import { Engine } from "../src/engine.ts";
 import type { EngineStatus } from "../src/engine.ts";
 import { WebError } from "../src/protocol.ts";
@@ -14,6 +15,7 @@ const httpFixture = fileURLToPath(new URL("./session-handoff-engine-fixture.ts",
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   delete process.env.SESSION_HANDOFF_HELD;
+  delete process.env.SESSION_HANDOFF_PROFILE;
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
@@ -46,16 +48,17 @@ async function prepareDirs() {
   return { root, agent, cwd };
 }
 
-async function launchHttp(held: readonly string[] = []) {
+async function launchHttp(held: readonly string[] = [], { profile = true } = {}) {
   const { root, agent, cwd } = await prepareDirs();
   if (held.length) process.env.SESSION_HANDOFF_HELD = held.join(",");
+  if (profile) process.env.SESSION_HANDOFF_PROFILE = agent;
   const dataDir = join(root, "web");
   const app = await startApp({
     dataDir,
     workspaces: [cwd],
     engineCommand: [process.execPath, httpFixture],
     port: 0,
-    cliAgentDir: agent,
+    ...(profile ? { cliAgentDir: agent } : {}),
   });
   cleanups.push(() => app.stop());
   const origin = app.url.origin;
@@ -69,22 +72,60 @@ async function launchHttp(held: readonly string[] = []) {
 }
 
 describe("sequential handoff HTTP routes", () => {
-  test("shared transport fails resume and handoff closed without publishing", async () => {
-    const client = await launchHttp();
+  test("without a profile, history is unavailable and handoff stays closed", async () => {
+    const client = await launchHttp([], { profile: false });
     const nativeId = crypto.randomUUID();
-    const source = await journal(client.agent, client.cwd, nativeId, "CLI seed", "http-seed");
-    expect(source).toContain(".jsonl");
+    await journal(client.agent, client.cwd, nativeId, "CLI seed", "http-seed");
+    const history = await (await client.get("/api/cli-history")).json();
+    expect(history).toEqual({ available: false, sessions: [] });
+    expect(client.bootstrap.handoff).toEqual({ supported: false, reason: "shared_transport" });
+    const created = await client.post("/api/sessions", { cwd: client.cwd, name: "private born" });
+    expect(created.status).toBe(201);
+    const webId = String((await created.json()).session.id);
+    const handoff = await client.post(`/api/sessions/${webId}/handoff`, {});
+    expect(handoff.status).toBe(409);
+    expect((await handoff.json()).code).toBe("handoff_unsupported");
+    expect((await (await client.get("/api/sessions")).json()).sessions).toHaveLength(1);
+    const journals = (await readdir(client.dataDir)).filter(name => name.endsWith(".jsonl"));
+    expect(journals).toEqual([`${webId}.jsonl`]);
+  });
+
+  test("private stdio shares one journal from Web create to CLI resume and back", async () => {
+    const client = await launchHttp();
+    expect(client.bootstrap.handoff).toEqual({ supported: true });
+    const created = await client.post("/api/sessions", { cwd: client.cwd, name: "web born" });
+    expect(created.status).toBe(201);
+    const webId = String((await created.json()).session.id);
+    // The runtime places the journal itself in the native bucket, not the Web store.
+    const bucket = join(client.agent, "sessions", sessionDirName(client.cwd));
+    const journals = (await readdir(bucket)).filter(name => name.endsWith(".jsonl"));
+    expect(journals).toHaveLength(1);
+    const prompt = await client.post(`/api/sessions/${webId}/actions`,
+      { action: "prompt", message: "web turn", clientMessageId: crypto.randomUUID() });
+    expect(prompt.status).toBe(200);
+    expect(await (await client.get(`/api/sessions/${webId}/last-assistant`)).json())
+      .toEqual({ text: "Echo: web turn" });
+    const thinking = await client.post(`/api/sessions/${webId}/actions`, { action: "thinking", level: "low" });
+    expect(thinking.status).toBe(200);
+    // Plain release answers attached (the native miscount); the scoped force
+    // retry releases quietly and returns a quoted local command.
+    const handoff = await client.post(`/api/sessions/${webId}/handoff`, {});
+    expect(handoff.status).toBe(200);
+    const receipt = await handoff.json();
+    expect(receipt.command).toContain(join(bucket, journals[0]));
+    expect((await (await client.get("/api/sessions")).json()).sessions[0])
+      .toMatchObject({ id: webId, active: false });
+    // The CLI picker discovers the same journal; resume coalesces the alias.
     const history = await (await client.get("/api/cli-history")).json();
     expect(history.available).toBe(true);
     expect(history.sessions).toHaveLength(1);
+    expect(history.sessions[0]).toMatchObject({ adopted: true, cwd: client.cwd });
     const opaque = String(history.sessions[0].id);
-    expect(opaque).not.toContain(nativeId);
-    expect(client.bootstrap.handoff).toEqual({ supported: false, reason: "shared_transport" });
-    const refused = await client.post(`/api/cli-history/${opaque}/resume`, {});
-    expect(refused.status).toBe(409);
-    expect((await refused.json()).code).toBe("resume_unsupported");
-    expect((await (await client.get("/api/sessions")).json()).sessions).toHaveLength(0);
-    expect(await readdir(client.dataDir)).toEqual([]);
+    const resumed = await client.post(`/api/cli-history/${opaque}/resume`, {});
+    expect(resumed.status).toBe(200);
+    expect((await resumed.json()).session.id).toBe(webId);
+    expect((await (await client.get("/api/sessions")).json()).sessions[0])
+      .toMatchObject({ id: webId, active: true });
   });
 
   test("resume rejects strict bodies and unknown keys before touching the engine", async () => {
@@ -97,7 +138,7 @@ describe("sequential handoff HTTP routes", () => {
     expect((await client.post(`/api/sessions/${crypto.randomUUID()}/handoff`, { unexpected: 1 })).status).toBe(400);
   });
 
-  test("stdio transport reports handoff unsupported while last-assistant and thinking work", async () => {
+  test("private stdio supports last-assistant, thinking, and handoff", async () => {
     const client = await launchHttp();
     const created = await client.post("/api/sessions", { cwd: client.cwd, name: "web born" });
     expect(created.status).toBe(201);
@@ -109,14 +150,14 @@ describe("sequential handoff HTTP routes", () => {
       .toEqual({ text: "Echo: web turn" });
     const thinking = await client.post(`/api/sessions/${webId}/actions`, { action: "thinking", level: "low" });
     expect(thinking.status).toBe(200);
-    const handoff = await client.post(`/api/sessions/${webId}/handoff`, {});
-    expect(handoff.status).toBe(409);
-    expect((await handoff.json()).code).toBe("handoff_unsupported");
     expect((await (await client.get(`/api/sessions/${webId}/last-assistant`)).json()).text).toContain("web turn");
+    const handoff = await client.post(`/api/sessions/${webId}/handoff`, {});
+    expect(handoff.status).toBe(200);
   });
 
   test("restart resumes the same legacy Web session without a guard", async () => {
     const { root, agent, cwd } = await prepareDirs();
+    process.env.SESSION_HANDOFF_PROFILE = agent;
     const settings = { dataDir: join(root, "web"), workspaces: [cwd],
       engineCommand: [process.execPath, httpFixture] as [string, ...string[]], port: 0, cliAgentDir: agent };
     const first = await startApp(settings);
@@ -139,7 +180,7 @@ describe("sequential handoff HTTP routes", () => {
     try {
       const origin = second.url.origin;
       const boot = await (await fetch(`${origin}/api/bootstrap`)).json();
-      expect(boot.handoff).toEqual({ supported: false, reason: "shared_transport" });
+      expect(boot.handoff).toEqual({ supported: true });
       const [row] = (await (await fetch(`${origin}/api/sessions`,
         { headers: { Origin: origin } })).json()).sessions;
       expect(row).toMatchObject({ id, name: "Keep this title", active: false });
@@ -185,17 +226,33 @@ class HandoffEngine extends Engine {
   readonly attachedElsewhere = new Set<string>();
   readonly thinkingScopes: unknown[] = [];
   readonly setNames: { route: string; name: unknown }[] = [];
-  readonly opened: { path: string; durable: unknown }[] = [];
-  readonly releases: { route: string; reason: unknown }[] = [];
+  readonly opened: { path: string; durable: unknown; sentPath: string | undefined }[] = [];
+  readonly releases: { route: string; reason: unknown; force?: true }[] = [];
+  /** Native ids whose plain takeover release answers `attached` although the
+   * caller is the only attachment: the version-native miscount case. */
+  readonly miscounted = new Set<string>();
+  /** Per-native-id attachment counts reported by list_sessions (default 1). */
+  readonly attachCounts = new Map<string, number>();
+  listFails = false;
+  deferHeader = false;
+  readonly buffered = new Map<string, { header: Record<string, unknown>; name?: unknown }>();
+  forceBusy = false;
+  omitDropped = false;
+  /** Native-placed opens land outside the profile bucket (unsupported layout). */
+  misplace = false;
   timeoutReleaseAfterWrite = false;
   dropRouteOnTimeout = true;
   private sequence = 0;
   override readonly capabilities = new Set<unknown>(["multi_session", "session_model_scope",
     "session_held", "release_caller_aware", "durable_session_id"]);
   override status: EngineStatus = { online: true };
-  constructor(cwd: string, private readonly privateTransport = true, caps?: readonly string[]) {
+  constructor(cwd: string, private readonly privateTransport = true, caps?: readonly string[],
+    private readonly profileDir?: string) {
     super(["never-spawned"], cwd, () => undefined, () => undefined);
     if (caps !== undefined) this.capabilities = new Set<unknown>(caps);
+  }
+  override get isPrivateHost(): boolean {
+    return this.privateTransport;
   }
   override get usesPrivateSocketTransport(): boolean {
     return this.privateTransport;
@@ -220,7 +277,10 @@ class HandoffEngine extends Engine {
     return last && typeof last.id === "string" ? String(last.id) : null;
   }
   private async stateOf(runtime: FakeRuntime): Promise<WireObject> {
-    const { header, entries } = await this.readJournal(runtime.path);
+    const pending = this.buffered.get(runtime.path);
+    const { header, entries } = pending
+      ? { header: pending.header, entries: [{ type: "session_info", name: pending.name }] }
+      : await this.readJournal(runtime.path);
     return {
       sessionId: header.id,
       sessionFile: runtime.path,
@@ -250,8 +310,20 @@ class HandoffEngine extends Engine {
   }
   override async request(type: string, fields: WireObject = {}): Promise<WireObject> {
     if (type !== "open_session") throw new WebError(409, "engine_refused", "Unexpected fixture request.");
-    const path = String(fields.sessionPath);
     const folder = String(fields.cwd);
+    const durable = typeof fields.durableSessionId === "string" && fields.durableSessionId
+      ? String(fields.durableSessionId) : undefined;
+    const sentPath = typeof fields.sessionPath === "string" ? fields.sessionPath : undefined;
+    // A native-placed (shared) open omits sessionPath: the runtime generates the
+    // journal under the shared profile bucket and binds the durable id.
+    let path = sentPath;
+    if (path === undefined) {
+      if (!this.profileDir) throw new WebError(409, "engine_refused", "Unexpected fixture request.");
+      const bucket = join(this.profileDir, "sessions", sessionDirName(folder));
+      path = this.misplace ? join(this.profileDir, "stray.jsonl")
+        : join(bucket, `${Date.now()}_${durable ?? crypto.randomUUID()}.jsonl`);
+      await mkdir(this.misplace ? this.profileDir : bucket, { recursive: true });
+    }
     if (this.held.has(path)) throw new WebError(409, "session_held", "会话正被另一进程持有。");
     const attached = this.byPath.get(path);
     if (attached && this.routes.has(attached)) {
@@ -266,20 +338,29 @@ class HandoffEngine extends Engine {
       if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
         throw new WebError(400, "history_invalid", `无法读取来源日志：${(error as Error).message}`);
       }
-      header = { type: "session", version: 3, id: crypto.randomUUID(), timestamp: new Date().toISOString(), cwd: folder };
-      const { writeFile } = await import("node:fs/promises");
-      await writeFile(path, `${JSON.stringify(header)}\n`, { flag: "wx", mode: 0o600 });
+      header = { type: "session", version: 3, id: durable ?? crypto.randomUUID(),
+        timestamp: new Date().toISOString(), cwd: folder };
+      if (this.deferHeader && sentPath === undefined) this.buffered.set(path, { header });
+      else await writeFile(path, `${JSON.stringify(header)}\n`, { flag: "wx", mode: 0o600 });
     }
     const runtime: FakeRuntime = { path, nativeId: String(header.id), cwd: String(header.cwd),
       archived: false, settled: false, leaf: null };
     const route = `rpc-${++this.sequence}`;
     this.routes.set(route, runtime);
     this.byPath.set(path, route);
-    this.opened.push({ path, durable: fields.durableSessionId });
+    this.opened.push({ path, durable: fields.durableSessionId, sentPath });
     return { sessionId: route, attached: false, state: await this.stateOf(runtime),
       permissionPreset: "ask", permissionPresetStatus: "applied" };
   }
   override async requestExisting(type: string, fields: WireObject = {}): Promise<WireObject> {
+    // list_sessions is connection-level: it carries no session route.
+    if (type === "list_sessions") {
+      if (this.listFails) throw new WebError(409, "engine_refused", "No session list.");
+      return { sessions: [...this.routes].map(([sessionId, item]) => ({
+        sessionId, durableSessionId: item.nativeId, sessionPath: item.path, cwd: item.cwd,
+        kind: "interactive", attachments: this.attachCounts.get(item.nativeId) ?? 1,
+      })) };
+    }
     const route = String(fields.sessionId);
     const runtime = this.routes.get(route);
     if (!runtime) throw new WebError(409, "unknown_session", "Unknown test session.");
@@ -346,8 +427,13 @@ class HandoffEngine extends Engine {
         return { leafId: runtime.leaf, cancelled: false };
       }
       case "set_session_name": {
-        const { entries } = await this.readJournal(runtime.path);
         this.setNames.push({ route, name: fields.name });
+        const pending = this.buffered.get(runtime.path);
+        if (pending) {
+          pending.name = fields.name;
+          return {};
+        }
+        const { entries } = await this.readJournal(runtime.path);
         await appendFile(runtime.path, line({ type: "session_info", id: crypto.randomUUID(),
           parentId: runtime.leaf ?? this.leafOf(entries), timestamp: iso, name: fields.name }));
         return {};
@@ -363,11 +449,29 @@ class HandoffEngine extends Engine {
         return { text: this.assistantText(entries) };
       }
       case "release_session": {
-        this.releases.push({ route, reason: fields.reason });
+        this.releases.push({ route, reason: fields.reason,
+          ...(fields.force === true ? { force: true as const } : {}) });
         if (fields.reason !== "takeover") throw new WebError(409, "invalid_release_reason", "Bad reason.");
+        if (fields.force === true && fields.interrupt !== undefined) {
+          throw new WebError(409, "invalid_release_reason", "Force must never interrupt.");
+        }
         if (this.busyIds.has(runtime.nativeId)) throw new WebError(409, "turn_active", "Busy turn.");
-        if (this.attachedElsewhere.has(runtime.nativeId)) {
+        // The version-native miscount answers plain takeover release with
+        // `attached` although the caller is the only attachment; the scoped
+        // force retry is the only path that may still release this holder.
+        const claimed = this.attachedElsewhere.has(runtime.nativeId) || this.miscounted.has(runtime.nativeId);
+        if (claimed && !(fields.force === true && this.miscounted.has(runtime.nativeId))) {
           throw new WebError(409, "attached", "Another client is attached.");
+        }
+        if (fields.force === true && this.forceBusy) {
+          throw new WebError(409, "turn_active", "Native work started before release.");
+        }
+        const pending = this.buffered.get(runtime.path);
+        if (pending) {
+          await writeFile(runtime.path, line(pending.header) + line({
+            type: "session_info", id: crypto.randomUUID(), parentId: null, timestamp: iso, name: pending.name,
+          }), { flag: "wx", mode: 0o600 });
+          this.buffered.delete(runtime.path);
         }
         if (this.timeoutReleaseAfterWrite && this.dropRouteOnTimeout) {
           const { entries } = await this.readJournal(runtime.path);
@@ -386,7 +490,7 @@ class HandoffEngine extends Engine {
         this.routes.delete(route);
         if (this.byPath.get(runtime.path) === route) this.byPath.delete(runtime.path);
         return { released: true, session_path: runtime.path, attachments: [],
-          dropped: { deliveries: [], user_messages: [] } };
+          ...(this.omitDropped ? {} : { dropped: { deliveries: [], user_messages: [] } }) };
       }
       case "close_session":
         this.routes.delete(route);
@@ -424,13 +528,28 @@ async function setupSessions(privateTransport = true, caps?: readonly string[],
   const cwd = join(root, "work space");
   await mkdir(cwd, { recursive: true });
   const dataDir = join(root, "web");
-  const engine = new HandoffEngine(cwd, privateTransport, caps);
+  const engine = new HandoffEngine(cwd, privateTransport, caps, agent);
   const paths = new Map<string, string>();
   const sessions = new Sessions(dataDir, [cwd], engine, () => undefined,
     async nativeId => {
-      const sourcePath = paths.get(nativeId);
-      if (!sourcePath) throw new WebError(404, "history_not_found", "找不到这条 CLI 历史。");
-      return { sourcePath };
+      const direct = paths.get(nativeId);
+      if (direct) return { sourcePath: direct };
+      // Shared rows are resolved by durable id through the profile bucket,
+      // mirroring CliHistory.branchSource without trusting a stored path.
+      const bucket = join(agent, "sessions", sessionDirName(cwd));
+      for (const name of await readdir(bucket).catch((): string[] => [])) {
+        if (!name.endsWith(".jsonl")) continue;
+        const candidate = join(bucket, name);
+        try {
+          const header = JSON.parse((await readFile(candidate, "utf8")).split("\n", 1)[0]);
+          if (header?.type === "session" && header?.id === nativeId && header?.cwd === cwd) {
+            return { sourcePath: candidate };
+          }
+        } catch {
+          continue;
+        }
+      }
+      throw new WebError(404, "history_not_found", "找不到这条 CLI 历史。");
     },
     guard ?? { sameProfile: true, profileDir: agent });
   await sessions.load();
@@ -441,6 +560,28 @@ async function seedCli(sessions: Awaited<ReturnType<typeof setupSessions>>, nati
   const source = await journal(sessions.agent, sessions.cwd, nativeId, title, seed);
   sessions.paths.set(nativeId, source);
   return source;
+}
+
+type SetupContext = Awaited<ReturnType<typeof setupSessions>>;
+
+async function storedRow(context: SetupContext, id: string): Promise<Record<string, unknown>> {
+  return JSON.parse(await readFile(join(context.dataDir, "sessions", `${id}.json`), "utf8"));
+}
+
+/** Locate the shared-bucket journal bound to a durable id (mirrors discovery). */
+async function sharedJournal(context: SetupContext, nativeId: string): Promise<string> {
+  const bucket = join(context.agent, "sessions", sessionDirName(context.cwd));
+  for (const name of await readdir(bucket)) {
+    if (!name.endsWith(".jsonl")) continue;
+    const candidate = join(bucket, name);
+    try {
+      const header = JSON.parse((await readFile(candidate, "utf8")).split("\n", 1)[0]);
+      if (header?.type === "session" && header?.id === nativeId && header?.cwd === context.cwd) return candidate;
+    } catch {
+      continue;
+    }
+  }
+  throw new Error(`shared journal missing for ${nativeId}`);
 }
 
 async function seedCliThread(agent: string, cwd: string, id: string, title: string,
@@ -518,6 +659,7 @@ describe("sequential handoff engine wiring", () => {
     await expect(context.sessions.handoff(created.id as SessionKey)).rejects.toMatchObject({ code: "dialog_pending" });
     context.engine.dialogIds.delete(nativeId);
     context.engine.attachedElsewhere.add(nativeId);
+    context.engine.attachCounts.set(nativeId, 2);
     await expect(context.sessions.handoff(created.id as SessionKey)).rejects.toMatchObject({ code: "attached" });
     context.engine.attachedElsewhere.delete(nativeId);
     expect(context.sessions.list()[0]).toMatchObject({ id: created.id, active: true });
@@ -576,11 +718,20 @@ describe("sequential handoff engine wiring", () => {
     expect(context.sessions.list()[0]).toMatchObject({ active: false });
   });
 
-  test("web-born conversations persist the durable id at handoff and keep the branch", async () => {
+  test("shared web-born conversations persist the durable id at handoff and keep the branch", async () => {
     const context = await setupSessions();
     const created = await context.sessions.create(context.cwd, "Created in Web");
     const id = created.id as SessionKey;
-    const webStore = join(context.dataDir, "sessions", `${created.id}.jsonl`);
+    const stored = await storedRow(context, created.id);
+    expect(stored.shared).toBe(true);
+    const durable = String(stored.nativeId);
+    // The runtime places the journal itself: no path is sent, the durable id binds.
+    expect(context.engine.opened).toEqual([{ path: expect.any(String), durable, sentPath: undefined }]);
+    const webStore = await sharedJournal(context, durable);
+    expect(webStore).toContain(join("sessions", sessionDirName(context.cwd)));
+    const storeFiles = await readdir(join(context.dataDir, "sessions"));
+    expect(storeFiles.filter(name => name.endsWith(".jsonl"))).toEqual([]);
+    expect(context.sessions.findAlias(durable, context.cwd)).toBe(created.id);
     await context.sessions.action(id, { action: "resume" });
     await context.sessions.action(id, { action: "prompt", mode: "prompt", message: "first branch" });
     await context.sessions.action(id, { action: "prompt", mode: "prompt", message: "second branch" });
@@ -602,8 +753,8 @@ describe("sequential handoff engine wiring", () => {
     const firstHeader = JSON.parse(text.split("\n", 1)[0]);
     const lastHeader = JSON.parse(after.split("\n", 1)[0]);
     expect(lastHeader.id).toBe(firstHeader.id);
-    const stored = JSON.parse(await readFile(join(context.dataDir, "sessions", `${created.id}.json`), "utf8"));
     expect(typeof stored.nativeId).toBe("string");
+    expect(stored.shared).toBe(true);
   });
 
   test("uncertain release never replays and reconciles on next resume", async () => {
@@ -659,14 +810,15 @@ describe("sequential handoff engine wiring", () => {
     expect(restarted.list()[0]).toMatchObject({ active: false });
   });
 
-  test("a deleted or replaced web journal refuses instead of recreating", async () => {
+  test("a deleted or replaced shared journal refuses instead of recreating", async () => {
     const context = await setupSessions();
     const created = await context.sessions.create(context.cwd, "Web origin");
     const id = created.id as SessionKey;
     await context.sessions.action(id, { action: "resume" });
     await context.sessions.action(id, { action: "prompt", mode: "prompt", message: "origin seed" });
     await context.sessions.handoff(id);
-    const webStore = join(context.dataDir, "sessions", `${created.id}.jsonl`);
+    const durable = String((await storedRow(context, created.id)).nativeId);
+    const webStore = await sharedJournal(context, durable);
     const opens = context.engine.opened.length;
     await rm(webStore);
     await expect(context.sessions.action(id, { action: "resume" }))
@@ -676,6 +828,19 @@ describe("sequential handoff engine wiring", () => {
       .rejects.toMatchObject({ code: "resume_source_changed" });
     expect(context.engine.opened.length).toBe(opens);
     expect(context.sessions.list()[0]).toMatchObject({ active: false });
+  });
+
+  test("an ineligible host keeps the legacy private journal", async () => {
+    const context = await setupSessions(true, ["multi_session"]);
+    const created = await context.sessions.create(context.cwd, "Legacy origin");
+    const id = created.id as SessionKey;
+    expect((await storedRow(context, created.id)).shared).toBeUndefined();
+    await context.sessions.action(id, { action: "resume" });
+    await context.sessions.action(id, { action: "prompt", mode: "prompt", message: "legacy seed" });
+    const webStore = join(context.dataDir, "sessions", `${created.id}.jsonl`);
+    expect(await readFile(webStore, "utf8")).toContain("legacy seed");
+    expect(context.sessions.handoffSupport()).toEqual({ supported: false, reason: "missing_capability" });
+    await expect(context.sessions.handoff(id)).rejects.toMatchObject({ code: "handoff_unsupported" });
   });
 
   test("a timed-out release that kept its route reattaches without a second marker", async () => {
@@ -704,13 +869,22 @@ describe("sequential handoff engine wiring", () => {
     const preview = await context.sessions.webBranchOptions(id);
     expect(preview.canClone).toBe(true);
     expect(preview.forkMessages.map(message => message.entryId)).toEqual(["u1", "u2"]);
+    const before = await readdir(join(context.agent, "sessions", sessionDirName(context.cwd)));
     const forked = await context.sessions.branchWeb(id, { kind: "fork", entryId: "u2" });
     expect(forked.cancelled).toBeFalsy();
     if (forked.cancelled) return;
     expect(forked.session.id).not.toBe(created.id);
     expect(forked.session).toMatchObject({ active: true, name: "CLI thread · 分支" });
     expect(typeof forked.editorText).toBe("string");
-    const branchFile = join(context.dataDir, "sessions", `${forked.session.id}.jsonl`);
+    // Shared-mode branches land next to the source so the CLI picker discovers them.
+    const after = await readdir(join(context.agent, "sessions", sessionDirName(context.cwd)));
+    const added = after.filter(name => !before.includes(name) && name.endsWith(".jsonl"));
+    expect(added).toHaveLength(1);
+    const branchFile = join(context.agent, "sessions", sessionDirName(context.cwd), added[0]);
+    const forkedStored = await storedRow(context, forked.session.id);
+    expect(forkedStored.shared).toBe(true);
+    expect(typeof forkedStored.nativeId).toBe("string");
+    expect(JSON.parse((await readFile(branchFile, "utf8")).split("\n", 1)[0]).id).toBe(forkedStored.nativeId);
     const branchText = await readFile(branchFile, "utf8");
     expect(branchText).toContain("First reply");
     expect(branchText).not.toContain("Second reply");
@@ -739,19 +913,22 @@ describe("sequential handoff engine wiring", () => {
     if (cloned.cancelled) return;
     expect(cloned.session.id).not.toBe(created.id);
     expect(cloned.session).toMatchObject({ active: true });
-    const branchText = await readFile(join(context.dataDir, "sessions", `${cloned.session.id}.jsonl`), "utf8");
+    const clonedStored = await storedRow(context, cloned.session.id);
+    expect(clonedStored.shared).toBe(true);
+    const branchText = await readFile(await sharedJournal(context, String(clonedStored.nativeId)), "utf8");
     expect(branchText).toContain("First reply");
     expect(branchText).toContain("Second reply");
     expect(JSON.parse(branchText.split("\n", 1)[0]).id).not.toBe(nativeId);
   });
 
-  test("a symlinked web journal refuses resume without opening", async () => {
+  test("a symlinked shared journal refuses resume without opening", async () => {
     const context = await setupSessions();
     const created = await context.sessions.create(context.cwd, "Web origin");
     const id = created.id as SessionKey;
     await context.sessions.action(id, { action: "resume" });
     await context.sessions.handoff(id);
-    const webStore = join(context.dataDir, "sessions", `${created.id}.jsonl`);
+    const durable = String((await storedRow(context, created.id)).nativeId);
+    const webStore = await sharedJournal(context, durable);
     const opens = context.engine.opened.length;
     await rm(webStore);
     await symlink("/dev/null", webStore);
@@ -761,25 +938,27 @@ describe("sequential handoff engine wiring", () => {
     expect(context.sessions.list()[0]).toMatchObject({ active: false });
   });
 
-  test("a hardlinked web journal refuses resume without opening", async () => {
+  test("a hardlinked shared journal refuses resume without opening", async () => {
     const context = await setupSessions();
     const created = await context.sessions.create(context.cwd, "Web origin");
     const id = created.id as SessionKey;
     await context.sessions.action(id, { action: "resume" });
     await context.sessions.handoff(id);
-    const webStore = join(context.dataDir, "sessions", `${created.id}.jsonl`);
+    const durable = String((await storedRow(context, created.id)).nativeId);
+    const webStore = await sharedJournal(context, durable);
     await link(webStore, `${webStore}.bak`);
     await expect(context.sessions.action(id, { action: "resume" }))
       .rejects.toMatchObject({ code: "resume_source_changed" });
   });
 
-  test("resume reads only the bounded header of a large journal", async () => {
+  test("resume reads only the bounded header of a large shared journal", async () => {
     const context = await setupSessions();
     const created = await context.sessions.create(context.cwd, "Web origin");
     const id = created.id as SessionKey;
     await context.sessions.action(id, { action: "resume" });
     await context.sessions.handoff(id);
-    const webStore = join(context.dataDir, "sessions", `${created.id}.jsonl`);
+    const durable = String((await storedRow(context, created.id)).nativeId);
+    const webStore = await sharedJournal(context, durable);
     await appendFile(webStore, line({ type: "custom", id: crypto.randomUUID(), parentId: null,
       timestamp: iso, customType: "padding", padding: "x".repeat(1024 * 1024) }));
     await context.sessions.action(id, { action: "resume" });
@@ -815,5 +994,164 @@ describe("sequential handoff engine wiring", () => {
     expect(restarted.list()[0]).toMatchObject({ id: created.id, name: "Restart title", active: true });
     const stored = JSON.parse(await readFile(join(context.dataDir, "sessions", `${created.id}.json`), "utf8"));
     expect(stored.nativeId).toBe(nativeId);
+  });
+
+  test("shared create omits the path and binds the durable id", async () => {
+    const context = await setupSessions();
+    const created = await context.sessions.create(context.cwd, "Shared create");
+    expect(created).toMatchObject({ active: true });
+    expect(context.engine.opened).toEqual([{ path: expect.any(String), durable: expect.any(String), sentPath: undefined }]);
+    const durable = String(context.engine.opened[0].durable);
+    const journal = await sharedJournal(context, durable);
+    expect(JSON.parse((await readFile(journal, "utf8")).split("\n", 1)[0])).toMatchObject(
+      { type: "session", version: 3, id: durable, cwd: context.cwd });
+    expect(await storedRow(context, created.id)).toMatchObject({ nativeId: durable, shared: true });
+    expect(context.sessions.findAlias(durable, context.cwd)).toBe(created.id);
+    const again = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: durable, sourcePath: journal });
+    expect(again.id).toBe(created.id);
+    expect(context.engine.opened).toHaveLength(1);
+  });
+
+  test("restart reopens a shared session from the profile bucket", async () => {
+    const context = await setupSessions();
+    const created = await context.sessions.create(context.cwd, "Shared restart");
+    const durable = String((await storedRow(context, created.id)).nativeId);
+    const engine = new HandoffEngine(context.cwd);
+    const restarted = new Sessions(context.dataDir, [context.cwd], engine, () => undefined,
+      async nativeId => ({ sourcePath: await sharedJournal(context, nativeId) }),
+      { sameProfile: true, profileDir: context.agent });
+    await restarted.load();
+    expect(restarted.list()).toHaveLength(1);
+    await restarted.action(created.id as SessionKey, { action: "resume" });
+    expect(restarted.list()[0]).toMatchObject({ id: created.id, name: "Shared restart", active: true });
+    expect(engine.opened).toEqual([{ path: expect.any(String), durable, sentPath: expect.any(String) }]);
+    expect(restarted.findAlias(durable, context.cwd)).toBe(created.id);
+    expect(restarted.findAlias(crypto.randomUUID(), context.cwd)).toBeUndefined();
+  });
+
+  test("miscounted plain release is retried once with force and verified", async () => {
+    const context = await setupSessions();
+    const nativeId = crypto.randomUUID();
+    const source = await seedCli(context, nativeId, "CLI title", "miscount-seed");
+    const created = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    const id = created.id as SessionKey;
+    context.engine.miscounted.add(nativeId);
+    const { command } = await context.sessions.handoff(id);
+    // Exactly one plain attempt, then one scoped force attempt: interrupt is never sent.
+    expect(context.engine.releases).toEqual([
+      { route: expect.any(String), reason: "takeover" },
+      { route: expect.any(String), reason: "takeover", force: true },
+    ]);
+    expect(command).toContain(`omo --session '${source}'`);
+    expect(context.sessions.list()[0]).toMatchObject({ active: false });
+    expect(JSON.parse((await readFile(source, "utf8")).split("\n", 1)[0]).id).toBe(nativeId);
+    const reopened = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    expect(reopened).toMatchObject({ id: created.id, active: true });
+  });
+
+  test("a new native session without a journal is materialized and reopened without a model turn", async () => {
+    const context = await setupSessions();
+    context.engine.deferHeader = true;
+    const created = await context.sessions.create(context.cwd, "Empty but shared");
+    const [placed, reopened] = context.engine.opened;
+    expect(placed?.sentPath).toBeUndefined();
+    expect(reopened).toMatchObject({ path: placed.path, sentPath: placed.path, durable: placed.durable });
+    expect(context.engine.opened).toHaveLength(2);
+    expect(created).toMatchObject({ active: true, name: "Empty but shared" });
+    expect(context.engine.routes.size).toBe(1);
+    expect(context.engine.releases).toEqual([{ route: expect.any(String), reason: "takeover" }]);
+    expect(context.sessions.findAlias(String(placed.durable), context.cwd)).toBe(created.id);
+    const snapshot = await context.sessions.snapshot(created.id);
+    expect(snapshot.messages).toEqual([]);
+    expect(JSON.parse((await readFile(placed.path, "utf8")).split("\n", 1)[0]).id).toBe(placed.durable);
+  });
+
+  test("an idle-to-busy native refusal during scoped release keeps the live route", async () => {
+    const context = await setupSessions();
+    const nativeId = crypto.randomUUID();
+    const source = await seedCli(context, nativeId, "CLI title", "retained-seed");
+    const { id } = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    context.engine.miscounted.add(nativeId);
+    context.engine.forceBusy = true;
+    await expect(context.sessions.handoff(id)).rejects.toMatchObject({ code: "turn_active" });
+    expect(context.sessions.list()[0]).toMatchObject({ id, active: true });
+    expect((await context.sessions.snapshot(id)).session.active).toBe(true);
+  });
+
+  test("an incomplete zero-loss release receipt does not produce a handoff command", async () => {
+    const context = await setupSessions();
+    const nativeId = crypto.randomUUID();
+    const source = await seedCli(context, nativeId, "CLI title", "receipt-seed");
+    const { id } = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    context.engine.miscounted.add(nativeId);
+    context.engine.omitDropped = true;
+    await expect(context.sessions.handoff(id)).rejects.toMatchObject({ code: "release_unverified" });
+    expect(context.sessions.list()[0]).toMatchObject({ id, active: false });
+  });
+
+  test("a genuinely attached session refuses without force and stays active", async () => {
+    const context = await setupSessions();
+    const nativeId = crypto.randomUUID();
+    const source = await seedCli(context, nativeId, "CLI title", "attached-seed");
+    const created = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    const id = created.id as SessionKey;
+    context.engine.attachedElsewhere.add(nativeId);
+    context.engine.attachCounts.set(nativeId, 2);
+    await expect(context.sessions.handoff(id)).rejects.toMatchObject({ code: "attached" });
+    expect(context.sessions.list()[0]).toMatchObject({ id: created.id, active: true });
+    expect(context.engine.releases).toEqual([{ route: expect.any(String), reason: "takeover" }]);
+  });
+
+  test("an unverifiable listing keeps the attached refusal", async () => {
+    const context = await setupSessions();
+    const nativeId = crypto.randomUUID();
+    const source = await seedCli(context, nativeId, "CLI title", "nolist-seed");
+    const created = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    const id = created.id as SessionKey;
+    context.engine.miscounted.add(nativeId);
+    context.engine.listFails = true;
+    await expect(context.sessions.handoff(id)).rejects.toMatchObject({ code: "attached" });
+    expect(context.sessions.list()[0]).toMatchObject({ id: created.id, active: true });
+    expect(context.engine.releases).toEqual([{ route: expect.any(String), reason: "takeover" }]);
+  });
+
+  test("placement outside the profile bucket fails closed without publishing", async () => {
+    const context = await setupSessions();
+    context.engine.misplace = true;
+    await expect(context.sessions.create(context.cwd, "Stray"))
+      .rejects.toMatchObject({ code: "shared_placement_unsupported" });
+    expect(context.sessions.list()).toHaveLength(0);
+    expect(context.engine.routes.size).toBe(0);
+  });
+
+  test("parked and released events drop the route while the row stays", async () => {
+    const context = await setupSessions();
+    const nativeId = crypto.randomUUID();
+    const source = await seedCli(context, nativeId, "CLI title", "park-seed");
+    const created = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    const route = [...context.engine.routes.keys()][0];
+    context.sessions.event({ type: "session_parked", sessionId: route });
+    expect(context.sessions.list()[0]).toMatchObject({ id: created.id, active: false });
+    const reopened = await context.sessions.resumeCli({ cwd: context.cwd, nativeSessionId: nativeId, sourcePath: source });
+    expect(reopened).toMatchObject({ id: created.id, active: true });
+    const route2 = [...context.engine.routes.keys()][0];
+    context.sessions.event({ type: "session_released", sessionId: route2 });
+    expect(context.sessions.list()[0]).toMatchObject({ id: created.id, active: false });
+  });
+
+  test("legacy private sources branch into the private store", async () => {
+    const context = await setupSessions(true, ["multi_session"]);
+    const created = await context.sessions.create(context.cwd, "Legacy origin");
+    const id = created.id as SessionKey;
+    await context.sessions.action(id, { action: "resume" });
+    await context.sessions.action(id, { action: "prompt", mode: "prompt", message: "legacy seed" });
+    const cloned = await context.sessions.branchWeb(id, { kind: "clone" });
+    expect(cloned.cancelled).toBeFalsy();
+    if (cloned.cancelled) return;
+    const branchText = await readFile(join(context.dataDir, "sessions", `${cloned.session.id}.jsonl`), "utf8");
+    expect(branchText).toContain("legacy seed");
+    const clonedStored = await storedRow(context, cloned.session.id);
+    expect(clonedStored.shared).toBeUndefined();
+    expect(clonedStored.nativeId).toBeUndefined();
   });
 });

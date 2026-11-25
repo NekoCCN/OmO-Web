@@ -28,6 +28,16 @@ const manager = dialog("manage-dialog");
 const inspector = dialog("details-dialog");
 const commandDialog = dialog("command-dialog");
 const settingLabels: Readonly<Record<string, string>> = { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" };
+const approvalLabels: Readonly<Record<string, string>> = {
+  ask: "审批：询问",
+  auto: "审批：Auto",
+  "full-access": "审批：无审批",
+};
+const approvalChoices: ReadonlyArray<readonly [string, string]> = [
+  ["ask", approvalLabels.ask],
+  ["auto", approvalLabels.auto],
+  ["full-access", approvalLabels["full-access"]],
+];
 const commandToken = /^(?:\/(?:[A-Za-z0-9_-]{1,64}|skill:[A-Za-z0-9-]{1,64})|\$[A-Za-z0-9-]{1,64})$/;
 type Attachment = Image & { readonly name: string; readonly url: string };
 type Draft = {
@@ -55,6 +65,14 @@ let bootstrapped = false;
 let bootError = "";
 let listError = "";
 let sessions = new Map<string, Session>();
+type CliRow = { readonly id: string; readonly name: string; readonly cwd: string; readonly updatedAt: number };
+let cliRows: readonly CliRow[] = [];
+let cliError = "";
+// Never fetched: the first update after bootstrap must not be throttled.
+let cliAt = Number.NEGATIVE_INFINITY;
+let cliSeq = 0;
+const CLI_REFRESH_MS = 30_000;
+const cliTime = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" });
 let workspaces: readonly string[] = [];
 let archived = false;
 let source: EventSource | undefined;
@@ -69,6 +87,7 @@ const sending = new Set<string>();
 const drafts = new Map<string, Draft>();
 const releases = new Map<string, Release>();
 const mobile = matchMedia("(max-width: 760px)");
+const compactInspector = matchMedia("(max-width: 1000px)");
 const system = matchMedia("(prefers-color-scheme: dark)");
 const countFormat = new Intl.NumberFormat("zh-CN");
 const focusCliLauncher = (id: string) => btn(mobile.matches ? "open-navigation" : id).focus();
@@ -76,9 +95,11 @@ const openBranch = branchDialog(api, enterBranch);
 const live = cliLive(api, () => focusCliLauncher("cli-live-button"), openBranch);
 let leavingHistory = false;
 const history = cliHistory(api, () => {
-  if (!leavingHistory && !document.querySelector("dialog[open]")) focusCliLauncher("cli-history-button");
+  if (!leavingHistory && !document.querySelector("dialog:modal")) focusCliLauncher("cli-history-button");
   leavingHistory = false;
 }, openBranch, historyResumeUnavailable, (session, show) => {
+  // Adoption changed: a CLI journal gained (or will gain) a Web alias.
+  void fetchCliRows(true);
   if (!show) { void fetchSessions(); return; }
   leavingHistory = true;
   dialog("cli-history-dialog").close();
@@ -135,6 +156,7 @@ function enterBranch(session: Session, editorText: string, source: BranchSource)
   archived = false;
   draftFor(session.id).text = editorText;
   remember(session);
+  void fetchCliRows(true);
   openSession(session.id, true);
 }
 
@@ -203,7 +225,62 @@ function updateConnection(): void {
   btn("create").disabled = !available || createPending;
   history.update();
   renderSessions();
+  // CLI discovery refreshes on every connection-level update (throttled),
+  // so newly CLI-created journals appear without opening the history dialog.
+  void fetchCliRows();
+  renderCliSessions();
   renderView();
+}
+
+async function fetchCliRows(force = false): Promise<void> {
+  // The sidebar list is only meaningful once bootstrap has provided the token
+  // and workspace state; earlier connection updates must not spend a fetch.
+  if (!bootstrapped) return;
+  if (!force && performance.now() - cliAt < CLI_REFRESH_MS) return;
+  const ticket = ++cliSeq;
+  cliAt = performance.now();
+  try {
+    const data = await api.request("/api/cli-history");
+    if (ticket !== cliSeq) return;
+    cliError = data.available === true ? "" : "CLI 历史不可用：未启用或未找到本地历史记录。";
+    cliRows = data.available === true ? list(data.sessions).map(object).flatMap(row => {
+      const id = str(row.id);
+      // Adopted rows already appear as Web aliases above; the sidebar only
+      // discovers journals without one. Previewing one never opens a route,
+      // and entering still goes through explicit resume under holder admission.
+      return id && row.adopted !== true
+        ? [{ id, name: str(row.name) || "未命名 CLI 会话", cwd: str(row.cwd), updatedAt: num(row.updatedAt) ?? 0 }] : [];
+    }) : [];
+  } catch (error) {
+    if (ticket !== cliSeq) return;
+    cliError = `无法读取 CLI 历史：${errorText(error)}`;
+  }
+  renderCliSessions();
+}
+
+function renderCliSessions(): void {
+  const section = box("cli-sessions");
+  const host = box("cli-session-list");
+  const focused = document.activeElement instanceof HTMLButtonElement && host.contains(document.activeElement)
+    ? document.activeElement.dataset.cliSession : undefined;
+  const query = inp("search").value.trim().toLocaleLowerCase();
+  const matches = archived ? [] : cliRows
+    .filter(row => !query || `${row.name} ${row.cwd}`.toLocaleLowerCase().includes(query))
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  section.hidden = matches.length === 0 && !cliError;
+  host.replaceChildren();
+  for (const row of matches) {
+    const item = el("li");
+    const open = button("", () => history.open(row.id), "button--quiet session-link");
+    open.dataset.cliSession = row.id;
+    const stamp = Number.isFinite(new Date(row.updatedAt).getTime()) ? cliTime.format(row.updatedAt) : "";
+    open.append(el("span", "", row.name), el("span", "small muted path", row.cwd), el("small", "", stamp));
+    item.append(open);
+    host.append(item);
+  }
+  host.hidden = !matches.length;
+  notice(box("cli-list-empty"), matches.length ? "" : cliError || (bootstrapped ? "暂无本机 CLI 会话。" : ""));
+  if (focused) [...host.querySelectorAll("button")].find(row => row.dataset.cliSession === focused)?.focus({ preventScroll: true });
 }
 
 function applySessions(items: readonly Session[]): void {
@@ -323,8 +400,10 @@ function openSession(id: string, focusComposer = false): void {
     if (current.status === "ready") { prompt.focus(); return; }
   }
   if (manager.open) manager.close();
-  if (inspector.open) { detailsRequest?.abort(); inspector.close(); }
+  closeDetails(false);
+  setComposeOptions(false);
   if (commandDialog.open) { commandRequest?.abort(); commandDialog.close(); }
+  box("conversation").focus({ preventScroll: true });
   const release = releases.get(id);
   const load = session.active && release?.status !== "released" && release?.status !== "uncertain";
   const view: View = {
@@ -346,7 +425,7 @@ function openSession(id: string, focusComposer = false): void {
       if (focusComposer && view === current && view.status === "ready" && document.activeElement === box("conversation")) prompt.focus();
     });
     void loadOptions(view);
-  } else if (release?.status === "released" && !document.querySelector("dialog[open]")) box("handoff-title").focus();
+  } else if (release?.status === "released" && !document.querySelector("dialog:modal")) box("handoff-title").focus();
 }
 
 function modelKey(value: Wire): string {
@@ -388,6 +467,7 @@ function renderView(): void {
   notice(path, cwd);
   path.title = cwd;
   btn("details-button").hidden = !available;
+  if (!available) closeDetails(false);
   btn("web-branch-button").hidden = !session;
   btn("web-branch-button").disabled = pending;
   btn("manage-button").hidden = !available;
@@ -468,6 +548,14 @@ function renderView(): void {
   if (selectedLevel && !levels.includes(selectedLevel)) levels.unshift(selectedLevel);
   syncSelect(sel("thinking"), levels.map(level => [level, Object.hasOwn(settingLabels, level) ? `思考：${settingLabels[level]}` : level]), selectedLevel, "思考档");
   sel("thinking").disabled = !canSend || !list(view.options.levels).length || view.running || busy || posting;
+  const preset = str(view.state.effectivePermissionPreset) || str(view.state.permissionPreset) || "ask";
+  syncSelect(sel("approval"), [...approvalChoices], approvalChoices.some(([value]) => value === preset) ? preset : "ask", "审批");
+  sel("approval").dataset.preset = sel("approval").value;
+  sel("approval").disabled = !canSend || busy || posting;
+  sel("approval").title = preset === "full-access"
+    ? "无审批：默认允许工具操作；原生权限规则仍有效。用户问题仍需回答。"
+    : preset === "auto" ? "Auto：原生确认安全的项目内操作自动放行，其余询问。"
+      : "询问：未被原生权限规则处理的工具操作需要批准。恢复会话后回到此模式。";
   const usage = object(view.state.contextUsage);
   const percent = num(usage.percent);
   const tokens = num(usage.tokens);
@@ -484,6 +572,7 @@ function renderView(): void {
   const activity = [view.running ? "正在生成" : "", view.compacting ? "正在压缩上下文" : "", view.queue ? `${view.queue} 条输入待处理` : "",
     view.requests.size ? `${view.requests.size} 项等待你的决定` : ""].filter(Boolean).join(" · ");
   box("activity-row").hidden = !activity;
+  box("activity-row").dataset.pending = String(view.requests.size > 0);
   if (box("activity").textContent !== activity) box("activity").textContent = activity;
   btn("jump-to-request").hidden = !view.requests.size;
   notice(box("compose-error"), (commandMode ? draft.commandError : draft.error) || view.optionsError ||
@@ -511,6 +600,9 @@ async function snapshot(view: View, bottom = false): Promise<void> {
   if (requiresManualResume && (view.status !== "loading" || !writes.has(view.session.id))) return;
   const ticket = ++view.sync;
   const revision = view.revision;
+  const baseRequests = new Set(view.requests.keys());
+  const baseLiveKey = view.liveKey;
+  const baseRunningTools = new Set([...view.tools].filter(([, tool]) => tool.stage === "running").map(([id]) => id));
   try {
     const data = await api.request(sessionPath(view.session.id));
     if (current !== view || ticket !== view.sync) return;
@@ -536,6 +628,14 @@ async function snapshot(view: View, bottom = false): Promise<void> {
       const newer = new Map(view.messages.map(entry => [entry.key, entry]));
       view.messages = [...entries.map(entry => newer.get(entry.key) ?? entry), ...view.messages.filter(entry => !keys.has(entry.key))];
       view.state = { ...state, ...view.state };
+      const streaming = session.running || state.isStreaming === true;
+      const liveAdded = [...view.requests].filter(([id]) => !baseRequests.has(id));
+      view.requests = new Map([...requestsFrom(state), ...liveAdded]);
+      if (!streaming && !view.running) {
+        view.liveKey = "";
+        if (baseLiveKey && !keys.has(baseLiveKey)) view.messages = view.messages.filter(entry => entry.key !== baseLiveKey);
+        for (const id of baseRunningTools) if (view.tools.get(id)?.stage === "running") view.tools.delete(id);
+      }
     } else {
       view.messages = entries;
       view.state = state;
@@ -979,7 +1079,7 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
       return manager.open;
     case "session":
     case "tree":
-      btn("details-button").click();
+      openDetails();
       return inspector.open;
     case "fork":
       btn("web-branch-button").click();
@@ -988,6 +1088,7 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
       return action({ action: "compact", ...(command.instructions ? { instructions: command.instructions } : {}) }, "压缩上下文");
     case "model": {
       if (!command.reference) {
+        if (mobile.matches && !sel("model").disabled) setComposeOptions(true);
         sel("model").focus();
         if (document.activeElement === sel("model")) {
           try { sel("model").showPicker?.(); } catch (error) { if (!(error instanceof DOMException)) throw error; }
@@ -1004,6 +1105,7 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
     }
     case "thinking": {
       if (!command.level) {
+        if (mobile.matches && !sel("thinking").disabled) setComposeOptions(true);
         sel("thinking").focus();
         if (document.activeElement === sel("thinking")) {
           try { sel("thinking").showPicker?.(); } catch (error) { if (!(error instanceof DOMException)) throw error; }
@@ -1147,13 +1249,14 @@ async function releaseToCli(view: View): Promise<void> {
     target.error = "";
     if (manager.open) manager.close();
     renderView();
-    if (shouldFocus && !document.querySelector("dialog[open]")) box(focus).focus();
+    if (shouldFocus && !document.querySelector("dialog:modal")) box(focus).focus();
   };
   try {
     const { session, command } = await api.handoff(id);
     if (releases.get(id) !== attempt) return;
     releases.set(id, { status: "released", command });
     remember(session);
+    void fetchCliRows(true);
     const target = selected();
     if (target) finish(target, "handoff-title");
   } catch (error) {
@@ -1274,7 +1377,7 @@ function insertCommand(view: View, invocation: string): void {
   draft.commandText = `${invocation}${rest || " "}`;
   draft.commandError = "";
   if (commandDialog.open) commandDialog.close();
-  if (inspector.open) inspector.close();
+  closeDetails(false);
   showCommandMode(view, true);
   prompt.setSelectionRange(invocation.length + 1, invocation.length + 1);
 }
@@ -1328,24 +1431,85 @@ async function openCommandPicker(view: View): Promise<void> {
 }
 
 let detailsRequest: AbortController | undefined;
+const detailsTabs = () => [...inspector.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+
+function selectDetailsView(tab: HTMLButtonElement): void {
+  if (tab.getAttribute("aria-selected") === "true") return;
+  for (const button of detailsTabs()) {
+    const selected = button === tab;
+    button.setAttribute("aria-selected", String(selected));
+    button.tabIndex = selected ? 0 : -1;
+    const target = button.getAttribute("aria-controls");
+    if (target) box(target).hidden = !selected;
+  }
+  box("details-scroll").scrollTop = 0;
+}
+
+function openDetails(): void {
+  if (current?.status !== "ready") return;
+  const overview = btn("runtime-open-overview");
+  selectDetailsView(overview);
+  if (!inspector.open) {
+    for (const panel of inspector.querySelectorAll('[role="tabpanel"]')) panel.replaceChildren();
+    if (compactInspector.matches) inspector.showModal();
+    else inspector.show();
+    btn("details-button").setAttribute("aria-expanded", "true");
+    box("details-scroll").scrollTop = 0;
+    loadDetails(current);
+  }
+  overview.focus({ preventScroll: true });
+}
+
+function closeDetails(restoreFocus = true): void {
+  if (!inspector.open) return;
+  inspector.close();
+  detailsRequest?.abort();
+  const trigger = btn("details-button");
+  trigger.setAttribute("aria-expanded", "false");
+  if (restoreFocus) (trigger.hidden ? box("conversation") : trigger).focus({ preventScroll: true });
+}
+
+function syncDetailsPresentation(): void {
+  const compact = compactInspector.matches;
+  if (!inspector.open || inspector.matches(":modal") === compact || document.querySelector("dialog:modal:not(#details-dialog)")) return;
+  const scroller = box("details-scroll");
+  const scrollTop = scroller.scrollTop;
+  const active = document.activeElement;
+  // Reopen the same node in the other native mode without invoking closeDetails.
+  inspector.close();
+  if (compact) inspector.showModal();
+  else inspector.show();
+  if (active instanceof HTMLElement && (inspector.contains(active) || !compact)) active.focus({ preventScroll: true });
+  else inspector.querySelector<HTMLElement>('[aria-selected="true"]')?.focus({ preventScroll: true });
+  scroller.scrollTop = scrollTop;
+}
+
+function setComposeOptions(open: boolean): void {
+  btn("compose-options-button").setAttribute("aria-expanded", String(open));
+}
+
 function loadDetails(view: View): void {
   detailsRequest?.abort();
   const request = detailsRequest = new AbortController();
   const live = () => !request.signal.aborted && inspector.open && view === current;
   const path = sessionPath(view.session.id);
-  const body = box("details-body");
-  const activity = box("details-native-activity");
+  const nativeActivity = box("details-native-activity");
+  const overviewPanels = [...box("details-body").querySelectorAll('[role="tabpanel"]')];
+  const nativePanels = [...nativeActivity.querySelectorAll('[role="tabpanel"]')];
   const fail = (message: string) => notice(box("details-error"), message);
-  if (!body.childElementCount) body.append(el("p", "muted", "正在读取运行详情…"));
+  for (const panel of overviewPanels) if (!panel.childElementCount) panel.append(el("p", "muted", "正在读取运行详情…"));
+  const nativeStatus = nativePanels.map(panel => {
+    panel.querySelector("[data-activity-status]")?.remove();
+    const status = el("p", "small muted", "正在读取原生快照…");
+    status.dataset.activityStatus = "";
+    status.setAttribute("role", "status");
+    panel.prepend(status);
+    return status;
+  });
   fail("");
-  activity.querySelector("[data-activity-status]")?.remove();
-  const status = el("p", "small muted", "正在读取原生快照…");
-  status.dataset.activityStatus = "";
-  status.setAttribute("role", "status");
-  activity.append(status);
   const stats = api.request(`${path}/details`, undefined, request.signal).then(data => {
     if (!live()) return;
-    renderDetails(body, data, view.state, view.options, {
+    renderDetails(data, view.state, view.options, {
       canWrite: connection === "online",
       canNavigate: connection === "online" && !view.running && !view.compacting && !sending.has(view.session.id),
       queueCount: view.queue,
@@ -1367,18 +1531,22 @@ function loadDetails(view: View): void {
     });
   }).catch(error => {
     if (!live()) return;
-    if (!body.querySelector("section")) body.replaceChildren();
+    for (const panel of overviewPanels) if (!panel.querySelector("section")) panel.replaceChildren();
     fail(`无法读取运行详情：${errorText(error)}`);
   });
   const native = api.request(`${path}/activity`, undefined, request.signal).then(data => {
-    if (live()) showNativeActivity(activity, data);
+    if (live()) showNativeActivity(nativeActivity, data);
   }).catch(error => {
     if (!live()) return;
-    status.textContent = `无法读取原生快照：${errorText(error)}`;
-    status.className = "notice error small";
-    status.setAttribute("role", "alert");
+    for (const status of nativeStatus) {
+      status.textContent = `无法读取原生快照：${errorText(error)}`;
+      status.className = "notice error small";
+      status.setAttribute("role", "alert");
+    }
   });
-  void Promise.all([stats, native]).then(() => { if (detailsRequest === request) detailsRequest = undefined; });
+  void Promise.all([stats, native]).then(() => {
+    if (detailsRequest === request) detailsRequest = undefined;
+  });
 }
 
 function listen(): void {
@@ -1392,17 +1560,44 @@ function listen(): void {
   btn("open-navigation").addEventListener("click", () => toggleNav(true));
   btn("close-navigation").addEventListener("click", () => toggleNav(false, true));
   btn("nav-scrim").addEventListener("click", () => toggleNav(false, true));
-  mobile.addEventListener("change", () => toggleNav(false));
-  document.addEventListener("keydown", event => {
-    if (event.key === "Escape" && navOpen && !document.querySelector("dialog[open]")) toggleNav(false, true);
+  mobile.addEventListener("change", () => { toggleNav(false); setComposeOptions(false); });
+  compactInspector.addEventListener("change", syncDetailsPresentation);
+  document.addEventListener("close", event => {
+    if (event.target !== inspector) syncDetailsPresentation();
+  }, true);
+  const composeOptionsButton = btn("compose-options-button");
+  const optionsOpen = () => composeOptionsButton.getAttribute("aria-expanded") === "true";
+  composeOptionsButton.addEventListener("click", () => setComposeOptions(!optionsOpen()));
+  document.addEventListener("click", event => {
+    if (optionsOpen() && event.target instanceof Node && !composeOptionsButton.contains(event.target)
+      && !box("compose-options").contains(event.target)) setComposeOptions(false);
   });
-  inp("search").addEventListener("input", renderSessions);
-  btn("recent").addEventListener("click", () => { archived = false; renderSessions(); });
-  btn("archived").addEventListener("click", () => { archived = true; renderSessions(); });
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || document.querySelector("dialog:modal")) return;
+    if (navOpen) toggleNav(false, true);
+    else if (optionsOpen()) {
+      setComposeOptions(false);
+      composeOptionsButton.focus({ preventScroll: true });
+    } else if (inspector.open) closeDetails();
+  });
+  inp("search").addEventListener("input", () => { renderSessions(); renderCliSessions(); });
+  btn("recent").addEventListener("click", () => { archived = false; renderSessions(); renderCliSessions(); });
+  btn("archived").addEventListener("click", () => { archived = true; renderSessions(); renderCliSessions(); });
+  // CLI journals appear outside the engine event stream; re-check when the
+  // page becomes visible so the sidebar discovers them without the dialog.
+  // An open run view refreshes too, so metrics stay current while viewed.
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    void fetchSessions();
+    if (current && inspector.open) loadDetails(current);
+  });
+  window.setInterval(() => {
+    if (!document.hidden && connection === "online") void fetchCliRows(true);
+  }, CLI_REFRESH_MS);
   btn("new-welcome").addEventListener("click", openChooser);
   btn("new-sidebar").addEventListener("click", openChooser);
   form("new-form").addEventListener("submit", event => { event.preventDefault(); void createSession(); });
-  for (const modal of [chooser, manager, inspector, commandDialog]) {
+  for (const modal of [chooser, manager, commandDialog]) {
     for (const close of modal.querySelectorAll("[data-close]")) close.addEventListener("click", () => modal.close());
   }
   btn("manage-button").addEventListener("click", () => {
@@ -1427,15 +1622,26 @@ function listen(): void {
     }
     if (current?.session.id === view.session.id && releases.get(view.session.id) === receipt) renderView();
   });
-  btn("details-button").addEventListener("click", () => {
-    if (!current || inspector.open) return;
-    box("details-body").replaceChildren();
-    box("details-native-activity").replaceChildren();
-    inspector.showModal();
-    loadDetails(current);
+  btn("details-button").addEventListener("click", () => { if (inspector.open) closeDetails(); else openDetails(); });
+  for (const tab of detailsTabs()) tab.addEventListener("click", () => selectDetailsView(tab));
+  box("runtime-shortcuts").addEventListener("keydown", event => {
+    const tabs = detailsTabs();
+    const index = tabs.findIndex(tab => tab === event.target);
+    if (index < 0) return;
+    const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)
+      : event.key === "ArrowLeft" ? tabs[(index + tabs.length - 1) % tabs.length]
+        : event.key === "ArrowRight" ? tabs[(index + 1) % tabs.length] : undefined;
+    if (!next) return;
+    event.preventDefault();
+    selectDetailsView(next);
+    next.focus({ preventScroll: true });
   });
   btn("details-refresh").addEventListener("click", () => { if (current && inspector.open) loadDetails(current); });
-  inspector.addEventListener("close", () => { if (!inspector.open) detailsRequest?.abort(); });
+  inspector.querySelector("[data-close]")?.addEventListener("click", () => closeDetails());
+  inspector.addEventListener("cancel", event => {
+    event.preventDefault();
+    closeDetails();
+  });
   btn("command-mode").addEventListener("click", () => {
     if (current) showCommandMode(current, !draftFor(current.session.id).commandMode);
   });
@@ -1470,7 +1676,7 @@ function listen(): void {
     const main = box("conversation");
     main.focus();
     void runAction(view, { action: "resume" }, "恢复会话", text => { view.error = text; renderView(); }).then(() => {
-      if (view !== current || document.activeElement !== main || document.querySelector("dialog[open]")) return;
+      if (view !== current || document.activeElement !== main || document.querySelector("dialog:modal")) return;
       if (view.status === "ready") prompt.focus();
       else if (!box("session-error").hidden) box("session-error").focus();
     });
@@ -1538,6 +1744,17 @@ function listen(): void {
     if (view && level) void runAction(view, { action: "thinking", level }, "切换思考档",
       text => { draftFor(view.session.id).error = text; renderView(); });
     else renderView();
+  });
+  sel("approval").addEventListener("change", () => {
+    const view = current;
+    const preset = sel("approval").value;
+    if (!view || (preset !== "ask" && preset !== "auto" && preset !== "full-access")) { renderView(); return; }
+    if (preset === "full-access" && !window.confirm("无审批会默认允许工具操作，包括删除文件或对外发送数据。原生权限规则仍有效，用户问题仍需你回答。仅对当前打开的会话生效。确定切换吗？")) {
+      renderView();
+      return;
+    }
+    void runAction(view, { action: "preset", preset }, "切换审批模式",
+      text => { draftFor(view.session.id).error = text; renderView(); });
   });
 }
 

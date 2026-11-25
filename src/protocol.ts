@@ -60,6 +60,7 @@ export const actions = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("settle"), enabled: z.boolean() }),
   z.strictObject({ action: z.literal("model"), provider: z.string().min(1).max(120), modelId: z.string().min(1).max(250) }),
   z.strictObject({ action: z.literal("thinking"), level: z.enum(["off", "minimal", "low", "medium", "high", "xhigh", "max"]) }),
+  z.strictObject({ action: z.literal("preset"), preset: z.enum(["ask", "auto", "full-access"]) }),
   z.strictObject({ action: z.literal("fast"), enabled: z.boolean() }),
   z.strictObject({ action: z.literal("autoCompaction"), enabled: z.boolean() }),
   z.strictObject({ action: z.literal("compact"), instructions: z.string().max(6000).optional() }),
@@ -162,6 +163,7 @@ export function browserEvent(value: WireObject): WireObject | undefined {
     case "agent_start":
     case "agent_end":
     case "agent_settled":
+    case "agent_idle":
     case "turn_start":
     case "turn_end":
     case "compaction_start":
@@ -170,10 +172,16 @@ export function browserEvent(value: WireObject): WireObject | undefined {
     case "auto_retry_end":
     case "commands_changed":
     case "loaded_surfaces_changed":
+    case "pending_input_update":
     case "session_closed":
+    case "session_parked":
+    case "session_released":
     case "session_replaced":
+    case "extension_error":
+    case "retry_fallback_exhausted":
     case "transcript_write_failed":
-      return pick(value, ["type", "turnId", "reason", "willRetry", "attempt", "success", "aborted", "errorMessage"]);
+      return pick(value, ["type", "turnId", "reason", "willRetry", "attempt", "success", "aborted",
+        "errorMessage", "error", "lastError"]);
     default:
       return;
   }

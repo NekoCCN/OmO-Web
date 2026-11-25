@@ -106,6 +106,16 @@ export class CliHistory {
   }
 
   async list(): Promise<CliHistoryList> {
+    const detailed = await this.listWithIds();
+    if (!detailed.available) return { available: false, sessions: [] };
+    return { available: true,
+      sessions: detailed.sessions.map(({ id, name, cwd, updatedAt }) => ({ id, name, cwd, updatedAt })) };
+  }
+
+  /** Server-only list carrying the durable native id per row for alias coalescing.
+   * Never serialize nativeSessionId to the browser; the public list stays opaque. */
+  async listWithIds(): Promise<{ readonly available: boolean;
+    readonly sessions: readonly (CliSessionSummary & { readonly nativeSessionId: string })[] }> {
     const scanned = await this.#scan();
     if (!scanned.available) return { available: false, sessions: [] };
     const candidates: { file: FileRef; mtimeMs: number; size: number }[] = [];
@@ -119,7 +129,7 @@ export class CliHistory {
       }
     }
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.file.path < b.file.path ? -1 : 1));
-    const sessions: CliSessionSummary[] = [];
+    const sessions: (CliSessionSummary & { readonly nativeSessionId: string })[] = [];
     let bytes = 0;
     let parsed = 0;
     for (const candidate of candidates) {
@@ -132,7 +142,7 @@ export class CliHistory {
         bytes += loaded.bytes;
         if (loaded.cwd !== candidate.file.root) continue;
         sessions.push({ id: loaded.sessionId, name: nameOf(loaded.entries, loaded.cwd),
-          cwd: loaded.cwd, updatedAt: loaded.updatedAt });
+          cwd: loaded.cwd, updatedAt: loaded.updatedAt, nativeSessionId: loaded.sessionId });
       } catch {
         continue;
       }
@@ -255,7 +265,9 @@ export class CliHistory {
   }
 }
 
-function sessionDirName(cwd: string): string {
+/** Native per-cwd journal bucket under `<profile>/sessions`. Shared by discovery and
+ * shared-store placement verification: both sides must resolve the identical directory. */
+export function sessionDirName(cwd: string): string {
   return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
 }
 

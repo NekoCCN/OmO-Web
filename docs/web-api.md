@@ -6,12 +6,12 @@
 
 - `GET /api/bootstrap` → `{ token, engine: {online,version?,error?}, workspaces: string[], sessions: Session[], handoff: {supported,reason?} }`。`handoff.supported` 表示当前配置有私有认证宿主、同一 CLI profile 和必需的原生能力；不是具体会话的释放承诺。
 - `GET /api/sessions` → `{sessions: Session[]}`。`Session = { id, name, cwd, updatedAt, archived, settled, active, running }`；`id` 是 Web 端 UUID，与临时路由句柄无关。`updatedAt` 为毫秒。
-- `GET /api/sessions/:id` → `{ session: Session, state, messages, handoff: {eligible,reason?} }`，原生状态经字段筛选后返回：`model`, `thinkingLevel`, `fastMode`, `isStreaming`, `isCompacting`, `currentTurnId`, `pendingDialogs`, `pendingQuestions`, `pendingMessageCount`, `permissionPreset`, `autoCompactionEnabled`, `contextUsage`, `usageTotals`。`model` 至多包含 `{id,provider,name,contextWindow,maxTokens,reasoning,input,supportedThinkingLevels}`。`messages` 保持原生 `role/content/timestamp/toolName/toolCallId/isError/stopReason/errorMessage` 形状。未加载的历史会话先显式执行 `resume`，然后读取。`handoff.eligible` 是当前状态提示；实际释放时原生引擎会再次判断。
+- `GET /api/sessions/:id` → `{ session: Session, state, messages, handoff: {eligible,reason?} }`，原生状态经字段筛选后返回：`model`, `thinkingLevel`, `fastMode`, `isStreaming`, `isCompacting`, `currentTurnId`, `pendingDialogs`, `pendingQuestions`, `pendingMessageCount`, `permissionPreset`, `effectivePermissionPreset`, `autoCompactionEnabled`, `contextUsage`, `usageTotals`。审批选择器显示 `effectivePermissionPreset || permissionPreset`；每次恢复/重开会话都回到 `ask`，不会自动沿用上次的 `auto`/`full-access`。``model` 至多包含 `{id,provider,name,contextWindow,maxTokens,reasoning,input,supportedThinkingLevels}`。`messages` 保持原生 `role/content/timestamp/toolName/toolCallId/isError/stopReason/errorMessage` 形状。未加载的历史会话先显式执行 `resume`，然后读取。`handoff.eligible` 是当前状态提示；实际释放时原生引擎会再次判断。
 - `GET /api/sessions/:id/last-assistant` → `{text: string | null}`，只读取当前已加载会话的原生最后一条可复制助手文本。
 - `GET /api/sessions/:id/options` → `{models, levels, commands}`，模型按上面的投影，命令含 `{name,description,source,invocation}`，其中 `source` 是 `extension`、`prompt` 或 `skill`，`invocation` 是规范的 `/命令` 或 `$技能`。不返回原生 `sourceInfo`。
-- `GET /api/sessions/:id/details` → `{stats, queue, tree}`，分别为原生 `get_session_stats`、`get_pending_inputs`、`get_tree` 的数据（不含顶层文件路径）。
+- `GET /api/sessions/:id/details` → `{stats, queue, tree, runtime, state?, sessionMemory}`。`runtime` 是活动分支的 Todo 与长期记忆召回状态投影，不返回原始扩展数据、记忆提示或路径；`state` 只提供详情需要的模型、运行模式与用量。`usageTotals.latestCacheHitRate` 是原生百分比；累计命中率按 `cacheRead / (input + cacheWrite + cacheRead)` 计算。`sessionMemory` 只匹配当前路由，区分 OmO 宿主主堆与该会话的内核统计。
 - `GET /api/sessions/:id/activity` → `Activity`。只接受已加载的 Web 会话 ID；服务端用内部 durable session ID 和该会话已授权的工作目录查找原生快照。没有加载的 Web 会话不会由该接口打开。
-- `GET /api/cli-history` → `{available, sessions: CliSession[]}`。`CliSession = {id, name, cwd, updatedAt}`；`cwd` 为服务器授权的工作目录，`updatedAt` 为毫秒。`available:false` 表示读取已关闭或找不到可读的本地历史目录；`available:true` 且 `sessions:[]` 表示没有可显示的记录。
+- `GET /api/cli-history` → `{available, sessions: CliSession[]}`。`CliSession = {id, name, cwd, updatedAt, adopted}`；`cwd` 为服务器授权的工作目录，`updatedAt` 为毫秒。`adopted:true` 表示该原生会话已有 Web 别名（按原生 ID 与工作目录合并），普通侧栏不再重复列出；进入仍走 `resume` 并受持有者接纳。`available:false` 表示读取已关闭或找不到可读的本地历史目录；`available:true` 且 `sessions:[]` 表示没有可显示的记录。
 - `GET /api/cli-history/:id` → `{session: CliSession, messages}`。ID 是本进程最近一次 CLI 列表返回的选择键，不是原生 ID、Web ID 或路径；过期需重新读取列表。仅返回最新分支上可显示的对话投影，不返回原始 journal。
 - `GET /api/cli-history/:id/activity` → `Activity`。先校验所选历史记录仍属于授权工作目录，再查找它的原生快照；列表、记录和快照都不接入 CLI 进程，不依赖 RPC 在线。
 - `GET /api/cli-live` → `{available, sessions: CliLiveSession[]}`。`CliLiveSession = {id, name, cwd, attached, running}`。`id` 是此 Web 服务在发现时分配的稳定不透明键，不是原生会话、宿主、文件或 socket 标识；服务重启或原生身份变化后需重新发现。`attached` 是本 Web 服务的附着状态。`available:false` 表示实时发现不可用或已禁用；可用的空列表表示没有匹配候选。只读发现不会附着。
@@ -42,6 +42,7 @@ CLI 实时的事件仅为 `{type:"cli-live", id}`；客户端只刷新当前已�
 | `clearQueue` | — |
 | `navigate` | `targetId` (`null` for empty context) |
 | `answer` | `requestId` 和 `value` / `confirmed` / `cancelled` / `answers` 中的一种；按照原生问题约定回传 |
+| `preset` | `preset: "ask" \| "auto" \| "full-access"`；按会话调用原生 `set_permission_preset`，须回执 `applied` 且 `get_state.effectivePermissionPreset` 一致才算成功。`auto` 要求原生能力 `permission_preset_auto`，否则 `409`；`full-access` 须用户显式选择（界面有风险确认），不改全局 profile 与项目信任（`--no-approve` 只是启动期项目信任，不是用户审批）。结构化问题（`method: question`）在任何预设下仍需显式 `answers`，私密/secret 输入永不投射到浏览器 |
 
 附件最多 4 张，限 PNG/JPEG/GIF/WebP。工具批准、衍生动作或提问一律展示给操作者，不替操作者选值。
 

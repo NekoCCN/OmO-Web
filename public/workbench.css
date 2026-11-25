@@ -1,5 +1,85 @@
 #cli-history-list .session-link { justify-content: stretch; }
 
+#details-dialog {
+  min-inline-size: 0;
+  min-block-size: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--inspect-surface);
+  color: var(--iris-ink);
+}
+#details-dialog[open] { display: grid; grid-template-rows: auto auto minmax(0, 1fr); }
+#details-dialog:modal {
+  position: fixed;
+  inset: auto 0 0;
+  margin: 0 auto;
+  inline-size: min(100%, var(--dialog-width));
+  max-inline-size: 100%;
+  block-size: min(88dvh, var(--measure));
+  max-block-size: none;
+  border-radius: var(--r3) var(--r3) 0 0;
+}
+.details-toolbar {
+  padding: var(--s3) var(--s4);
+  gap: var(--s1);
+}
+.details-toolbar .button { color: var(--iris-muted); }
+.runtime-index {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  padding: 0 var(--s4) var(--s2);
+  gap: var(--s1);
+  border-block-end: var(--stroke) solid var(--line);
+}
+.runtime-index .button { padding-inline: var(--s1); color: var(--iris-muted); white-space: nowrap; }
+.runtime-index .button:hover, .runtime-index .button[aria-selected="true"] {
+  background: var(--iris-tint); color: var(--iris-ink);
+}
+.runtime-index .button[aria-selected="true"] { font-weight: 750; border-block-end-color: var(--line); }
+#details-button[aria-expanded="true"] { background: var(--iris-tint); color: var(--iris-ink); }
+.details-scroll {
+  min-block-size: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: var(--s4) var(--s4) max(var(--s4), env(safe-area-inset-bottom));
+}
+.runtime-panel { gap: var(--s6); }
+.runtime-panel .muted, .runtime-panel :is(dt, summary) { color: var(--iris-muted); }
+.runtime-panel > .subpanel:first-child { border: 0; padding-block-start: 0; }
+.runtime-panel .subpanel { padding-block-start: var(--s4); }
+.runtime-panel .button:not(.button--quiet, .button--danger) { color: var(--ink); }
+#runtime-metrics .button--danger:active:not(:disabled) { color: var(--error); background: var(--error-tint); }
+#details-error:not([hidden]) { margin-block-end: var(--s4); }
+.runtime-metrics { gap: var(--s4); }
+.metric-group { gap: var(--s1); min-inline-size: 0; }
+.metric-label { color: var(--iris-ink); font-weight: 650; }
+.metric-group .details-list { grid-template-columns: minmax(0, 5fr) minmax(0, 4fr); gap: 0 var(--s2); }
+.metric-group :is(dt, dd) { padding-block: var(--s1); border-block-start: var(--stroke) solid var(--line); }
+.metric-group dd { text-align: end; font-weight: 600; }
+.metric-group .metric-unreported { color: var(--iris-muted); font-weight: 400; }
+
+.workspace:has(#details-dialog[open]:not(:modal)) {
+  grid-template-columns: var(--rail-width) minmax(0, 1fr) var(--inspector-width);
+}
+#details-dialog[open]:not(:modal) {
+  position: static;
+  grid-area: 1 / 3;
+  inline-size: auto;
+  block-size: auto;
+  max-block-size: none;
+  margin: 0;
+  border: 0;
+  border-inline-start: var(--stroke) solid var(--line);
+  border-radius: 0;
+  box-shadow: none;
+}
+
+#approval { color: var(--accent); background: var(--tint); font-size: var(--small); font-weight: 650; }
+#approval[data-preset="full-access"] { color: var(--warning); background: var(--warning-tint); }
+#approval:disabled { opacity: 1; border-color: var(--line); background: color-mix(in srgb, var(--surface) 40%, var(--tint)); }
+#approval[data-preset="full-access"]:disabled { background: color-mix(in srgb, var(--surface) 40%, var(--warning-tint)); }
+#compose-options-button[aria-expanded="true"] { color: var(--accent); background: var(--tint); }
+
 #handoff-receipt { min-inline-size: 0; inline-size: 100%; }
 #handoff-command { white-space: pre-wrap; }
 #handoff-command code { overflow-wrap: anywhere; }
@@ -31,6 +111,15 @@
 }
 
 @media (max-width: 760px) {
+  .workspace:has(#details-dialog[open]:not(:modal)) {
+    grid-template-columns: 0 minmax(0, 1fr) min(var(--inspector-width), 50%);
+  }
+  .workspace:has(#details-dialog[open]:not(:modal)) .main { grid-column: 2; }
+  .metric-group .details-list { grid-template-columns: minmax(0, 1fr) minmax(calc(var(--s8) * 5), 1fr); }
+  #approval { padding-inline: var(--s2); }
+  #compose-options-button { padding-inline: var(--s2); }
+  #stop.button--danger:not([hidden]) ~ .button { min-inline-size: var(--touch); }
+  .compose-toolbar:has(#stop.button--danger:not([hidden])) { row-gap: var(--s2); }
   #cli-live-transcript {
     max-block-size: min(var(--code-height), calc(100dvh / 3));
   }

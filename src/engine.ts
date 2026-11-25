@@ -28,9 +28,9 @@ class Peer {
   readonly #exit: Promise<void>;
 
   constructor(command: readonly [string, ...string[]], cwd: string,
-    onEvent: (frame: WireObject) => void, onExit: (error: WebError) => void) {
+    onEvent: (frame: WireObject) => void, onExit: (error: WebError) => void, env?: NodeJS.ProcessEnv) {
     const [program, ...args] = command;
-    this.#proc = spawn(program, args, { cwd, env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    this.#proc = spawn(program, args, { cwd, env: env ?? process.env, stdio: ["pipe", "pipe", "pipe"] });
     // The engine can print local paths and provider diagnostics to stderr. Drain it without forwarding it to the browser.
     this.#proc.stderr.resume();
     this.#proc.stdout.setEncoding("utf8");
@@ -120,7 +120,19 @@ export class Engine {
 
   constructor(readonly command: readonly [string, ...string[]], readonly cwd: string,
     readonly onEvent: (event: WireObject) => void, readonly onStatus: (status: EngineStatus) => void,
-    readonly transport?: EngineSocketTransport) {}
+    readonly transport?: EngineSocketTransport,
+    readonly scope: { readonly privateHost?: boolean; readonly env?: NodeJS.ProcessEnv } = {}) {}
+
+  /** Web-owned private non-listening stdio host. Socket hosts are never private:
+   * a discoverable endpoint lets another stock TUI attach instead of refusing. */
+  get isPrivateHost(): boolean {
+    return this.scope.privateHost === true;
+  }
+
+  /** A listening host publishes an attach endpoint; scoped force release never applies there. */
+  get usesListeningTransport(): boolean {
+    return this.transport?.kind === "socket";
+  }
 
   get usesPrivateSocketTransport(): boolean {
     return this.transport?.kind === "socket";
@@ -153,7 +165,7 @@ export class Engine {
     const socket = this.transport?.kind === "socket" ? this.transport : undefined;
     let peer: Connection | undefined;
     const launchSocket = async (): Promise<Connection> => {
-      if (!socket) return new Peer(this.command, this.cwd, this.onEvent, onExit);
+      if (!socket) return new Peer(this.command, this.cwd, this.onEvent, onExit, this.scope.env);
       try {
         return await SocketPeer.launch({
           command: [...this.command, "--listen", `unix://${socket.socketPath}`, "--session-runtime", "in-process"],

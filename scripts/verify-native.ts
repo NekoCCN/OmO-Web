@@ -57,7 +57,7 @@ try {
   const settings: AppSettings = {
     dataDir: join(directory, "web"), workspaces: [workspace], port: 0,
     cliAgentDir: profile,
-    engineCommand: [process.env.OMO_WEB_BIN || "omo", "--mode", "rpc", "--multi-session", "--offline", "--no-approve"],
+    engineCommand: [process.env.OMO_WEB_BIN || "omo", "--mode", "rpc", "--multi-session", "--offline", "--no-approve", "--session-runtime", "in-process"],
   };
   async function connect() {
     const connection = await startApp(settings);

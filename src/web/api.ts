@@ -45,6 +45,7 @@ export type Action =
   | { readonly action: "archive" | "settle" | "fast" | "autoCompaction"; readonly enabled: boolean }
   | { readonly action: "model"; readonly provider: string; readonly modelId: string }
   | { readonly action: "thinking"; readonly level: string }
+  | { readonly action: "preset"; readonly preset: "ask" | "auto" | "full-access" }
   | { readonly action: "compact"; readonly instructions?: string }
   | { readonly action: "navigate"; readonly targetId: string | null }
   | ({ readonly action: "answer"; readonly requestId: string } & Answer);

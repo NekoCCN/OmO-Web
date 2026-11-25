@@ -64,7 +64,7 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   const permission = Boolean(request.toolCallId) && method !== "question";
   const node = el("form", "panel stack request-form");
   const label = method === "question" ? "待回答问题" : permission ? "工具批准" : "等待你的决定";
-  const heading = el("h3", "", label);
+  const heading = el("h2", "", label);
   node.append(heading);
   if (title) node.append(el("p", "plain", title));
   if (str(request.message)) node.append(el("p", "plain muted", str(request.message)));

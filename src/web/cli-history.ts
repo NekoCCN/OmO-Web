@@ -4,7 +4,8 @@ import { showNativeActivity } from "./details.ts";
 import { byId, button, el, errorText, list, notice, num, object, str } from "./dom.ts";
 import { roleOf, Transcript } from "./transcript.ts";
 
-type HistoryRow = { readonly id: string; readonly name: string; readonly cwd: string; readonly updatedAt: number };
+type HistoryRow = { readonly id: string; readonly name: string; readonly cwd: string; readonly updatedAt: number;
+  readonly adopted: boolean };
 
 const box = (id: string) => byId(id, HTMLElement);
 const btn = (id: string) => byId(id, HTMLButtonElement);
@@ -51,7 +52,8 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       const li = el("li");
       const open = button("", () => openRecord(row), "button--quiet session-link");
       open.dataset.history = row.id;
-      open.append(el("span", "", row.name), el("span", "small muted path", row.cwd), el("small", "", time(row.updatedAt)));
+      open.append(el("span", "", row.name), el("span", "small muted path", row.cwd), el("small", "", time(row.updatedAt)),
+        ...(row.adopted ? [el("small", "muted", "已在 Web 打开")] : []));
       li.append(open);
       rows.append(li);
     }
@@ -73,7 +75,8 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       available = data.available === true;
       items = list(data.sessions).map(object).flatMap(row => {
         const id = str(row.id);
-        return id ? [{ id, name: str(row.name) || "未命名 CLI 会话", cwd: str(row.cwd), updatedAt: num(row.updatedAt) ?? 0 }] : [];
+        return id ? [{ id, name: str(row.name) || "未命名 CLI 会话", cwd: str(row.cwd), updatedAt: num(row.updatedAt) ?? 0,
+          adopted: row.adopted === true }] : [];
       });
     } catch (error) {
       if (!request.signal.aborted && modal.open) notice(box("cli-history-list-error"), `无法读取 CLI 历史：${errorText(error)}`);
@@ -221,14 +224,22 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     stopRecord();
     onClose();
   });
-  function open(): void {
-    if (modal.open) return;
-    stopRecord();
-    record.hidden = true;
-    index.hidden = false;
-    filter.value = "";
-    modal.showModal();
-    void loadList();
+  /** Open the dialog; with a history id, jump straight to that record once
+   * the list loads. Reading a record never opens a route, so sidebar preview
+   * cannot seize the holder: entering still goes through explicit resume. */
+  function open(recordId?: string): void {
+    if (!modal.open) {
+      stopRecord();
+      record.hidden = true;
+      index.hidden = false;
+      filter.value = "";
+      modal.showModal();
+    }
+    void loadList().then(() => {
+      if (!modal.open || recordId === undefined) return;
+      const row = items.find(item => item.id === recordId);
+      if (row) openRecord(row);
+    });
   }
   return { open, update };
 }

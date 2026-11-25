@@ -11,7 +11,7 @@ const cwd = "/tmp/omo-synthetic/workspace";
 const command = `cd '${cwd}' && omo --session '/tmp/omo-synthetic/<session-with-a-long-path-${"a".repeat(90)}>.jsonl'`;
 const row = { id: bookmarkId, name: "合成同一会话", cwd, updatedAt: 2, archived: false, settled: false, active: true, running: false };
 const other = { ...row, id: otherId, name: "另一个 Web 会话", updatedAt: 1 };
-const record = { id: historyId, name: row.name, cwd, updatedAt: 2 };
+const record = { id: historyId, name: row.name, cwd, updatedAt: 2, adopted: true };
 const historyMessage = { role: "user", content: "CLI 历史中的合成消息", timestamp: 2 };
 const held = { code: "session_held", error: "会话正在另一端打开，请关闭 CLI 后再试。" };
 const busy = { code: "session_busy", error: "会话正在运行，请等待当前回合结束后再交接。" };
@@ -31,8 +31,8 @@ async function fixture(supported = true) {
   let published = false;
   let resumed = false;
   const support = supported ? { supported: true } : unsupported;
-  const gates: { history?: () => Promise<void>; release?: () => Promise<void>; held: boolean; busy: boolean } = {
-    held: false, busy: false };
+  const gates: { history?: () => Promise<void>; release?: () => Promise<void>; held: boolean; busy: boolean;
+    unadopted: boolean } = { held: false, busy: false, unadopted: false };
   const sessions = () => ({ sessions: published ? [{ ...row, active }, other] : [other] });
   const snapshot = (session: typeof row) => Response.json({ session, state: { isStreaming: false, pendingDialogs: [], pendingQuestions: [] },
     messages: session.id === row.id ? [historyMessage, ...(resumed ? [{ ...historyMessage, content: "CLI 退出后保存的新消息" }] : [])] : [],
@@ -80,8 +80,8 @@ async function fixture(supported = true) {
     }, { status: 409 });
     if (path === `/api/sessions/${otherId}`) return snapshot(other);
     if (path.startsWith("/api/sessions/") && path.endsWith("/options")) return Response.json({ models: [], levels: [], commands: [] });
-    if (path === "/api/cli-history") return Response.json({ available: true, sessions: [record] });
-    if (path === `/api/cli-history/${historyId}`) return Response.json({ session: record, messages: [historyMessage] });
+    if (path === "/api/cli-history") return Response.json({ available: true, sessions: [{ ...record, adopted: !gates.unadopted }] });
+    if (path === `/api/cli-history/${historyId}`) return Response.json({ session: { ...record, adopted: !gates.unadopted }, messages: [historyMessage] });
     if (path === `/api/cli-history/${historyId}/activity`) return Response.json({ status: "unavailable", reason: "no-agent-dir" });
     if (path === "/api/cli-live") return Response.json({ available: false, sessions: [] });
     if (path === "/app.js") return new Response(script, { headers: { "Content-Type": "text/javascript" } });
@@ -113,7 +113,7 @@ function page(view: Bun.WebView, width: number) {
   const nav = async () => { if (width < 761) await click("#open-navigation"); };
   return {
     visible, click,
-    async history() { await nav(); await click("#cli-history-button"); await click("#cli-history-list button"); await visible("#cli-history-messages article", historyMessage.content); },
+    async history() { await nav(); await click("#cli-history-button"); await visible("#cli-history-list button", "已在 Web 打开"); await click("#cli-history-list button"); await visible("#cli-history-messages article", historyMessage.content); },
     async select(id: string) { await nav(); await click(`#session-list button[data-session="${id}"]`); },
     async check(name: string) {
       expect(await view.evaluate("innerWidth")).toBe(width);
@@ -257,3 +257,26 @@ test.skipIf(!chromium)("an older host leaves history readable and handoff unavai
     expect(f.posted).toEqual([]);
   } finally { f.close(); }
 });
+
+test.skipIf(!chromium)("fresh page discovers unadopted CLI sessions in the sidebar", async () => {
+  if (!chromium) throw new Error("Set OMO_HANDOFF_CHROMIUM to an isolated Chromium executable.");
+  const f = await fixture();
+  f.gates.unadopted = true;
+  try {
+    using view = new Bun.WebView({ backend: { type: "chrome", url: false, path: chromium }, width: 1440 });
+    const p = page(view, 1440);
+    await view.navigate(f.url);
+    // No dialog is opened: the ordinary sidebar itself lists the CLI journal.
+    await p.visible("#cli-sessions:not([hidden])");
+    await p.visible("#cli-session-list button", record.name);
+    // Previewing from the sidebar reads the record without seizing the holder.
+    await p.click("#cli-session-list button");
+    await p.visible("#cli-history-messages article", historyMessage.content);
+    await p.visible("#cli-history-activity section h3");
+    expect(await view.evaluate(`Array.from(document.querySelectorAll("#runtime-shortcuts [role=tab]"), tab => {
+      const id = tab.getAttribute("aria-controls");
+      return Array.from(document.querySelectorAll("#" + CSS.escape(id))).map(panel => panel.getAttribute("role"));
+    })`)).toEqual([["tabpanel"], ["tabpanel"], ["tabpanel"], ["tabpanel"]]);
+    expect(f.posted).toEqual([]);
+  } finally { f.close(); }
+}, 25000);

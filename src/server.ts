@@ -1,12 +1,11 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { realpath, rm } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z, ZodError } from "zod";
 import { CliHistory } from "./cli-history.ts";
 import type { CliSessionSummary } from "./cli-history.ts";
 import { Engine } from "./engine.ts";
-import { createPrivateSocketDir } from "./engine-socket.ts";
 import { NativeActivity } from "./native-activity.ts";
 import type { NativeActivityView } from "./native-activity.ts";
 import { actions, emptyBody, openInput, sessionKey, WebError } from "./protocol.ts";
@@ -22,7 +21,6 @@ export type AppSettings = {
   readonly engineCommand: readonly [string, ...string[]];
   readonly port: number;
   readonly cliAgentDir?: string;
-  readonly engineSocketAgentDir?: string;
 };
 
 const headers = {
@@ -82,7 +80,7 @@ export async function startApp(settings: AppSettings) {
   const profile = settings.cliAgentDir?.trim() || undefined;
   const history = new CliHistory(profile, roots);
   const native = new NativeActivity(profile);
-  let historySessions = new Map<string, CliSessionSummary>();
+  let historySessions = new Map<string, CliSessionSummary & { readonly nativeSessionId: string }>();
   const historyKey = (session: CliSessionSummary) =>
     createHmac("sha256", tokenBytes).update(JSON.stringify([session.cwd, session.id])).digest("hex");
   async function activityFor(durableId: string, cwd: string): Promise<Response> {
@@ -104,22 +102,27 @@ export async function startApp(settings: AppSettings) {
   };
   const fanout = (event: WireObject) => { if (clients.size) publish(frame(event)); };
   const terminals = new TerminalSessions(profile, roots, id => fanout({ type: "cli-live", id }));
-  const socketAgentDir = settings.engineSocketAgentDir?.trim() || undefined;
-  const socketDir = socketAgentDir ? await createPrivateSocketDir() : undefined;
+  // Default sharing primary: the engine is a Web-owned private non-listening
+  // stdio host whose profile env is pinned to the configured agent dir, so its
+  // journals land in the same bucket CliHistory scans. Listening socket hosts
+  // are not offered: a discoverable endpoint lets another stock TUI attach to
+  // the Web host instead of being refused by the native holder guard.
+  const cliProfileDir = profile === undefined ? undefined : resolve(profile);
   const engine = new Engine(settings.engineCommand, root, event => sessions.event(event), status => {
     if (!status.online) sessions.disconnected();
     fanout({ type: "engine", engine: status });
-  }, socketAgentDir && socketDir ? {
-    kind: "socket",
-    socketPath: `${socketDir}/engine.sock`,
-    keyRoot: socketAgentDir,
-  } : undefined);
-  const cliProfileDir = profile === undefined ? undefined : resolve(profile);
-  const socketKeyRoot = settings.engineSocketAgentDir?.trim() ? resolve(settings.engineSocketAgentDir) : undefined;
+  }, undefined, cliProfileDir === undefined ? undefined : { privateHost: true, env: { ...process.env,
+    OMO_CODING_AGENT_DIR: cliProfileDir, SENPI_CODING_AGENT_DIR: cliProfileDir, PI_CODING_AGENT_DIR: cliProfileDir,
+    // Controlled client capability, not user config: private in-process stdio
+    // ignores `question` from set_client_info, so native ask_user_question
+    // would fall back to a select dialog and lose structured UI. Verified on
+    // omo 5.1.81: this env restores real pendingQuestions with explicit settle.
+    OMO_RPC_CLIENT_CAPABILITIES: "question", SENPI_RPC_CLIENT_CAPABILITIES: "question",
+    PI_RPC_CLIENT_CAPABILITIES: "question" } });
   const sessions = new Sessions(settings.dataDir, roots, engine, fanout,
     async (nativeSessionId, cwd) => history.branchSource(nativeSessionId, cwd),
-    { sameProfile: cliProfileDir !== undefined && socketKeyRoot !== undefined && cliProfileDir === socketKeyRoot,
-      ...(socketKeyRoot === undefined ? {} : { profileDir: socketKeyRoot }) });
+    { sameProfile: cliProfileDir !== undefined,
+      ...(cliProfileDir === undefined ? {} : { profileDir: cliProfileDir }) });
   await sessions.load();
   function selectedHistory(id: string | undefined): CliSessionSummary {
     const selected = id === undefined ? undefined : historySessions.get(id);
@@ -165,11 +168,16 @@ export async function startApp(settings: AppSettings) {
         if (pathname === "/api/sessions") return json({ sessions: sessions.list() });
         if (pathname === "/api/cli-live") return json(await terminals.list());
         if (pathname === "/api/cli-history") {
-          const { available, sessions: rows } = await history.list();
+          const { available, sessions: rows } = await history.listWithIds();
           historySessions = new Map(rows.map(row => [historyKey(row), row]));
           return json({
             available,
-            sessions: [...historySessions].map(([id, { name, cwd, updatedAt }]) => ({ id, name, cwd, updatedAt })),
+            sessions: [...historySessions].map(([id, { name, cwd, updatedAt, nativeSessionId }]) => ({
+              id, name, cwd, updatedAt,
+              // Coalesce logical aliases by native id and cwd: an adopted row
+              // enters the existing Web alias (holder admission still applies).
+              adopted: sessions.findAlias(nativeSessionId, cwd) !== undefined,
+            })),
           });
         }
         const historyRoute = /^\/api\/cli-history\/([a-f0-9]{64})(\/activity)?$/.exec(pathname);
@@ -180,7 +188,8 @@ export async function startApp(settings: AppSettings) {
           if (session.cwd !== selected.cwd) throw new WebError(404, "history_not_found", "找不到这条 CLI 历史，请刷新列表。");
           if (activity) return await activityFor(internal.nativeSessionId, session.cwd);
           const { name, cwd, updatedAt } = session;
-          return json({ session: { id, name, cwd, updatedAt }, messages });
+          return json({ session: { id, name, cwd, updatedAt,
+            adopted: sessions.findAlias(internal.nativeSessionId, session.cwd) !== undefined }, messages });
         }
         if (pathname === "/api/events") {
           if (clients.size >= MAX_STREAM_CLIENTS) throw new WebError(429, "too_many_streams", "打开的页面太多，请关闭部分页面后重试。");
@@ -310,7 +319,6 @@ export async function startApp(settings: AppSettings) {
         terminals.stop();
         for (const client of clients) disconnect(client);
         await Promise.all([server.stop(true), engine.stop()]);
-        if (socketDir) await rm(socketDir, { recursive: true, force: true });
       })();
       return closing;
     },

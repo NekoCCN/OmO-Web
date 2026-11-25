@@ -155,7 +155,9 @@ describe("private socket transport against the real engine", () => {
       socketPath,
       keyRoot: profile,
       env: { ...process.env, OMO_CODING_AGENT_DIR: profile, SENPI_CODING_AGENT_DIR: profile,
-        PI_CODING_AGENT_DIR: profile, SENPI_RPC_REQUIRE_TOKEN: "1" },
+        PI_CODING_AGENT_DIR: profile, SENPI_RPC_REQUIRE_TOKEN: "1",
+        OMO_RPC_CLIENT_CAPABILITIES: "question", SENPI_RPC_CLIENT_CAPABILITIES: "question",
+        PI_RPC_CLIENT_CAPABILITIES: "question" },
     });
     cleanups.push(async () => {
       await peer.stop().catch(() => undefined);
@@ -179,8 +181,8 @@ describe("private socket transport against the real engine", () => {
       workspaces: [workspace],
       port: 0,
       cliAgentDir: profile,
-      engineSocketAgentDir: profile,
-      engineCommand: [process.env.OMO_WEB_BIN || "omo", "--mode", "rpc", "--multi-session", "--offline", "--no-approve"],
+      engineCommand: [process.env.OMO_WEB_BIN || "omo", "--mode", "rpc", "--multi-session", "--offline",
+        "--no-approve", "--session-runtime", "in-process"],
     });
     cleanups.push(async () => app.stop());
     const boot = await (await fetch(new URL("/api/bootstrap", app.url))).json();

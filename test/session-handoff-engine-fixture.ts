@@ -1,14 +1,20 @@
 import { createInterface } from "node:readline";
-import { appendFile, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 /**
  * File-backed stdio fixture for the sequential-handoff HTTP tests.
  * Real OmO journals live under the configured agent profile; open_session
  * resolves them by path exactly like the native host, including the
- * cross-process holder guard (SESSION_HANDOFF_HELD). The transport is stdio,
- * so handoff stays unsupported here; the quiet release matrix is covered by
- * the in-process fake inside session-handoff.test.ts.
+ * cross-process holder guard (SESSION_HANDOFF_HELD). Pathless opens generate
+ * the native bucket journal under SESSION_HANDOFF_PROFILE and bind the
+ * durable id, like the version-native runtime. Plain takeover release answers
+ * `attached` (the version-native miscount); only the scoped force retry
+ * releases. The quiet release matrix beyond that lives in the in-process fake
+ * inside session-handoff.test.ts.
  */
+const bucketFor = (profile: string, cwd: string): string =>
+  join(profile, "sessions", `--${cwd.slice(1).replace(/[/\\:]/g, "-")}--`);
 const held = new Set(
   (process.env.SESSION_HANDOFF_HELD ?? "").split(",").map(entry => entry.trim()).filter(Boolean),
 );
@@ -95,7 +101,20 @@ for await (const line of lines) {
         ok(request.id, {}, request.type);
         continue;
       case "open_session": {
-        const path = String(request.sessionPath);
+        const folder = String(request.cwd);
+        const durable = typeof request.durableSessionId === "string" && request.durableSessionId
+          ? String(request.durableSessionId) : undefined;
+        let path = typeof request.sessionPath === "string" ? String(request.sessionPath) : undefined;
+        if (path === undefined) {
+          const profile = process.env.SESSION_HANDOFF_PROFILE;
+          if (!profile) {
+            refused(request.id, request.type, "engine_refused", "No shared profile for a native-placed open.");
+            continue;
+          }
+          const bucket = bucketFor(profile, folder);
+          await mkdir(bucket, { recursive: true });
+          path = join(bucket, `${Date.now()}_${durable ?? crypto.randomUUID()}.jsonl`);
+        }
         if (held.has(path)) {
           refused(request.id, request.type, "session_held", "会话正被另一进程持有。");
           continue;
@@ -111,11 +130,11 @@ for await (const line of lines) {
           header = parseJournal(await readFile(path, "utf8")).header;
         } catch (error) {
           if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
-          header = { type: "session", version: 3, id: crypto.randomUUID(),
-            timestamp: new Date().toISOString(), cwd: String(request.cwd) };
+          header = { type: "session", version: 3, id: durable ?? crypto.randomUUID(),
+            timestamp: new Date().toISOString(), cwd: folder };
           await writeFile(path, `${JSON.stringify(header)}\n`, { flag: "wx", mode: 0o600 });
         }
-        if (header.cwd !== request.cwd) {
+        if (header.cwd !== folder) {
           refused(request.id, request.type, "open_failed", "工作目录与日志不一致。");
           continue;
         }
@@ -124,6 +143,37 @@ for await (const line of lines) {
         byPath.set(path, sessionId);
         ok(request.id, { sessionId, attached: false, state: await stateOf(path),
           permissionPreset: "ask", permissionPresetStatus: "applied" }, request.type);
+        continue;
+      }
+      case "list_sessions": {
+        const sessions = [];
+        for (const [sessionId, item] of runtimes) {
+          const { header } = parseJournal(await readFile(item.path, "utf8"));
+          sessions.push({ sessionId, durableSessionId: header.id, sessionPath: item.path,
+            cwd: header.cwd, kind: "interactive", attachments: 1 });
+        }
+        ok(request.id, { sessions }, request.type);
+        continue;
+      }
+      case "release_session": {
+        if (!runtime) throw Object.assign(new Error("unknown"), { code: "unknown_session" });
+        if (request.reason !== "takeover") {
+          refused(request.id, request.type, "invalid_release_reason", "Bad reason.");
+          continue;
+        }
+        if (request.force !== true) {
+          refused(request.id, request.type, "attached", "Another client is attached.");
+          continue;
+        }
+        const { entries } = parseJournal(await readFile(runtime.path, "utf8"));
+        const leaf = runtime.leaf ?? leafOf(entries);
+        await appendFile(runtime.path, `${JSON.stringify({ type: "custom", id: crypto.randomUUID(),
+          parentId: leaf, timestamp: new Date().toISOString(), customType: "session_released",
+          details: { reason: "takeover", interrupted: false, attachments: [], released_at: new Date().toISOString() } })}\n`);
+        runtimes.delete(route);
+        if (byPath.get(runtime.path) === route) byPath.delete(runtime.path);
+        ok(request.id, { released: true, session_path: runtime.path, attachments: 1,
+          dropped: { deliveries: [], user_messages: [] } }, request.type);
         continue;
       }
       case "close_session":

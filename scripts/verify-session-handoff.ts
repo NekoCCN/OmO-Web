@@ -69,11 +69,12 @@ const env = {
   XDG_CONFIG_HOME: join(root, "config"), XDG_STATE_HOME: join(root, "state"),
   XDG_CACHE_HOME: join(root, "cache"), XDG_DATA_HOME: join(root, "data"),
   OMO_CODING_AGENT_DIR: profile, SENPI_CODING_AGENT_DIR: profile, PI_CODING_AGENT_DIR: profile,
-  SENPI_TEST_AGENT_DIR_GUARD: "1", SENPI_RPC_REQUIRE_TOKEN: "1", TERM: "xterm-256color", NO_PROXY: "127.0.0.1,localhost",
+  SENPI_TEST_AGENT_DIR_GUARD: "1", SENPI_RPC_CLIENT_CAPABILITIES: "question", TERM: "xterm-256color", NO_PROXY: "127.0.0.1,localhost",
 };
 const entry = [process.execPath, "--no-orphans", "--no-env-file", cliMain] as const;
 const isolated = ["/usr/bin/env", "-i", ...Object.entries(env).map(([key, value]) => `${key}=${value}`)] as const;
-const engineCommand = [...isolated, ...entry, "--mode", "rpc", "--multi-session", "--offline", "--no-approve"] as const;
+const engineCommand = [...isolated, ...entry, "--mode", "rpc", "--multi-session",
+  "--offline", "--no-approve", "--session-runtime", "in-process"] as const;
 const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
 async function until(label: string, predicate: () => boolean | Promise<boolean>) {
@@ -162,11 +163,10 @@ async function launchBrowser(): Promise<BrowserProof> {
   return harness.openBrowserProof();
 }
 async function start() {
-  const configured = { engineSocketAgentDir: profile };
-  app = await startApp({ dataDir, workspaces: [cwd], cliAgentDir: profile, port: 0, engineCommand, ...configured });
+  app = await startApp({ dataDir, workspaces: [cwd], cliAgentDir: profile, port: 0, engineCommand });
   origin = app.url.origin;
   const boot = await request("/api/bootstrap");
-  assert.equal(record(boot.engine).online, true, "The private authenticated native Web engine must be online");
+  assert.equal(record(boot.engine).online, true, "The private non-listening native Web engine must be online");
   assert.equal(typeof boot.token, "string");
   token = String(boot.token);
   return origin;
@@ -353,11 +353,17 @@ try {
   const afterNavigation = array((await request(webBornApi)).messages).map(textOf);
   assert(afterNavigation.some(text => text.includes(webCreated)));
   assert(!afterNavigation.some(text => text.includes(oldBranch)));
-  const [webBornFile, ...extras] = (await readdir(webStore)).filter(name => name.endsWith(".jsonl"));
-  assert(webBornFile && extras.length === 0, "There is only one Web-origin conversation journal");
-  const webBornPath = join(webStore, webBornFile);
+  const [webBornPath, ...extras] = (await journalFiles()).filter(path => !paths.includes(path));
+  assert(webBornPath && extras.length === 0, "There is only one Web-origin journal in the shared native store");
+  assert.deepEqual((await readdir(webStore)).filter(name => name.endsWith(".jsonl")), []);
   const webBornHeader = record(JSON.parse((await readFile(webBornPath, "utf8")).split("\n", 1)[0]));
   assert(typeof webBornHeader.id === "string");
+  const cannotAttach = terminal(cwd, [...entry, "--session", webBornPath]);
+  terminals.add(cannotAttach);
+  await until("a stock TUI cannot attach to the Web-held journal",
+    () => cannotAttach.sees("Not opened:") && cannotAttach.sees("close it there"));
+  await cannotAttach.stop();
+  assert(!calls.some(call => call.turn === fromWeb));
   const webBornCommand = (await request(`${webBornApi}/handoff`, {})).command;
   assert(typeof webBornCommand === "string" && webBornCommand.includes(webBornPath));
   const webBornCli = runCopiedCommand(webBornCommand, fromWeb);
@@ -388,6 +394,7 @@ try {
   assert(forkMessages.some(text => text.includes(seed)) && !forkMessages.some(text => text.includes(web)));
   assert(cloneMessages.some(text => text.includes(webAgain)));
   assert.equal(await readFile(owned.path, "utf8"), adoptedBefore, "Separate branches must not change the adopted journal");
+  assert.equal((await journalFiles()).length, paths.length + 3, "Both branches are discoverable in the native store");
   assert.equal(calls.length, 8, "Fork and Clone are not prompts");
   console.log("NATIVE_SESSION_HANDOFF_OK same-journal same-native-id live-holder-rejected busy-release-rejected restart-resumed branch-preserved requests-once");
   if (browser) console.log("BROWSER_SESSION_HANDOFF_OK real-CLI recorded-history main-workbench release resume");

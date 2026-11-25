@@ -1,11 +1,13 @@
 import { link, lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { composeMessage, projectCommands, resolveCommand } from "./commands.ts";
 import { WebError, array, browserEvent, model, pick, record, sessionKey, state, transcriptMessage, transcriptTree } from "./protocol.ts";
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
 import type { Engine } from "./engine.ts";
-import { readOwnedJournalHeader } from "./cli-history.ts";
+import { readOwnedJournalHeader, sessionDirName } from "./cli-history.ts";
+import { projectRuntimeBranch } from "./runtime-branch.ts";
+import { projectSessionMemory } from "./runtime-metrics.ts";
 import { branchBusy, loadBranchSource, loadSavedWebBranch, nativeBranchError, SessionBranches, staleBranch } from "./session-branches.ts";
 import type { BranchOptions, BranchSelection, BranchSource, LoadedBranchSource, PreparedBranch } from "./session-branches.ts";
 
@@ -18,6 +20,9 @@ const savedSession = z.strictObject({
   settled: z.boolean(),
   nativeId: z.string().min(1).max(200).optional(),
   cliBookmark: z.boolean().optional(),
+  /** Web session whose journal lives in the shared native profile bucket (native-placed).
+   * Legacy rows without this flag keep their private dataDir journal. */
+  shared: z.boolean().optional(),
 });
 type SavedSession = Readonly<z.infer<typeof savedSession>>;
 export type SessionView = Omit<SavedSession, "nativeId" | "cliBookmark"> & { readonly active: boolean; readonly running: boolean };
@@ -112,9 +117,29 @@ export class Sessions {
     try { await queued; } finally { if (this.#writes.get(id) === queued) this.#writes.delete(id); }
   }
 
+  /** Default sharing primary: when the private host and profile layout are
+   * available, the native runtime places the new journal itself (pathless open)
+   * under the shared profile bucket and binds the durable id. Otherwise the
+   * legacy private dataDir journal is used, never a silent half-shared mix. */
   async create(cwd: string, name = "新会话"): Promise<SessionView> {
     if (!this.workspaces.includes(cwd)) throw new WebError(403, "workspace_refused", "只能选择启动配置中允许的工作目录。");
     const id = sessionKey.parse(crypto.randomUUID());
+    const sharedDir = await this.#sharedProfileDir().catch(() => undefined);
+    if (sharedDir !== undefined) {
+      const durable = crypto.randomUUID();
+      const row: SavedSession = { id, cwd, name, updatedAt: Date.now(), archived: false,
+        settled: false, nativeId: durable, shared: true };
+      await this.#open(row, { durableId: durable, nativePlaced: { profileDir: sharedDir }, publishName: true });
+      try {
+        await this.#persist(id, () => row);
+      } catch (error) {
+        const route = this.#live.get(id)?.route;
+        this.#live.delete(id);
+        if (route) await this.engine.requestExisting("close_session", { sessionId: route }).catch(() => undefined);
+        throw error;
+      }
+      return this.#view(row);
+    }
     const row: SavedSession = { id, cwd, name, updatedAt: Date.now(), archived: false, settled: false };
     await this.#open(row, { publishName: true });
     try {
@@ -128,7 +153,21 @@ export class Sessions {
     return this.#view(row);
   }
 
-  async #open(row: SavedSession, opts: { branchNativeId?: string; sourcePath?: string; durableId?: string; publishName?: boolean } = {}): Promise<WireObject> {
+  /** Profile directory eligible for native-placed journals, or undefined for
+   * legacy private journals. Never throws: callers fall back to private mode. */
+  async #sharedProfileDir(): Promise<string | undefined> {
+    try {
+      await this.#requirePrivateHost("resume_unsupported");
+    } catch {
+      return undefined;
+    }
+    const dir = this.hostGuard?.profileDir;
+    if (this.hostGuard?.sameProfile !== true || !dir) return undefined;
+    return dir;
+  }
+
+  async #open(row: SavedSession, opts: { branchNativeId?: string; sourcePath?: string; durableId?: string;
+    publishName?: boolean; nativePlaced?: { profileDir: string } } = {}): Promise<WireObject> {
     let actual: string | undefined;
     try { actual = await realpath(row.cwd); } catch (error) {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
@@ -136,10 +175,12 @@ export class Sessions {
     if (!this.workspaces.includes(row.cwd) || actual !== row.cwd) {
       throw new WebError(403, "workspace_refused", "工作目录已不在启动配置中，或目标路径已改变。");
     }
-    const sessionPath = opts.sourcePath ?? join(this.#directory, `${row.id}.jsonl`);
+    // Native-placed (shared) opens omit sessionPath: the runtime generates the
+    // journal under the shared profile bucket. All other opens pin the path.
+    const sessionPath = opts.nativePlaced ? undefined : (opts.sourcePath ?? join(this.#directory, `${row.id}.jsonl`));
     const fields: WireObject = {
       cwd: row.cwd,
-      sessionPath,
+      ...(sessionPath === undefined ? {} : { sessionPath }),
       permissionPreset: "ask",
       kind: "interactive",
       retain_on_disconnect: true,
@@ -155,10 +196,7 @@ export class Sessions {
     const initial = record(result.state);
     const bound = opts.branchNativeId ?? opts.durableId;
     const trackedElsewhere = [...this.#live.values()].some(live => live.route === route);
-    // Exact native identity checks apply only to native-bound opens (CLI bookmarks,
-    // durable-verified reopens, branches). Plain Web opens keep the legacy contract
-    // so older fixtures without a state projection still open.
-    if (bound !== undefined) {
+    if (opts.nativePlaced === undefined && bound !== undefined) {
       if (typeof initial.sessionId !== "string" || !initial.sessionId || initial.sessionFile !== sessionPath ||
         initial.cwd !== row.cwd || initial.sessionId !== bound ||
         (opts.branchNativeId !== undefined && result.attached === true) || trackedElsewhere) {
@@ -176,6 +214,42 @@ export class Sessions {
         await this.engine.requestExisting("close_session", { sessionId: route }).catch(() => undefined);
       }
       throw new WebError(409, "permission_mode_unconfirmed", "OmO 未确认 ask 权限模式，未开放该会话。");
+    }
+    if (opts.nativePlaced !== undefined) {
+      const bucket = join(opts.nativePlaced.profileDir, "sessions", sessionDirName(row.cwd));
+      const generated = initial.sessionFile;
+      const durable = opts.durableId;
+      const invalid = () => new WebError(502, "shared_placement_unsupported",
+        "OmO 没有在默认共享目录生成可核验的会话日志。");
+      let released = false;
+      try {
+        if (typeof generated !== "string" || generated !== resolve(generated) || dirname(generated) !== bucket ||
+          durable === undefined || !generated.endsWith(`_${durable}.jsonl`) || initial.sessionId !== durable ||
+          initial.cwd !== row.cwd || result.attached === true || trackedElsewhere ||
+          await realpath(bucket).catch(() => undefined) !== bucket) throw invalid();
+        const present = await lstat(generated).then(() => true, (error: NodeJS.ErrnoException) => {
+          if (error.code === "ENOENT") return false;
+          throw error;
+        });
+        if (!present) {
+          // OmO buffers an untouched journal (including its name) until a
+          // conversation starts. Native quiet release can persist it without
+          // a fake prompt; reopen the exact verified journal before publishing.
+          if (opts.publishName && initial.sessionName !== row.name) {
+            await this.engine.requestExisting("set_session_name", { sessionId: route, name: row.name });
+          }
+          await this.#releaseNative(route, row.cwd, durable, generated);
+          released = true;
+        }
+        const header = await readOwnedJournalHeader(generated);
+        if (!header || header.version !== 3 || header.sessionId !== durable || header.cwd !== row.cwd) throw invalid();
+        if (released) return this.#open(row, { sourcePath: generated, durableId: durable });
+      } catch (error) {
+        if (!released && result.attached !== true && !trackedElsewhere) {
+          await this.engine.requestExisting("close_session", { sessionId: route }).catch(() => undefined);
+        }
+        throw error;
+      }
     }
     this.#live.set(row.id, { route, running: initial.isStreaming === true });
     if (opts.publishName && initial.sessionName !== row.name) {
@@ -211,6 +285,25 @@ export class Sessions {
       await this.#adoptOpen(row, { sourcePath: resolved.sourcePath, durableId: row.nativeId });
       return;
     }
+    // Shared rows live in the native profile bucket: re-resolve the journal by
+    // durable id on every open, never trust a stored path.
+    if (row.shared === true) {
+      if (!row.nativeId || !this.resolveCli) {
+        throw new WebError(409, "resume_unavailable", "该共享会话缺少可用的来源解析，请刷新 CLI 历史后重试。");
+      }
+      // An existing alias always had a journal: an unresolvable source means
+      // it was deleted, replaced, or unlinked, never a fresh id to mint.
+      let sourcePath: string;
+      try {
+        sourcePath = (await this.resolveCli(row.nativeId, row.cwd)).sourcePath;
+      } catch {
+        throw new WebError(409, "resume_source_changed", "共享会话日志已不在，请刷新后重试。");
+      }
+      await this.#requirePrivateHost("resume_unsupported");
+      await this.#verifySharedJournal(row, sourcePath);
+      await this.#adoptOpen(row, { sourcePath, durableId: row.nativeId });
+      return;
+    }
     if (row.nativeId !== undefined) {
       await this.#requirePrivateHost("resume_unsupported");
       await this.#verifyWebJournal(row);
@@ -230,7 +323,10 @@ export class Sessions {
       if (error instanceof WebError) throw error;
       throw new WebError(503, "engine_unavailable", "OmO 连接已断开。");
     }
-    if (!this.engine.usesPrivateSocketTransport) {
+    // Only the Web-owned private non-listening stdio host refuses a second
+    // opener in both directions. Listening socket hosts admit stock TUI attach,
+    // so they never qualify, even with the same profile configured.
+    if (!this.engine.isPrivateHost || this.engine.usesListeningTransport) {
       throw new WebError(409, code, "顺序换端需要私有本机传输。");
     }
     if (!this.engine.capabilities.has("release_caller_aware") || !this.engine.capabilities.has("session_held")) {
@@ -238,6 +334,20 @@ export class Sessions {
     }
     if (this.hostGuard?.sameProfile !== true) {
       throw new WebError(409, code, "本机引擎与 CLI 会话目录不是同一配置，拒绝换端。");
+    }
+  }
+
+  /** A shared-bucket journal re-resolved by durable id must still be the same
+   * canonical owned v3 file before it reopens, so a deletion or replacement
+   * can never silently mint an empty native session under the preserved id. */
+  async #verifySharedJournal(row: SavedSession, sourcePath: string): Promise<void> {
+    if (resolve(sourcePath) !== sourcePath || await realpath(sourcePath).catch(() => undefined) !== sourcePath) {
+      throw new WebError(409, "resume_source_changed", "共享会话日志已不在，请刷新后重试。");
+    }
+    if (!row.nativeId) throw new WebError(409, "resume_source_changed", "共享会话日志已变化，无法恢复。");
+    const header = await readOwnedJournalHeader(sourcePath);
+    if (!header || header.version !== 3 || header.sessionId !== row.nativeId || header.cwd !== row.cwd) {
+      throw new WebError(409, "resume_source_changed", "共享会话日志已变化，无法恢复。");
     }
   }
 
@@ -331,7 +441,9 @@ export class Sessions {
       live.running = frame.type === "agent_start";
       this.fanout({ type: "sessions" });
     }
-    if (frame.type === "session_closed") {
+    // session_parked / session_released end the route the same way a close does:
+    // the session row stays, but the next enter must reopen against the holder.
+    if (frame.type === "session_closed" || frame.type === "session_parked" || frame.type === "session_released") {
       this.#live.delete(sessionId);
       this.fanout({ type: "sessions" });
     }
@@ -351,6 +463,16 @@ export class Sessions {
       handoff: this.#handoffEligibility(record(rawState)) };
   }
 
+  /** Web alias for a known durable native session in this workspace, if any.
+   * Coalesces logical aliases by native id and cwd so the sidebar and history
+   * enter the same session instead of minting a second bookmark. */
+  findAlias(nativeSessionId: string, cwd: string): SessionKey | undefined {
+    for (const row of this.#rows.values()) {
+      if (row.cwd === cwd && row.nativeId === nativeSessionId) return row.id;
+    }
+    return undefined;
+  }
+
   /** Durable native session id from `get_state`, for server-side integration only (never sent to the browser). */
   async nativeSessionId(id: SessionKey): Promise<string | undefined> {
     const raw = await this.engine.requestExisting("get_state", { sessionId: this.#route(id) });
@@ -359,8 +481,8 @@ export class Sessions {
   }
 
   /** Sequential handoff: quiet native release with reason takeover, then a local
-   * `omo --session` command for the same journal. Never interrupts, forces,
-   * kills, or copies the source. Refusals keep the session live; uncertain
+   * `omo --session` command for the same journal. Never interrupts, kills, or
+   * copies the source. Refusals keep the session live; uncertain
    * transport outcomes drop the route without replay and reconcile on next resume. */
   async handoff(id: SessionKey): Promise<{ session: SessionView; command: string }> {
     const row = this.#row(id);
@@ -369,13 +491,13 @@ export class Sessions {
     if (this.#opening.has(id) || this.#releasing.has(id)) {
       throw new WebError(409, "handoff_in_progress", "交接正在进行，请稍后再试。");
     }
-    await this.#requirePrivateHost("handoff_unsupported");
     this.#releasing.add(id);
     try {
+      await this.#requirePrivateHost("handoff_unsupported");
       let expectedPath = join(this.#directory, `${id}.jsonl`);
-      if (row.cliBookmark) {
+      if (row.cliBookmark || row.shared === true) {
         if (!row.nativeId || !this.resolveCli) {
-          throw new WebError(409, "handoff_unavailable", "该 CLI 书签缺少可用的来源解析。");
+          throw new WebError(409, "handoff_unavailable", "该书签缺少可用的来源解析。");
         }
         expectedPath = (await this.resolveCli(row.nativeId, row.cwd)).sourcePath;
       }
@@ -391,20 +513,17 @@ export class Sessions {
         current.isBashRunning === true || current.runPaused === true) {
         throw new WebError(409, "session_busy", "会话正在运行，请等待当前回合结束后再交接。");
       }
-      const projected = state(current);
-      if (array(projected.pendingDialogs).length > 0 || array(projected.pendingQuestions).length > 0) {
+      if (array(current.pendingDialogs).length > 0 || array(current.pendingQuestions).length > 0) {
         throw new WebError(409, "dialog_pending", "会话有待处理的交互，请先处理后再交接。");
       }
       if (row.nativeId === undefined) {
         await this.#persist(id, previous => ({ ...(previous ?? row), nativeId: durable }));
       }
-      let ack: WireObject;
       try {
-        ack = record(await this.engine.requestExisting("release_session",
-          { sessionId: live.route, reason: "takeover" }));
+        await this.#releaseNative(live.route, row.cwd, durable, sessionFile);
       } catch (error) {
-        if (error instanceof WebError && (error.status >= 500 || error.code === "engine_timeout" ||
-          error.code === "engine_unavailable" || error.code === "unknown_session")) {
+        if (error instanceof WebError && (error.status >= 500 ||
+          ["release_failed", "unknown_session"].includes(error.code))) {
           if (this.#live.get(id)?.route === live.route) this.#live.delete(id);
           this.fanout({ type: "sessions" });
           if (error.code === "unknown_session") {
@@ -413,16 +532,36 @@ export class Sessions {
         }
         throw error;
       }
-      if (ack.released !== true || ack.session_path !== sessionFile) {
-        if (this.#live.get(id)?.route === live.route) this.#live.delete(id);
-        this.fanout({ type: "sessions" });
-        throw new WebError(502, "release_unverified", "OmO 释放确认与会话来源不一致，未返回可用命令。");
-      }
       this.#live.delete(id);
       this.fanout({ type: "sessions" });
       return { session: this.#view(this.#row(id)), command: this.#handoffCommand(row.cwd, sessionFile) };
     } finally {
       this.#releasing.delete(id);
+    }
+  }
+
+  async #releaseNative(route: string, cwd: string, durable: string, sessionFile: string): Promise<void> {
+    const fields = { sessionId: route, reason: "takeover" };
+    let ack: WireObject;
+    try {
+      ack = record(await this.engine.requestExisting("release_session", fields));
+    } catch (error) {
+      // Senpi 2026.11.19-5 counts the caller as another attachment over
+      // stdio. Retry only for the exact sole holder of our non-listening
+      // child. Never allow the force flag to interrupt a native turn.
+      if (!(error instanceof WebError) || error.code !== "attached" ||
+        !this.engine.isPrivateHost || this.engine.usesListeningTransport) throw error;
+      const listing = await this.engine.requestExisting("list_sessions").catch(() => undefined);
+      const exact = array(listing?.sessions).map(record).filter(entry => entry.sessionId === route);
+      if (exact.length !== 1 || exact[0].sessionPath !== sessionFile || exact[0].cwd !== cwd ||
+        exact[0].durableSessionId !== durable || exact[0].attachments !== 1) throw error;
+      ack = record(await this.engine.requestExisting("release_session", { ...fields, force: true }));
+    }
+    const dropped = record(ack.dropped);
+    if (ack.released !== true || ack.session_path !== sessionFile ||
+      !Array.isArray(dropped.deliveries) || dropped.deliveries.length !== 0 ||
+      !Array.isArray(dropped.user_messages) || dropped.user_messages.length !== 0) {
+      throw new WebError(502, "release_unverified", "OmO 释放确认与会话来源不一致，未返回可用命令。");
     }
   }
 
@@ -448,7 +587,9 @@ export class Sessions {
 
   handoffSupport(): { supported: boolean; reason?: string } {
     if (!this.engine.status.online) return { supported: false, reason: "engine_offline" };
-    if (!this.engine.usesPrivateSocketTransport) return { supported: false, reason: "shared_transport" };
+    if (!this.engine.isPrivateHost || this.engine.usesListeningTransport) {
+      return { supported: false, reason: "shared_transport" };
+    }
     if (!this.engine.capabilities.has("release_caller_aware") || !this.engine.capabilities.has("session_held")) {
       return { supported: false, reason: "missing_capability" };
     }
@@ -495,7 +636,7 @@ export class Sessions {
     const loaded = await this.#webBranchSource(id);
     if (!loaded) throw staleBranch();
     const branch = await this.#branches.prepare(this.#directory, loaded, selection);
-    return this.#publishBranch(loaded.source.cwd, branch, this.#row(id).name, selection);
+    return this.#publishBranch(loaded.source.cwd, branch, this.#row(id).name, selection, loaded.source.sourcePath);
   }
 
   /** CLI history: use CliHistory.branchSource(id, cwd) after resolving the opaque key.
@@ -510,7 +651,8 @@ export class Sessions {
   async branchFrom(source: BranchSource, selection: BranchSelection): Promise<BranchResult> {
     await this.#authorizeBranchSource(source.cwd);
     const branch = await this.#branches.prepare(this.#directory, await loadBranchSource(source), selection);
-    return this.#publishBranch(source.cwd, branch, branch.cancelled ? undefined : branch.name, selection);
+    return this.#publishBranch(source.cwd, branch, branch.cancelled ? undefined : branch.name,
+      selection, source.sourcePath);
   }
 
   async #authorizeBranchSource(cwd: string) {
@@ -565,18 +707,31 @@ export class Sessions {
     return loaded;
   }
 
-  async #publishBranch(cwd: string, branch: PreparedBranch, name: string | undefined, selection: BranchSelection): Promise<BranchResult> {
+  async #publishBranch(cwd: string, branch: PreparedBranch, name: string | undefined,
+    selection: BranchSelection, placeNear?: string): Promise<BranchResult> {
     if (branch.cancelled) return { cancelled: true };
     await this.#authorizeBranchSource(cwd);
     const id = sessionKey.parse(crypto.randomUUID());
     const suffix = selection.kind === "fork" ? "分支" : "副本";
     const base = name?.trim().slice(0, 116);
-    const row = { id, cwd, name: base ? `${base} · ${suffix}` : suffix, updatedAt: Date.now(), archived: false, settled: false };
-    const path = join(this.#directory, `${id}.jsonl`);
+    // Shared-mode sources keep the branch next to the source journal in the
+    // native profile bucket so the CLI picker discovers it without copying;
+    // legacy sources keep the private dataDir journal. The identity guards in
+    // #open apply unchanged to either placement.
+    const profileDir = await this.#sharedProfileDir().catch(() => undefined);
+    const bucket = profileDir === undefined ? undefined
+      : join(profileDir, "sessions", sessionDirName(cwd));
+    const sharedPlacement = bucket !== undefined && placeNear !== undefined && dirname(placeNear) === bucket;
+    let row: SavedSession = { id, cwd, name: base ? `${base} · ${suffix}` : suffix,
+      updatedAt: Date.now(), archived: false, settled: false };
+    const path = sharedPlacement
+      ? join(bucket as string, `${Date.now()}_${branch.nativeId}.jsonl`)
+      : join(this.#directory, `${id}.jsonl`);
     await writeFile(path, branch.transcript, { flag: "wx", mode: 0o600 });
+    if (sharedPlacement) row = { ...row, nativeId: branch.nativeId, shared: true };
     // An unconfirmed open (e.g. RPC timeout) might still be writing. Never unlink
     // its transcript or close an unverified route; no Web index is published.
-    await this.#open(row, { branchNativeId: branch.nativeId, publishName: true });
+    await this.#open(row, { branchNativeId: branch.nativeId, sourcePath: path, publishName: true });
     try {
       await this.#persist(id, () => row, true);
     } catch (error) {
@@ -612,15 +767,29 @@ export class Sessions {
 
   async details(id: SessionKey) {
     const params = { sessionId: this.#route(id) };
-    const [stats, queue, tree] = await Promise.all([
+    // Runtime visibility is read-only: the raw tree feeds both the transcript
+    // view and the active-branch Todo/memory projection; state and the
+    // per-route list_sessions row feed labeled usage/memory panels. Both are
+    // best-effort and surface as explicit unavailable, never fake zeros.
+    const [stats, queue, rawTree, rawState, listing] = await Promise.all([
       this.engine.requestExisting("get_session_stats", params),
       this.engine.requestExisting("get_pending_inputs", params),
       this.engine.requestExisting("get_tree", params),
+      this.engine.requestExisting("get_state", params).catch(() => undefined),
+      this.engine.requestExisting("list_sessions").catch(() => undefined),
     ]);
+    const safeState = rawState && state(rawState);
     return {
       stats: pick(stats, ["userMessages", "assistantMessages", "toolCalls", "toolResults", "totalMessages", "tokens", "cost", "contextUsage", "failures"]),
       queue: pick(queue, ["lifetimeId", "throughCursor", "inputs", "outcomes"]),
-      tree: transcriptTree(tree),
+      tree: transcriptTree(rawTree),
+      runtime: projectRuntimeBranch(rawTree),
+      state: safeState && {
+        ...pick(safeState, ["model", "fastMode", "autoCompactionEnabled", "permissionPreset", "effectivePermissionPreset"]),
+        contextUsage: pick(safeState.contextUsage, ["tokens", "contextWindow", "percent"]),
+        usageTotals: pick(safeState.usageTotals, ["input", "output", "cacheRead", "cacheWrite", "latestCacheHitRate"]),
+      },
+      sessionMemory: projectSessionMemory(listing, params.sessionId),
     };
   }
 
@@ -676,6 +845,30 @@ export class Sessions {
         await request("set_model", { provider: action.provider, modelId: action.modelId, scope: "session" });
         break;
       case "thinking": await request("set_thinking_level", { level: action.level, scope: "turn" }); break;
+      case "preset": {
+        // Per-session preset only: open_session always pins ask, so every
+        // reopen/ownership change reverts to ask until the user explicitly
+        // switches again. Never touches the global profile or project trust
+        // flags (`--no-approve` stays a launch-level project-trust setting).
+        if (action.preset === "auto" && !this.engine.capabilities.has("permission_preset_auto")) {
+          throw new WebError(409, "unsupported", "此 OmO 版本不支持自动批准。");
+        }
+        const applied = record(await request("set_permission_preset", { permissionPreset: action.preset }));
+        if (applied.permissionPreset !== action.preset || applied.permissionPresetStatus !== "applied") {
+          throw new WebError(502, "preset_unconfirmed", "OmO 未确认审批模式，请刷新检查生效状态。");
+        }
+        const current = state(await request("get_state"));
+        const effective = current.effectivePermissionPreset;
+        if (effective !== action.preset) {
+          throw new WebError(502, "preset_unconfirmed", "OmO 未确认请求的审批模式已生效，请刷新检查。");
+        }
+        // Structured questions stay explicit under every preset: pendingQuestions
+        // is still projected and the answer path still requires `answers` for
+        // method question (see case "answer"). Secret/private prompts never
+        // reach the browser (see dialog()).
+        result = { preset: effective };
+        break;
+      }
       case "fast": await request("set_fast_mode", { enabled: action.enabled }); break;
       case "autoCompaction": await request("set_auto_compaction", { enabled: action.enabled }); break;
       case "compact": await request("compact", { customInstructions: action.instructions }, 180_000); break;

@@ -110,23 +110,43 @@ function renderTasks(tasks: readonly Wire[]): HTMLElement {
   return fold(`子任务（${items.childElementCount}）`, items);
 }
 
+const unavailableReason: Readonly<Record<string, string>> = {
+  "no-agent-dir": "原生任务快照不可用：未配置原生配置目录，快照入口已关闭。",
+  "invalid-id": "原生任务快照不可用：会话标识无效，无法定位快照。",
+  "session-unavailable": "原生任务快照不可用：会话尚未接入引擎，请先恢复会话。",
+  "missing-projection": "原生任务快照不可用：原生暂无此会话的任务快照，并非读取失败。",
+};
+
 export function renderNativeActivity(data: Wire): HTMLElement {
+  const result = el("div", "stack stack--tight");
   const section = el("section", "subpanel stack stack--tight");
-  section.append(el("h3", "", "原生任务"));
+  const subtasks = el("section", "subpanel stack stack--tight");
+  section.id = "runtime-dag";
+  section.tabIndex = -1;
+  subtasks.id = "runtime-subagent";
+  subtasks.tabIndex = -1;
+  section.append(el("h3", "", "DAG 快照"));
+  subtasks.append(el("h3", "", "子代理"));
+  result.append(subtasks, section);
   if (str(data.status) !== "ok") {
-    section.append(el("p", "small muted", "原生任务快照不可用，没有可显示的原生任务。"));
-    return section;
+    const reason = str(data.reason);
+    const message = unavailableReason[reason] ?? "原生任务快照不可用。";
+    section.append(el("p", "small muted", message));
+    subtasks.append(el("p", "small muted", message));
+    return result;
   }
   const snapshot = [
     `快照时间：${timeText(data.updatedAt)}`,
     data.connected === undefined ? "工作区记录，非实时" : `Herdr 快照，记录时${data.connected === true ? "已连接" : "未连接"}，非实时`,
   ].join(" · ");
   section.append(el("p", "small muted", snapshot));
+  subtasks.append(el("p", "small muted", snapshot));
   const runs = list(data.runs).map(object);
   const tasks = list(data.tasks).map(object);
-  if (!runs.length && !tasks.length) section.append(el("p", "small muted", "快照中没有运行或任务记录。"));
+  if (!runs.length) section.append(el("p", "small muted", "快照中没有 DAG 记录。"));
   const known = new Map(tasks.map(task => [str(task.id), task]));
   for (const run of runs) section.append(renderRun(run, known));
-  if (tasks.length) section.append(renderTasks(tasks));
-  return section;
+  if (tasks.length) subtasks.append(renderTasks(tasks));
+  else subtasks.append(el("p", "small muted", "快照中没有子代理记录。"));
+  return result;
 }
