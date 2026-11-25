@@ -208,15 +208,47 @@ legend { padding-inline: var(--s1); font-size: var(--small); color: var(--muted)
 .welcome-icon { width: var(--s8); height: var(--s8); color: var(--accent); }
 .conversation-empty { padding-block: var(--s8); }
 .messages { display: grid; gap: var(--s6); }
+.transcript-load { justify-self: center; font-size: var(--small); }
 .message { min-width: 0; display: grid; gap: var(--s2); }
 .message--user { padding: var(--s3) var(--s4); border: var(--stroke) solid var(--line); background: var(--rail); border-radius: var(--r2); }
 .message--tool { gap: 0; }
-.message--tool > details, .message details { border: var(--stroke) solid var(--line); border-radius: var(--r2); background: var(--surface); }
+.message details { border: var(--stroke) solid var(--line); border-radius: var(--r2); background: var(--surface); }
+.tool-summary {
+  display: grid;
+  grid-template-columns: var(--s2) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--s2);
+  padding-block: var(--s1);
+  color: var(--ink);
+  font-size: var(--small);
+  border-radius: inherit;
+}
+.tool-summary::-webkit-details-marker { display: none; }
+.tool-chevron {
+  inline-size: var(--s1);
+  block-size: var(--s1);
+  border-inline-end: var(--stroke) solid var(--muted);
+  border-block-end: var(--stroke) solid var(--muted);
+  transform: rotate(-45deg);
+}
+.tool-details[open] .tool-chevron { transform: rotate(45deg); }
+.tool-subject, .tool-state { display: flex; align-items: center; gap: var(--s2); min-inline-size: 0; }
+.tool-label, .tool-target { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.tool-label { font-weight: 600; }
+.tool-target, .tool-state { color: var(--muted); }
+.tool-state { gap: var(--s1); font-size: var(--caption); white-space: nowrap; }
+.tool-state-text { min-inline-size: calc(var(--s6) * 2); }
+.tool-details[data-state="running"] .tool-state { color: var(--info); }
+.tool-details[data-state="success"] .tool-state { color: var(--accent); }
+.tool-details[data-state="error"] .tool-state { color: var(--error); }
+.tool-output { max-block-size: var(--code-height); overflow: auto; background: var(--rail); border-radius: var(--r1); }
+.tool-output pre { max-block-size: none; overflow: visible; }
 .message header { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s2); }
 .speaker { font-size: var(--small); font-weight: 700; }
 .message time { font-size: var(--caption); color: var(--muted); }
 .message-body { display: grid; gap: var(--s2); min-width: 0; }
 .message .fold-body { padding: 0 var(--s3) var(--s3); }
+.tool-details > .fold-body { padding-block-start: var(--s2); }
 .prose { display: grid; gap: var(--s2); min-width: 0; overflow-wrap: anywhere; }
 .prose p, .plain { white-space: pre-wrap; overflow-wrap: anywhere; }
 .prose :is(ul, ol) { padding-inline-start: var(--s6); }
