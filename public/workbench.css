@@ -1,0 +1,37 @@
+#cli-history-list .session-link { justify-content: stretch; }
+
+#handoff-receipt { min-inline-size: 0; inline-size: 100%; }
+#handoff-command { white-space: pre-wrap; }
+#handoff-command code { overflow-wrap: anywhere; }
+#command-mode[aria-pressed="true"] { background: var(--tint); color: var(--accent); }
+#cli-live-transcript {
+  max-block-size: var(--code-height);
+  min-block-size: var(--s8);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-block: var(--stroke) solid var(--line);
+  padding-block: var(--s3);
+}
+
+#cli-live-input,
+#branch-message {
+  inline-size: 100%;
+}
+
+#cli-live-input {
+  resize: vertical;
+}
+
+#branch-message-preview {
+  max-block-size: calc(var(--s8) * 3);
+  overflow: auto;
+  padding: var(--s2) var(--s3);
+  background: var(--rail);
+  border-radius: var(--r1);
+}
+
+@media (max-width: 760px) {
+  #cli-live-transcript {
+    max-block-size: min(var(--code-height), calc(100dvh / 3));
+  }
+}

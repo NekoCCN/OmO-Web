@@ -1,12 +1,16 @@
 import { Api, RequestError, parseSession, parseSessions, sessionPath } from "./api.ts";
-import type { Action, Image, Mode, Session } from "./api.ts";
+import type { Action, BranchSource, Image, Mode, Session } from "./api.ts";
 import { byId, button, el, errorText, field, isImageType, list, notice, num, object, option, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { Interactions, isRequest, requestId } from "./interactions.ts";
 import type { Answer } from "./interactions.ts";
 import { Transcript, messageKey, roleOf } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
-import { renderDetails } from "./details.ts";
+import { branchDialog, renderDetails, showNativeActivity } from "./details.ts";
+import { cliHistory } from "./cli-history.ts";
+import { cliLive } from "./cli-live.ts";
+import { BUILTIN_COMMANDS, parseBuiltinInput } from "./builtin-commands.ts";
+import type { BuiltinCommand } from "./builtin-commands.ts";
 
 const box = (id: string) => byId(id, HTMLElement);
 const btn = (id: string) => byId(id, HTMLButtonElement);
@@ -22,18 +26,28 @@ const mode = sel("prompt-mode");
 const chooser = dialog("new-dialog");
 const manager = dialog("manage-dialog");
 const inspector = dialog("details-dialog");
+const commandDialog = dialog("command-dialog");
 const settingLabels: Readonly<Record<string, string>> = { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" };
+const commandToken = /^(?:\/(?:[A-Za-z0-9_-]{1,64}|skill:[A-Za-z0-9-]{1,64})|\$[A-Za-z0-9-]{1,64})$/;
 type Attachment = Image & { readonly name: string; readonly url: string };
-type Draft = { text: string; mode: Mode; images: Attachment[]; reading: number; error: string; admission?: { readonly imageList: readonly Attachment[]; readonly text: string; readonly mode: Mode; readonly turn: string; readonly id: string } };
+type Draft = {
+  text: string; mode: Mode; images: Attachment[]; reading: number; error: string;
+  commandMode: boolean; commandText: string; commandError: string; commandStatus?: string;
+  commandAdmission?: { readonly text: string; readonly id: string };
+  admission?: { readonly imageList: readonly Attachment[]; readonly text: string; readonly mode: Mode; readonly turn: string; readonly id: string };
+};
 type View = {
   session: Session; status: "inactive" | "loading" | "ready" | "failed"; error: string; state: Wire;
   messages: TranscriptEntry[]; liveKey: string; tools: Map<string, ToolTrace>; requests: Map<string, Wire>;
-  options: Wire; optionsError: string; queue: number | undefined; revision: number; serial: number;
+  options: Wire; optionsError: string; handoff: Wire; queue: number | undefined; revision: number; serial: number;
   sync: number; optionSync: number; running: boolean; compacting: boolean;
 };
+type Release = { status: "pending" } | { status: "released"; command: string; copyStatus?: string }
+  | { status: "failed" | "uncertain"; error: string };
 
 let current: View | undefined;
 let engine: Wire = {};
+let handoffSupport: Wire = {};
 let connection: "connecting" | "online" | "offline" = "connecting";
 let transport: "waiting" | "open" | "lost" = "waiting";
 let recovering = false;
@@ -53,17 +67,88 @@ let navOpen = false;
 const writes = new Set<string>();
 const sending = new Set<string>();
 const drafts = new Map<string, Draft>();
+const releases = new Map<string, Release>();
 const mobile = matchMedia("(max-width: 760px)");
 const system = matchMedia("(prefers-color-scheme: dark)");
 const countFormat = new Intl.NumberFormat("zh-CN");
+const focusCliLauncher = (id: string) => btn(mobile.matches ? "open-navigation" : id).focus();
+const openBranch = branchDialog(api, enterBranch);
+const live = cliLive(api, () => focusCliLauncher("cli-live-button"), openBranch);
+let leavingHistory = false;
+const history = cliHistory(api, () => {
+  if (!leavingHistory && !document.querySelector("dialog[open]")) focusCliLauncher("cli-history-button");
+  leavingHistory = false;
+}, openBranch, historyResumeUnavailable, (session, show) => {
+  if (!show) { void fetchSessions(); return; }
+  leavingHistory = true;
+  dialog("cli-history-dialog").close();
+  archived = session.archived;
+  if (releases.get(session.id)?.status === "pending" && current?.session.id === session.id) markInactive(current);
+  releases.delete(session.id);
+  remember(session);
+  openSession(session.id, true);
+});
+
+function handoffReason(reason: unknown): string {
+  switch (reason) {
+    case "engine_offline": return "本机引擎未连接。";
+    case "shared_transport": return "顺序换端需要私有本机传输。";
+    case "missing_capability": return "此 OmO 版本不支持顺序换端。";
+    case "profile_mismatch": return "本机引擎与 CLI 会话目录不是同一配置。";
+    case "session_busy": return "会话正在运行，请等待当前回合结束后再交接。";
+    case "dialog_pending": return "会话有待处理的交互，请先处理后再交接。";
+    default: return "本机服务未确认可顺序换端。";
+  }
+}
+
+function historyResumeUnavailable(): string {
+  if (connection !== "online") return "本机连接不可用，暂时只能浏览记录。";
+  return handoffSupport.supported === true ? "" : handoffReason(handoffSupport.reason);
+}
+
+function handoffUnavailable(view: View): string {
+  if (!view.session.active || view.status !== "ready") return "请先恢复此会话。";
+  if (connection !== "online") return "本机连接不可用，无法交接。";
+  if (handoffSupport.supported !== true) return handoffReason(handoffSupport.reason);
+  if (view.running || view.compacting) return handoffReason("session_busy");
+  if (view.requests.size) return handoffReason("dialog_pending");
+  if (view.queue) return "还有排队输入，请先等待处理完成。";
+  if (view.handoff.eligible !== true) return handoffReason(view.handoff.reason);
+  if (writes.has(view.session.id) || sending.has(view.session.id)) return "正在提交操作，请稍候。";
+  return "";
+}
+
+function markInactive(view: View): void {
+  view.sync++;
+  view.optionSync++;
+  view.status = "inactive";
+  view.running = false;
+  view.compacting = false;
+}
+
+function enterBranch(session: Session, editorText: string, source: BranchSource): void {
+  if (source.kind === "live") live.closeAfterBranch();
+  if (source.kind === "history") {
+    leavingHistory = true;
+    dialog("cli-history-dialog").close();
+  }
+  archived = false;
+  draftFor(session.id).text = editorText;
+  remember(session);
+  openSession(session.id, true);
+}
 
 function draftFor(id: string): Draft {
   let draft = drafts.get(id);
   if (!draft) {
-    draft = { text: "", mode: "prompt", images: [], reading: 0, error: "" };
+    draft = { text: "", mode: "prompt", images: [], reading: 0, error: "", commandMode: false, commandText: "", commandError: "" };
     drafts.set(id, draft);
   }
   return draft;
+}
+
+function composerCommand(text: string): boolean {
+  return parseBuiltinInput(text).kind !== "plain" || commandToken.test(text.split(/\s/, 1)[0] ?? "");
 }
 
 function startTheme(): void {
@@ -98,6 +183,7 @@ function toggleNav(open: boolean, restoreFocus = false): void {
 }
 
 function updateConnection(): void {
+  live.setTransport(transport);
   connection = bootError || engine.online === false || transport === "lost" ? "offline"
     : bootstrapped && transport === "open" && !recovering && engine.online === true ? "online" : "connecting";
   box("connection").dataset.state = connection;
@@ -115,13 +201,20 @@ function updateConnection(): void {
     ? "没有可选的工作目录。请检查本机 Web 服务的工作目录配置。"
     : "选择工作目录后开始新会话，或从会话列表继续此前的工作。";
   btn("create").disabled = !available || createPending;
+  history.update();
   renderSessions();
   renderView();
 }
 
 function applySessions(items: readonly Session[]): void {
   sessions = new Map(items.map(session => [session.id, session]));
-  if (current) current.session = sessions.get(current.session.id) ?? current.session;
+  if (current) {
+    current.session = sessions.get(current.session.id) ?? current.session;
+    if (!current.session.active && current.status === "ready" && releases.get(current.session.id)?.status !== "pending") {
+      markInactive(current);
+      if (manager.open) manager.close();
+    }
+  }
   renderSessions();
   renderView();
 }
@@ -155,13 +248,15 @@ async function bootstrap(reconcile = false): Promise<void> {
     if (ticket !== bootSeq) return;
     api.token = str(data.token);
     engine = object(data.engine);
+    handoffSupport = object(data.handoff);
     workspaces = list(data.workspaces).filter((cwd): cwd is string => typeof cwd === "string" && Boolean(cwd));
     bootstrapped = true;
     bootError = "";
     listError = "";
     if (version === mutation) applySessions(parseSessions(data));
     if (!source) connectEvents();
-    if (reconcile && current) {
+    const release = current && releases.get(current.session.id);
+    if (reconcile && current && (!release || release.status === "failed")) {
       if (!current.session.active && current.status !== "loading" && engine.online === true) {
         current.status = "inactive";
         current.error = "";
@@ -202,7 +297,8 @@ function renderSessions(): void {
       const path = row.children.item(1);
       if (path instanceof HTMLElement) { path.textContent = session.cwd; path.title = session.cwd; path.hidden = !session.cwd; }
       const stamp = row.lastElementChild;
-      if (stamp) stamp.textContent = session.running ? "运行中" : session.settled ? "已结清" : session.active ? "已打开" : "待恢复";
+      if (stamp) stamp.textContent = releases.get(session.id)?.status === "released" ? "已释放"
+        : session.running ? "运行中" : session.settled ? "已结清" : session.active ? "已打开" : "待恢复";
       if (session.id === current?.session.id) row.setAttribute("aria-current", "true");
       else row.removeAttribute("aria-current");
     }
@@ -217,29 +313,40 @@ function renderSessions(): void {
   btn("archived").setAttribute("aria-pressed", String(archived));
 }
 
-function openSession(id: string): void {
+function openSession(id: string, focusComposer = false): void {
   const session = sessions.get(id);
   if (!session) return;
   toggleNav(false);
   box("conversation").focus();
-  if (id === current?.session.id) return;
+  if (id === current?.session.id) {
+    if (!focusComposer) return;
+    if (current.status === "ready") { prompt.focus(); return; }
+  }
   if (manager.open) manager.close();
-  if (inspector.open) inspector.close();
+  if (inspector.open) { detailsRequest?.abort(); inspector.close(); }
+  if (commandDialog.open) { commandRequest?.abort(); commandDialog.close(); }
+  const release = releases.get(id);
+  const load = session.active && release?.status !== "released" && release?.status !== "uncertain";
   const view: View = {
-    session, status: session.active ? "loading" : "inactive", error: "", state: {}, messages: [], liveKey: "",
-    tools: new Map(), requests: new Map(), options: {}, optionsError: "", queue: undefined, revision: 0, serial: 0,
+    session, status: load ? "loading" : "inactive", error: "", state: {}, messages: [], liveKey: "",
+    tools: new Map(), requests: new Map(), options: {}, optionsError: "", handoff: {}, queue: undefined, revision: 0, serial: 0,
     sync: 0, optionSync: 0, running: session.running, compacting: false,
   };
   current = view;
   stream.reset();
   interactions.reset();
   const draft = draftFor(id);
-  prompt.value = draft.text;
+  prompt.value = draft.commandMode ? draft.commandText : draft.text;
   mode.value = draft.mode;
   renderAttachments();
   renderSessions();
   renderView();
-  if (session.active) { void snapshot(view, true); void loadOptions(view); }
+  if (load) {
+    void snapshot(view, true).then(() => {
+      if (focusComposer && view === current && view.status === "ready" && document.activeElement === box("conversation")) prompt.focus();
+    });
+    void loadOptions(view);
+  } else if (release?.status === "released" && !document.querySelector("dialog[open]")) box("handoff-title").focus();
 }
 
 function modelKey(value: Wire): string {
@@ -264,11 +371,15 @@ function syncSelect(node: HTMLSelectElement, choices: readonly (readonly [string
 function renderView(): void {
   const view = current;
   const session = view?.session;
+  const release = session && releases.get(session.id);
+  const pending = release?.status === "pending";
+  const receipt = release?.status === "released" ? release : undefined;
   const available = Boolean(view && view.status === "ready");
   box("welcome").hidden = Boolean(view);
   box("inactive-session").hidden = !view || available;
   box("active-session").hidden = !available;
   box("composer-shell").hidden = !available;
+  prompt.disabled = !available || session?.active !== true;
   const title = box("session-title");
   title.textContent = session?.name ?? "会话工作台";
   title.title = title.textContent;
@@ -277,43 +388,75 @@ function renderView(): void {
   notice(path, cwd);
   path.title = cwd;
   btn("details-button").hidden = !available;
+  btn("web-branch-button").hidden = !session;
+  btn("web-branch-button").disabled = pending;
   btn("manage-button").hidden = !available;
   if (!view) return;
+  const draft = draftFor(view.session.id);
+  if (manager.open) {
+    const reason = pending ? "正在释放当前会话…" : handoffUnavailable(view);
+    btn("manage-handoff").disabled = Boolean(reason);
+    notice(box("manage-handoff-status"), reason);
+    notice(box("manage-handoff-error"), release?.status === "failed" ? release.error : "");
+  }
   for (const modal of [manager, inspector]) if (modal.open) {
     modal.querySelectorAll<HTMLButtonElement>("[data-write]").forEach(node => {
-      node.disabled = connection !== "online" || writes.has(view.session.id) || node.hasAttribute("data-unavailable")
+      node.disabled = connection !== "online" || pending || writes.has(view.session.id) || node.hasAttribute("data-unavailable")
         || (node.hasAttribute("data-idle") && (view.running || view.compacting || sending.has(view.session.id)));
     });
   }
   const active = view.status !== "inactive";
   box("inactive-title").textContent = view.status === "loading" ? "正在读取会话…" : view.status === "failed" ? "无法读取会话" : "继续此会话";
-  box("inactive-copy").textContent = view.status === "loading" ? "正在向本机引擎请求会话记录。"
+  const showReceipt = Boolean(receipt && view.status !== "loading");
+  box("inactive-title").hidden = showReceipt;
+  box("inactive-copy").hidden = showReceipt;
+  box("inactive-copy").textContent = pending ? "正在释放当前会话，请等待本机确认。"
+    : view.status === "loading" ? "正在向本机引擎请求会话记录。"
     : view.status === "failed" ? "请检查连接后重试。"
       : `${view.session.archived ? "此会话已归档。" : ""}恢复后可查看此前的对话并继续。`;
-  notice(box("session-error"), view.error);
+  box("handoff-receipt").hidden = !showReceipt;
+  const code = box("handoff-command").firstElementChild;
+  if (code && code.textContent !== (receipt?.command ?? "")) code.textContent = receipt?.command ?? "";
+  notice(box("handoff-copy-status"), receipt?.copyStatus);
+  notice(box("handoff-draft-note"), !available && (receipt || pending || release?.status === "uncertain") &&
+    (draft.text || draft.commandText || draft.images.length || draft.reading) ? "未发送的文字和图片草稿仍保留在此页面。" : "");
+  notice(box("session-error"), view.error || (release?.status === "uncertain" && view.status !== "loading" ? release.error : ""));
   const resume = btn("resume");
   resume.hidden = available || view.status === "loading";
-  resume.disabled = connection !== "online" || writes.has(view.session.id);
-  resume.textContent = active && view.session.active ? "重试读取" : "恢复会话";
+  resume.disabled = connection !== "online" || pending || writes.has(view.session.id);
+  resume.classList.toggle("button--primary", !receipt);
+  resume.textContent = !receipt && release?.status !== "uncertain" && active && view.session.active ? "重试读取" : "恢复会话";
   if (!available) return;
 
-  const draft = draftFor(view.session.id);
   const online = connection === "online";
-  const busy = writes.has(view.session.id);
+  const busy = pending || writes.has(view.session.id);
   const posting = sending.has(view.session.id);
   const blocked = view.session.archived;
-  const canSend = online && !blocked && !view.compacting;
+  const canSend = online && view.session.active && !blocked && !view.compacting;
   const chosenMode = mode.value;
-  const primaryStop = view.running && (chosenMode === "prompt" || blocked);
+  const commandMode = draft.commandMode;
+  const commandInput = commandMode || composerCommand(draft.text);
+  const primaryStop = view.running && (chosenMode === "prompt" || blocked || commandInput);
   btn("stop").hidden = !view.running;
   btn("stop").disabled = !online || busy;
   btn("stop").classList.toggle("button--primary", primaryStop);
   btn("stop").classList.toggle("button--danger", !primaryStop);
   const send = btn("send");
-  send.hidden = view.running && (chosenMode === "prompt" || blocked);
+  send.hidden = commandInput || (view.running && (chosenMode === "prompt" || blocked));
   send.disabled = !canSend || busy || posting || draft.reading > 0 || (!draft.text.trim() && !draft.images.length);
   send.textContent = chosenMode === "follow_up" ? "排队" : chosenMode === "steer" ? "发送引导" : "发送";
-  btn("attach").disabled = blocked || draft.images.length + draft.reading >= 4 || busy;
+  const execute = btn("send-command");
+  execute.hidden = !commandInput;
+  execute.disabled = !canSend || view.running || Boolean(view.queue) || busy || posting ||
+    !(commandMode ? draft.commandText : draft.text).trim();
+  btn("command-mode").setAttribute("aria-pressed", String(commandMode));
+  btn("command-picker").hidden = !commandMode;
+  btn("command-picker").disabled = !online || blocked;
+  box("prompt-label").textContent = commandMode ? "命令及参数" : "消息";
+  prompt.placeholder = commandMode ? "输入 /命令 或 $技能，可加参数…" : "输入消息…";
+  btn("attach").disabled = commandMode || blocked || draft.images.length + draft.reading >= 4 || busy;
+  btn("attach").hidden = commandMode;
+  (mode.closest("label") ?? mode).hidden = commandMode;
   mode.disabled = blocked || busy;
   const selected = object(view.state.model);
   const models = list(view.options.models).map(object).filter(model => Boolean(modelKey(model)));
@@ -330,19 +473,22 @@ function renderView(): void {
   const tokens = num(usage.tokens);
   const limit = num(usage.contextWindow);
   notice(box("context-usage"), percent !== undefined ? `上下文 ${countFormat.format(percent)}%` : tokens !== undefined && limit ? `上下文 ${countFormat.format(tokens)} / ${countFormat.format(limit)}` : "");
-  const hint = !online ? "离线：可继续编辑草稿，恢复连接后再发送。" : blocked
+  const hint = pending ? "正在交接，草稿不会发送。" : !online ? "离线：可继续编辑草稿，恢复连接后再发送。" : blocked
     ? "此会话已归档；可在会话管理中取消归档。"
+    : draft.commandStatus || (commandInput ? view.running || view.compacting || view.queue ? "会话忙：请等待当前运行和队列结束再执行命令。"
+      : "Ctrl / ⌘ + Enter 执行命令；命令前加空格可按文字发送。"
     : view.compacting ? "上下文压缩完成后可发送。" : draft.reading ? "正在读取图片…"
       : view.running && chosenMode === "prompt" ? "可停止当前轮，或切换发送方式以引导或排队。"
-        : !view.running && chosenMode !== "prompt" ? "当前没有运行中的轮次；此输入将在下一轮处理。" : "Ctrl / ⌘ + Enter 发送";
+        : !view.running && chosenMode !== "prompt" ? "当前没有运行中的轮次；此输入将在下一轮处理。" : "Ctrl / ⌘ + Enter 发送");
   box("composer-hint").textContent = hint;
   const activity = [view.running ? "正在生成" : "", view.compacting ? "正在压缩上下文" : "", view.queue ? `${view.queue} 条输入待处理` : "",
     view.requests.size ? `${view.requests.size} 项等待你的决定` : ""].filter(Boolean).join(" · ");
   box("activity-row").hidden = !activity;
   if (box("activity").textContent !== activity) box("activity").textContent = activity;
   btn("jump-to-request").hidden = !view.requests.size;
-  notice(box("compose-error"), draft.error || view.optionsError);
-  interactions.render(view.requests, online, (id, answer) => answerRequest(view, id, answer));
+  notice(box("compose-error"), (commandMode ? draft.commandError : draft.error) || view.optionsError ||
+    (!manager.open && release?.status === "failed" ? release.error : ""));
+  interactions.render(view.requests, online && !pending, (id, answer) => answerRequest(view, id, answer));
 }
 
 function requestsFrom(state: Wire): Map<string, Wire> {
@@ -360,14 +506,21 @@ function renderMessages(view: View, bottom = false): void {
 }
 
 async function snapshot(view: View, bottom = false): Promise<void> {
+  const release = releases.get(view.session.id);
+  const requiresManualResume = release?.status === "released" || release?.status === "uncertain";
+  if (requiresManualResume && (view.status !== "loading" || !writes.has(view.session.id))) return;
   const ticket = ++view.sync;
   const revision = view.revision;
   try {
     const data = await api.request(sessionPath(view.session.id));
     if (current !== view || ticket !== view.sync) return;
-    const session = parseSession(data.session) ?? view.session;
+    const parsed = parseSession(data.session);
+    if (requiresManualResume && !parsed?.active) throw new Error("本机服务未确认已恢复此会话。");
+    const session = parsed ?? view.session;
+    if (requiresManualResume) releases.delete(session.id);
     remember(session);
     const state = object(data.state);
+    view.handoff = object(data.handoff);
     const messages = list(data.messages).map(object);
     const changed = revision !== view.revision;
     const oldKeys = new Map(view.messages.map(entry => [entry.key, entry.message]));
@@ -405,6 +558,7 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     renderMessages(view, bottom);
   } catch (error) {
     if (current !== view || ticket !== view.sync) return;
+    if (releases.get(view.session.id)?.status === "pending") return;
     if (view.status !== "ready" || !view.session.active) {
       view.status = "failed";
       view.error = errorText(error);
@@ -494,6 +648,7 @@ function receiveRequest(view: View, raw: unknown): void {
 
 function onEvent(event: Wire): void {
   const type = str(event.type);
+  if (type === "cli-live") { live.invalidate(str(event.id)); return; }
   if (type === "ready" || type === "engine") {
     if (type === "engine") {
       const status = object(event.engine);
@@ -614,8 +769,7 @@ function onEvent(event: Wire): void {
     case "session_closed":
     case "session_parked":
     case "session_released":
-      view.status = "inactive";
-      view.running = false;
+      if (releases.get(view.session.id)?.status !== "pending") markInactive(view);
       remember({ ...view.session, active: false, running: false });
       break;
     default: return;
@@ -626,6 +780,10 @@ function onEvent(event: Wire): void {
 
 async function write(view: View, action: Action): Promise<Wire> {
   if (connection !== "online") throw new Error("实时连接不可用，请重新连接后重试。");
+  if (action.action !== "resume" && (view !== current || view.status !== "ready" || !view.session.active ||
+    releases.get(view.session.id)?.status === "pending")) {
+    throw new Error("当前会话不可写，请在恢复后再试。");
+  }
   try {
     const data = await api.action(view.session.id, action);
     const session = parseSession(data.session);
@@ -648,7 +806,7 @@ function renderAttachments(): void {
   const view = current;
   const host = box("attachments");
   const draft = view && draftFor(view.session.id);
-  host.hidden = !draft?.images.length;
+  host.hidden = !draft?.images.length || draft.commandMode;
   host.replaceChildren();
   if (!draft) return;
   for (const image of draft.images) {
@@ -670,7 +828,7 @@ function renderAttachments(): void {
 
 async function addImages(files: readonly File[]): Promise<void> {
   const view = current;
-  if (!view || view.status !== "ready" || view.session.archived) return;
+  if (!view || view.status !== "ready" || view.session.archived || draftFor(view.session.id).commandMode) return;
   const draft = draftFor(view.session.id);
   const errors: string[] = [];
   const jobs: Promise<Attachment>[] = [];
@@ -726,7 +884,7 @@ async function sendPrompt(): Promise<void> {
     draft.admission = undefined;
     if (draft.text === text) {
       draft.text = "";
-      if (view === current) prompt.value = "";
+      if (view === current && !draft.commandMode) prompt.value = "";
     }
     draft.images = draft.images.filter(image => !images.includes(image));
     if (view === current) renderAttachments();
@@ -741,9 +899,164 @@ async function sendPrompt(): Promise<void> {
   }
 }
 
-async function runAction(view: View, action: Action, label: string, onError: (text: string) => void, after?: (data: Wire) => void): Promise<void> {
+async function sendCommand(view: View): Promise<void> {
+  if (btn("send-command").disabled || btn("send-command").hidden) return;
   const id = view.session.id;
-  if (writes.has(id)) return;
+  const draft = draftFor(id);
+  const textField = draft.commandMode ? "commandText" : "text";
+  const errorField = draft.commandMode ? "commandError" : "error";
+  const text = draft[textField];
+  const fail = (message: string) => { draft[errorField] = message; };
+  const clear = () => {
+    if (draft[textField] !== text) return;
+    draft[textField] = "";
+    if (current?.session.id === id && draft.commandMode === (textField === "commandText")) prompt.value = "";
+  };
+  draft.commandStatus = undefined;
+  const parsed = parseBuiltinInput(text);
+  if (parsed.kind === "malformed" || parsed.kind === "tui-only") {
+    fail(parsed.kind === "malformed" ? parsed.message : `“/${parsed.name}”暂不能在 Web 中执行，未发送给模型。`);
+    renderView();
+    return;
+  }
+  if (parsed.kind === "builtin") {
+    fail("");
+    try {
+      if (await runBuiltin(view, parsed.command, fail)) clear();
+    } catch (error) {
+      fail(`命令失败：${errorText(error)}`);
+    }
+    if (current?.session.id === id) renderView();
+    return;
+  }
+  const [, invocation, args] = /^(\S+)(?:[ \t]+([^\r\n]*))?$/.exec(text) ?? [];
+  if (!invocation || !commandToken.test(invocation) || /[\r\n]/.test(text)) {
+    fail("请输入单行 /命令 或 $技能，可附加参数。");
+    renderView();
+    return;
+  }
+  const clientMessageId = draft.commandAdmission?.text === text ? draft.commandAdmission.id : crypto.randomUUID();
+  draft.commandAdmission = { text, id: clientMessageId };
+  fail("");
+  sending.add(id);
+  renderView();
+  try {
+    await write(view, { action: "command", invocation, ...(args ? { arguments: args } : {}), clientMessageId });
+    draft.commandAdmission = undefined;
+    clear();
+  } catch (error) {
+    if (error instanceof RequestError && error.status >= 400 && error.status < 500) draft.commandAdmission = undefined;
+    const code = error instanceof RequestError ? error.code : "";
+    const label = code === "unknown_command" ? "未知命令" : code === "session_busy" || code === "bridge_busy" ? "会话忙"
+      : code === "invalid_arguments" || code === "invalid_request" ? "命令输入无效" : "原生命令失败";
+    fail(`${label}：${errorText(error)}`);
+  } finally {
+    sending.delete(id);
+    if (current?.session.id === id) {
+      renderView();
+      scheduleSnapshot(current);
+    }
+  }
+}
+
+async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: string) => void): Promise<boolean> {
+  const id = view.session.id;
+  const action = (value: Action, label: string) => runAction(view, value, label, fail);
+  switch (command.name) {
+    case "new":
+      openChooser();
+      if (chooser.open && workspaces.includes(view.session.cwd)) sel("new-cwd").value = view.session.cwd;
+      return chooser.open;
+    case "resume":
+    case "sessions":
+      btn("cli-history-button").click();
+      return dialog("cli-history-dialog").open;
+    case "name":
+    case "rename":
+      if (command.value !== undefined) return action({ action: "rename", name: command.value }, "重命名");
+      btn("manage-button").click();
+      manager.querySelector<HTMLInputElement>('[data-key="name"]')?.focus();
+      return manager.open;
+    case "session":
+    case "tree":
+      btn("details-button").click();
+      return inspector.open;
+    case "fork":
+      btn("web-branch-button").click();
+      return dialog("branch-dialog").open;
+    case "compact":
+      return action({ action: "compact", ...(command.instructions ? { instructions: command.instructions } : {}) }, "压缩上下文");
+    case "model": {
+      if (!command.reference) {
+        sel("model").focus();
+        if (document.activeElement === sel("model")) {
+          try { sel("model").showPicker?.(); } catch (error) { if (!(error instanceof DOMException)) throw error; }
+          return true;
+        }
+        fail("当前没有可选择的模型。");
+        return false;
+      }
+      const matches = list(view.options.models).map(object).filter(model =>
+        [str(model.id), `${str(model.provider)}/${str(model.id)}`].includes(command.reference ?? ""));
+      if (matches.length === 1) return action({ action: "model", provider: str(matches[0].provider), modelId: str(matches[0].id) }, "切换模型");
+      fail(matches.length ? "模型名称不唯一，请使用 provider/model。" : "未找到此模型，请用 /model 查看可选模型。");
+      return false;
+    }
+    case "thinking": {
+      if (!command.level) {
+        sel("thinking").focus();
+        if (document.activeElement === sel("thinking")) {
+          try { sel("thinking").showPicker?.(); } catch (error) { if (!(error instanceof DOMException)) throw error; }
+          return true;
+        }
+        fail("当前没有可选择的思考档。");
+        return false;
+      }
+      if (!list(view.options.levels).includes(command.level)) {
+        fail("当前模型不支持这个思考档位。");
+        return false;
+      }
+      return action({ action: "thinking", level: command.level }, "切换思考档");
+    }
+    case "fast":
+      if (typeof view.state.fastMode !== "boolean") { fail("当前模型没有可用的快速模式。"); return false; }
+      return action({ action: "fast", enabled: command.mode ? command.mode === "on" : !view.state.fastMode }, "切换快速模式");
+    case "clone":
+    case "copy":
+      writes.add(id);
+      renderView();
+      try {
+        if (command.name === "copy") {
+          const { text } = await api.request(`${sessionPath(id)}/last-assistant`);
+          if (typeof text !== "string" || !text) { fail("没有可复制的助手消息。"); return false; }
+          if (!navigator.clipboard) { fail("当前浏览器无法访问剪贴板。"); return false; }
+          await navigator.clipboard.writeText(text);
+          draftFor(id).commandStatus = "已复制上一条助手消息。";
+          return true;
+        }
+        const data = await api.request(`${sessionPath(id)}/branches`, { kind: "clone" });
+        if (data.cancelled === true) { fail("原生引擎取消了复制。"); return false; }
+        const session = parseSession(data.session);
+        if (!session) throw new Error("本机服务没有返回新会话。");
+        if (view === current) enterBranch(session, "", { kind: "web", id, name: view.session.name });
+        else remember(session);
+        return true;
+      } finally {
+        writes.delete(id);
+      }
+  }
+}
+
+function submitComposer(): void {
+  if (!current || current.status !== "ready" || !current.session.active || releases.get(current.session.id)?.status === "pending") return;
+  const draft = draftFor(current.session.id);
+  if (draft.commandMode || composerCommand(draft.text)) void sendCommand(current);
+  else void sendPrompt();
+}
+
+async function runAction(view: View, action: Action, label: string, onError: (text: string) => void, after?: (data: Wire) => void): Promise<boolean> {
+  const id = view.session.id;
+  if (writes.has(id) || releases.get(id)?.status === "pending") return false;
   writes.add(id);
   onError("");
   renderView();
@@ -751,10 +1064,10 @@ async function runAction(view: View, action: Action, label: string, onError: (te
   inspector.setAttribute("aria-busy", "true");
   try {
     const data = await write(view, action);
-    if (view !== current) return;
+    if (view !== current) return true;
     after?.(data);
     if (action.action === "navigate") {
-      if (object(data.result).cancelled === true) return;
+      if (object(data.result).cancelled === true) return false;
       view.revision++;
       view.messages = [];
       view.liveKey = "";
@@ -764,7 +1077,7 @@ async function runAction(view: View, action: Action, label: string, onError: (te
       if (editor) {
         const draft = draftFor(id);
         draft.text = editor;
-        prompt.value = editor;
+        if (!draft.commandMode) prompt.value = editor;
       }
     }
     if (action.action === "resume") view.status = "loading";
@@ -772,8 +1085,10 @@ async function runAction(view: View, action: Action, label: string, onError: (te
     if (action.action === "resume" || action.action === "model") void loadOptions(view);
     if (manager.open) renderManager(view);
     if (inspector.open && action.action !== "abort") void loadDetails(view);
+    return true;
   } catch (error) {
     if (view === current) onError(`${label}失败：${errorText(error)}`);
+    return false;
   } finally {
     writes.delete(id);
     manager.removeAttribute("aria-busy");
@@ -813,6 +1128,53 @@ async function createSession(): Promise<void> {
   } finally {
     createPending = false;
     updateConnection();
+  }
+}
+
+async function releaseToCli(view: View): Promise<void> {
+  const id = view.session.id;
+  if (view !== current || !manager.open || releases.get(id)?.status === "pending" || handoffUnavailable(view)) return;
+  const attempt: Release = { status: "pending" };
+  releases.set(id, attempt);
+  renderView();
+  box("manage-handoff-status").focus();
+  const selected = () => current?.session.id === id ? current : undefined;
+  const ownsFocus = () => manager.open || document.activeElement === btn("manage-button") ||
+    box("composer-shell").contains(document.activeElement);
+  const finish = (target: View, focus: string) => {
+    const shouldFocus = ownsFocus();
+    markInactive(target);
+    target.error = "";
+    if (manager.open) manager.close();
+    renderView();
+    if (shouldFocus && !document.querySelector("dialog[open]")) box(focus).focus();
+  };
+  try {
+    const { session, command } = await api.handoff(id);
+    if (releases.get(id) !== attempt) return;
+    releases.set(id, { status: "released", command });
+    remember(session);
+    const target = selected();
+    if (target) finish(target, "handoff-title");
+  } catch (error) {
+    if (releases.get(id) !== attempt) return;
+    const uncertain = !(error instanceof RequestError) || error.status >= 500 || error.code === "session_not_open";
+    const message = `无法转到 CLI：${errorText(error)}`;
+    const target = selected();
+    if (uncertain || (target && !target.session.active)) {
+      releases.set(id, { status: "uncertain", error: message });
+      const session = target?.session ?? sessions.get(id);
+      if (session) remember({ ...session, active: false, running: false });
+      if (target) finish(target, "session-error");
+      void fetchSessions();
+    } else {
+      releases.set(id, { status: "failed", error: message });
+      if (target) {
+        renderView();
+        if (manager.open && document.activeElement === box("manage-handoff-status")) box("manage-handoff-error").focus();
+      }
+    }
+    if (error instanceof RequestError && (error.status === 401 || error.status === 403)) void bootstrap(true);
   }
 }
 
@@ -891,21 +1253,102 @@ function renderManager(view: View): void {
   if (focusedKey) [...body.querySelectorAll<HTMLElement>("[data-key]")].find(node => node.dataset.key === focusedKey)?.focus();
 }
 
-let detailsSeq = 0;
-async function loadDetails(view: View): Promise<void> {
-  const ticket = ++detailsSeq;
+let commandRequest: AbortController | undefined;
+let commandOptions: readonly Wire[] = [];
+
+function showCommandMode(view: View, enabled: boolean): void {
+  if (view !== current) return;
+  const draft = draftFor(view.session.id);
+  draft.commandMode = enabled;
+  prompt.value = enabled ? draft.commandText : draft.text;
+  renderAttachments();
+  renderView();
+  prompt.focus();
+}
+
+function insertCommand(view: View, invocation: string): void {
+  if (view !== current || !commandToken.test(invocation)) return;
+  const draft = draftFor(view.session.id);
+  const [head = ""] = draft.commandText.split(/\s/, 1);
+  const rest = commandToken.test(head) ? draft.commandText.slice(head.length) : "";
+  draft.commandText = `${invocation}${rest || " "}`;
+  draft.commandError = "";
+  if (commandDialog.open) commandDialog.close();
+  if (inspector.open) inspector.close();
+  showCommandMode(view, true);
+  prompt.setSelectionRange(invocation.length + 1, invocation.length + 1);
+}
+
+function renderCommandOptions(view: View): void {
+  const query = inp("command-search").value.trim().toLocaleLowerCase();
+  const nodes = commandOptions.flatMap(command => {
+    const invocation = str(command.invocation);
+    const description = str(command.description);
+    const source = str(command.source);
+    const sourceLabel = source === "builtin" ? "内置命令" : source === "skill" ? "技能" : source === "prompt" ? "提示模板" : "扩展";
+    if (!commandToken.test(invocation) || !`${invocation} ${description} ${sourceLabel} ${source}`.toLocaleLowerCase().includes(query)) return [];
+    const row = el("li", "stack stack--tight");
+    const insert = button(invocation, () => insertCommand(view, invocation), "button--quiet path");
+    insert.dataset.invocation = invocation;
+    insert.setAttribute("aria-label", `插入命令：${invocation}`);
+    row.append(insert, el("p", "small muted break", [sourceLabel, description].filter(Boolean).join(" · ")));
+    return [row];
+  });
+  box("command-list").replaceChildren(...nodes);
+  box("command-list").hidden = !nodes.length;
+  notice(box("command-status"), nodes.length ? "" : query ? "没有匹配的命令。" : "此会话未列出可用命令。");
+}
+
+async function openCommandPicker(view: View): Promise<void> {
+  if (commandDialog.open || btn("command-picker").disabled) return;
+  commandRequest?.abort();
+  const request = commandRequest = new AbortController();
+  commandOptions = [];
+  const filter = inp("command-search");
+  filter.value = "";
+  box("command-list").replaceChildren();
+  box("command-list").hidden = true;
+  notice(box("command-error"));
+  notice(box("command-status"), "正在读取当前会话的命令…");
+  commandDialog.showModal();
+  const live = () => !request.signal.aborted && commandDialog.open && view === current;
+  try {
+    const data = await api.request(`${sessionPath(view.session.id)}/options`, undefined, request.signal);
+    if (!live()) return;
+    commandOptions = [...BUILTIN_COMMANDS.map(command => ({ ...command, source: "builtin" })),
+      ...list(data.commands).map(object).filter(command => parseBuiltinInput(str(command.invocation)).kind === "plain")];
+    renderCommandOptions(view);
+  } catch (error) {
+    if (!live()) return;
+    notice(box("command-status"));
+    notice(box("command-error"), `无法读取当前会话的命令：${errorText(error)}。可关闭后重试，或直接输入命令。`);
+  } finally {
+    if (commandRequest === request) commandRequest = undefined;
+  }
+}
+
+let detailsRequest: AbortController | undefined;
+function loadDetails(view: View): void {
+  detailsRequest?.abort();
+  const request = detailsRequest = new AbortController();
+  const live = () => !request.signal.aborted && inspector.open && view === current;
+  const path = sessionPath(view.session.id);
   const body = box("details-body");
+  const activity = box("details-native-activity");
   const fail = (message: string) => notice(box("details-error"), message);
   if (!body.childElementCount) body.append(el("p", "muted", "正在读取运行详情…"));
   fail("");
-  try {
-    const data = await api.request(`${sessionPath(view.session.id)}/details`);
-    if (ticket !== detailsSeq || view !== current || !inspector.open) return;
+  activity.querySelector("[data-activity-status]")?.remove();
+  const status = el("p", "small muted", "正在读取原生快照…");
+  status.dataset.activityStatus = "";
+  status.setAttribute("role", "status");
+  activity.append(status);
+  const stats = api.request(`${path}/details`, undefined, request.signal).then(data => {
+    if (!live()) return;
     renderDetails(body, data, view.state, view.options, {
       canWrite: connection === "online",
       canNavigate: connection === "online" && !view.running && !view.compacting && !sending.has(view.session.id),
       queueCount: view.queue,
-      refresh: () => void loadDetails(view),
       clearQueue: () => {
         if (window.confirm("清空所有尚未发送的排队输入？")) void runAction(view, { action: "clearQueue" }, "清空队列", fail);
       },
@@ -920,35 +1363,38 @@ async function loadDetails(view: View): Promise<void> {
           });
         }
       },
-      insertCommand: command => {
-        const draft = draftFor(view.session.id);
-        const start = prompt.selectionStart;
-        const end = prompt.selectionEnd;
-        const spacer = start > 0 && !/\s/.test(draft.text[start - 1] ?? "") ? " " : "";
-        draft.text = `${draft.text.slice(0, start)}${spacer}${command} ${draft.text.slice(end)}`;
-        prompt.value = draft.text;
-        const caret = start + spacer.length + command.length + 1;
-        inspector.close();
-        prompt.focus();
-        prompt.setSelectionRange(caret, caret);
-        renderView();
-      },
+      insertCommand: command => insertCommand(view, command),
     });
-  } catch (error) {
-    if (ticket === detailsSeq && inspector.open && view === current) {
-      body.replaceChildren(button("重试读取", () => void loadDetails(view)));
-      fail(`无法读取运行详情：${errorText(error)}`);
-    }
-  }
+  }).catch(error => {
+    if (!live()) return;
+    if (!body.querySelector("section")) body.replaceChildren();
+    fail(`无法读取运行详情：${errorText(error)}`);
+  });
+  const native = api.request(`${path}/activity`, undefined, request.signal).then(data => {
+    if (live()) showNativeActivity(activity, data);
+  }).catch(error => {
+    if (!live()) return;
+    status.textContent = `无法读取原生快照：${errorText(error)}`;
+    status.className = "notice error small";
+    status.setAttribute("role", "alert");
+  });
+  void Promise.all([stats, native]).then(() => { if (detailsRequest === request) detailsRequest = undefined; });
 }
 
 function listen(): void {
+  btn("cli-history-button").addEventListener("click", () => { toggleNav(false); history.open(); });
+  btn("cli-live-button").addEventListener("click", () => { toggleNav(false); live.open(); });
+  btn("web-branch-button").addEventListener("click", () => {
+    if (current && releases.get(current.session.id)?.status !== "pending") {
+      openBranch({ kind: "web", id: current.session.id, name: current.session.name });
+    }
+  });
   btn("open-navigation").addEventListener("click", () => toggleNav(true));
   btn("close-navigation").addEventListener("click", () => toggleNav(false, true));
   btn("nav-scrim").addEventListener("click", () => toggleNav(false, true));
   mobile.addEventListener("change", () => toggleNav(false));
   document.addEventListener("keydown", event => {
-    if (event.key === "Escape" && navOpen && !chooser.open) toggleNav(false, true);
+    if (event.key === "Escape" && navOpen && !document.querySelector("dialog[open]")) toggleNav(false, true);
   });
   inp("search").addEventListener("input", renderSessions);
   btn("recent").addEventListener("click", () => { archived = false; renderSessions(); });
@@ -956,7 +1402,7 @@ function listen(): void {
   btn("new-welcome").addEventListener("click", openChooser);
   btn("new-sidebar").addEventListener("click", openChooser);
   form("new-form").addEventListener("submit", event => { event.preventDefault(); void createSession(); });
-  for (const modal of [chooser, manager, inspector]) {
+  for (const modal of [chooser, manager, inspector, commandDialog]) {
     for (const close of modal.querySelectorAll("[data-close]")) close.addEventListener("click", () => modal.close());
   }
   btn("manage-button").addEventListener("click", () => {
@@ -964,12 +1410,39 @@ function listen(): void {
     notice(box("manage-error"));
     renderManager(current);
     manager.showModal();
+    renderView();
+  });
+  manager.addEventListener("close", renderView);
+  btn("manage-handoff").addEventListener("click", () => { if (current) void releaseToCli(current); });
+  btn("handoff-copy").addEventListener("click", async () => {
+    const view = current;
+    if (!view) return;
+    const receipt = releases.get(view.session.id);
+    if (receipt?.status !== "released") return;
+    try {
+      await navigator.clipboard.writeText(receipt.command);
+      receipt.copyStatus = "已复制命令。";
+    } catch {
+      receipt.copyStatus = "无法访问剪贴板；可选中命令手动复制。";
+    }
+    if (current?.session.id === view.session.id && releases.get(view.session.id) === receipt) renderView();
   });
   btn("details-button").addEventListener("click", () => {
     if (!current || inspector.open) return;
     box("details-body").replaceChildren();
+    box("details-native-activity").replaceChildren();
     inspector.showModal();
-    void loadDetails(current);
+    loadDetails(current);
+  });
+  btn("details-refresh").addEventListener("click", () => { if (current && inspector.open) loadDetails(current); });
+  inspector.addEventListener("close", () => { if (!inspector.open) detailsRequest?.abort(); });
+  btn("command-mode").addEventListener("click", () => {
+    if (current) showCommandMode(current, !draftFor(current.session.id).commandMode);
+  });
+  btn("command-picker").addEventListener("click", () => { if (current) void openCommandPicker(current); });
+  commandDialog.addEventListener("close", () => { if (!commandDialog.open) commandRequest?.abort(); });
+  inp("command-search").addEventListener("input", () => {
+    if (current && !commandRequest && box("command-error").hidden) renderCommandOptions(current);
   });
   btn("retry").addEventListener("click", () => {
     source?.close();
@@ -983,8 +1456,10 @@ function listen(): void {
   });
   btn("resume").addEventListener("click", () => {
     const view = current;
-    if (!view) return;
-    if (view.session.active) {
+    if (!view || btn("resume").disabled) return;
+    const release = releases.get(view.session.id);
+    const manual = release?.status === "released" || release?.status === "uncertain";
+    if (view.session.active && !manual) {
       view.status = "loading";
       view.error = "";
       renderView();
@@ -992,18 +1467,32 @@ function listen(): void {
       void loadOptions(view);
       return;
     }
-    void runAction(view, { action: "resume" }, "恢复会话", text => { view.error = text; renderView(); });
+    const main = box("conversation");
+    main.focus();
+    void runAction(view, { action: "resume" }, "恢复会话", text => { view.error = text; renderView(); }).then(() => {
+      if (view !== current || document.activeElement !== main || document.querySelector("dialog[open]")) return;
+      if (view.status === "ready") prompt.focus();
+      else if (!box("session-error").hidden) box("session-error").focus();
+    });
   });
-  form("composer").addEventListener("submit", event => { event.preventDefault(); void sendPrompt(); });
+  form("composer").addEventListener("submit", event => { event.preventDefault(); submitComposer(); });
   prompt.addEventListener("input", () => {
     if (!current) return;
-    draftFor(current.session.id).text = prompt.value;
+    const draft = draftFor(current.session.id);
+    draft.commandStatus = undefined;
+    if (draft.commandMode) {
+      draft.commandText = prompt.value;
+      draft.commandError = "";
+    } else {
+      draft.text = prompt.value;
+      draft.error = "";
+    }
     renderView();
   });
   prompt.addEventListener("keydown", event => {
     if (event.key === "Enter" && !event.isComposing && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
-      void sendPrompt();
+      submitComposer();
     }
   });
   prompt.maxLength = 200_000;

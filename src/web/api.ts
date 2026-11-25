@@ -29,10 +29,18 @@ export const parseSessions = (data: Wire): Session[] => list(data.sessions).flat
 });
 
 export type Mode = "prompt" | "steer" | "follow_up";
+export type CliLiveAction =
+  | { readonly action: "connect" }
+  | { readonly action: "disconnect" }
+  | { readonly action: "input"; readonly mode: "prompt"; readonly message: string; readonly clientMessageId: string }
+  | { readonly action: "stop"; readonly expectedTurnId: string };
+export type BranchSource = { readonly kind: "web" | "history" | "live"; readonly id: string; readonly name: string };
+export type BranchChoice = { readonly kind: "fork"; readonly entryId: string } | { readonly kind: "clone" };
 export type Image = { readonly type: "image"; readonly data: string; readonly mimeType: string };
 export type Action =
   | { readonly action: "resume" | "abort" | "clearQueue" }
   | { readonly action: "prompt"; readonly message: string; readonly mode: Mode; readonly expectedTurnId?: string; readonly clientMessageId: string; readonly images?: readonly Image[] }
+  | { readonly action: "command"; readonly invocation: string; readonly arguments?: string; readonly clientMessageId?: string }
   | { readonly action: "rename"; readonly name: string }
   | { readonly action: "archive" | "settle" | "fast" | "autoCompaction"; readonly enabled: boolean }
   | { readonly action: "model"; readonly provider: string; readonly modelId: string }
@@ -48,6 +56,15 @@ export class RequestError extends Error {
 }
 
 export const sessionPath = (id: string): string => `/api/sessions/${encodeURIComponent(id)}`;
+export const cliHistoryPath = (id: string): string => `/api/cli-history/${encodeURIComponent(id)}`;
+export const cliLivePath = (id: string): string => `/api/cli-live/${encodeURIComponent(id)}`;
+export const branchPath = ({ kind, id }: BranchSource): string => {
+  switch (kind) {
+    case "web": return sessionPath(id);
+    case "history": return cliHistoryPath(id);
+    case "live": return cliLivePath(id);
+  }
+};
 
 export class Api {
   token = "";
@@ -74,5 +91,26 @@ export class Api {
 
   action(id: string, action: Action): Promise<Wire> {
     return this.request(`${sessionPath(id)}/actions`, action);
+  }
+
+  cliLiveAction(id: string, action: CliLiveAction): Promise<Wire> {
+    return this.request(`${cliLivePath(id)}/actions`, action);
+  }
+
+  async resumeHistory(id: string): Promise<Session> {
+    const data = await this.request(`${cliHistoryPath(id)}/resume`, {});
+    const session = parseSession(data.session);
+    if (!session?.active) throw new RequestError("没有收到可继续的 Web 会话。请检查会话列表。", 502, "");
+    return session;
+  }
+
+  async handoff(id: string): Promise<{ session: Session; command: string }> {
+    const data = await this.request(`${sessionPath(id)}/handoff`, {});
+    const session = parseSession(data.session);
+    const command = str(data.command);
+    if (!session || session.id !== id || object(data.session).active !== false || !command.trim()) {
+      throw new RequestError("无法确认会话已释放，未显示启动命令。", 502, "");
+    }
+    return { session, command };
   }
 }

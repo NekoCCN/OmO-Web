@@ -11,8 +11,11 @@ const workspace = join(directory, "workspace");
 const answer = "Native RPC stream verified.";
 const modelId = "web-smoke";
 const permissionMarker = "Please test the write approval flow.";
+const cliMarker = "CLI history smoke test.";
+const commandMarker = "Native template expansion for workbench smoke.";
 const blockedFile = join(workspace, "should-not-exist.txt");
 let received = 0;
+let expandedCommand = false;
 const provider = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
@@ -21,6 +24,7 @@ const provider = Bun.serve({
     const params = await request.json();
     assert.equal(params.model, modelId);
     received++;
+    if (JSON.stringify(params.messages.at(-1)).includes(commandMarker)) expandedCommand = true;
     const data = (delta: object, finish_reason: string | null) => `data: ${JSON.stringify({
       id: "chatcmpl-web-smoke", object: "chat.completion.chunk", created: 1795460000, model: modelId,
       choices: [{ index: 0, delta, finish_reason }],
@@ -42,7 +46,8 @@ const provider = Bun.serve({
 });
 let app: Awaited<ReturnType<typeof startApp>> | undefined;
 try {
-  await Promise.all([mkdir(profile), mkdir(workspace)]);
+  await Promise.all([mkdir(join(profile, "prompts"), { recursive: true }), mkdir(workspace)]);
+  await writeFile(join(profile, "prompts", "web-workbench-smoke.md"), commandMarker + "\n");
   await writeFile(join(profile, "models.json"), JSON.stringify({ providers: { "web-test": {
     baseUrl: `${provider.url.origin}/v1`, api: "openai-completions", apiKey: "local-dummy",
     models: [{ id: modelId, name: "Web Smoke Model", input: ["text"], contextWindow: 128000, maxTokens: 4000 }],
@@ -51,6 +56,7 @@ try {
   process.env.OMO_CODING_AGENT_DIR = profile;
   const settings: AppSettings = {
     dataDir: join(directory, "web"), workspaces: [workspace], port: 0,
+    cliAgentDir: profile,
     engineCommand: [process.env.OMO_WEB_BIN || "omo", "--mode", "rpc", "--multi-session", "--offline", "--no-approve"],
   };
   async function connect() {
@@ -82,6 +88,8 @@ try {
   const path = `/api/sessions/${created.session.id}`;
   const options = await first.get(`${path}/options`);
   assert(options.models.some((m: { id: string }) => m.id === modelId));
+  assert(options.commands.some((row: { invocation?: string }) => row.invocation === "/web-workbench-smoke"),
+    "Expected the loaded native prompt template with an executable Web invocation");
   await first.post(`${path}/actions`, { action: "model", provider: "web-test", modelId });
   const details = await first.get(`${path}/details`);
   assert.equal(details.stats.userMessages, 0);
@@ -145,7 +153,34 @@ try {
   await later.post(`${path}/actions`, { action: "resume" });
   const reopened = await later.get(path);
   assert.deepEqual(reopened.messages, messages);
-  console.log(`NATIVE PASS · ${later.boot.engine.version} · stream, explicit tool denial, restart and resume`);
+
+  const commandSession = await later.post("/api/sessions", { cwd: workspace, name: "Native command smoke" }, 201);
+  const commandPath = `/api/sessions/${commandSession.session.id}`;
+  const commandEvents = await fetch(`${later.origin}/api/events`, { signal: AbortSignal.timeout(20_000) });
+  const commandReader = commandEvents.body?.pipeThrough(new TextDecoderStream()).getReader();
+  assert(commandReader);
+  try {
+    approvalWire = "";
+    await later.post(`${commandPath}/actions`, { action: "command", invocation: "/web-workbench-smoke" });
+    await readUntil(commandReader, '"type":"agent_settled"');
+    assert(expandedCommand, "The native provider should receive the expanded template, not its invocation");
+  } finally {
+    await commandReader.cancel();
+  }
+
+  const cli = Bun.spawn([settings.engineCommand[0], "-p", "--offline", "--no-approve", "--name", "CLI smoke history", cliMarker], {
+    cwd: workspace, env: process.env, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 20_000,
+  });
+  const [cliCode, , cliError] = await Promise.all([cli.exited, new Response(cli.stdout).text(), new Response(cli.stderr).text()]);
+  assert.equal(cliCode, 0, cliError);
+  const history = await later.get("/api/cli-history");
+  const cliSession = history.sessions.find((row: { name: string }) => row.name === "CLI smoke history");
+  assert(cliSession, "The native CLI session must appear independently of the Web registry");
+  const cliSnapshot = await later.get(`/api/cli-history/${encodeURIComponent(cliSession.id)}`);
+  assert(cliSnapshot.messages.some((m: { role: string; content: { text?: string }[] }) =>
+    m.role === "assistant" && m.content.some(block => block.text === answer)));
+  assert(!(await later.get("/api/sessions")).sessions.some((row: { name: string }) => row.name === "CLI smoke history"));
+  console.log(`NATIVE PASS · ${later.boot.engine.version} · stream, explicit tool denial, restart and resume, template execution, CLI-created read-only history`);
 } finally {
   await app?.stop();
   await provider.stop(true);

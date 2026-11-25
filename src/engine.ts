@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { SocketPeer } from "./engine-socket.ts";
+import type { EngineSocketTransport } from "./engine-socket.ts";
 import { WebError, array, record } from "./protocol.ts";
 import type { WireObject } from "./protocol.ts";
 
@@ -104,15 +106,25 @@ class Peer {
   }
 }
 
+type Connection = {
+  request(type: string, fields?: WireObject, timeout?: number): Promise<WireObject>;
+  stop(): Promise<void>;
+};
+
 export class Engine {
-  #peer: Peer | undefined;
-  #boot: Promise<Peer> | undefined;
+  #peer: Connection | undefined;
+  #boot: Promise<Connection> | undefined;
   #stopped = false;
   status: EngineStatus = { online: false };
   capabilities: ReadonlySet<unknown> = new Set();
 
   constructor(readonly command: readonly [string, ...string[]], readonly cwd: string,
-    readonly onEvent: (event: WireObject) => void, readonly onStatus: (status: EngineStatus) => void) {}
+    readonly onEvent: (event: WireObject) => void, readonly onStatus: (status: EngineStatus) => void,
+    readonly transport?: EngineSocketTransport) {}
+
+  get usesPrivateSocketTransport(): boolean {
+    return this.transport?.kind === "socket";
+  }
 
   request(type: string, fields?: WireObject, timeout?: number): Promise<WireObject> {
     return this.#connect().then(peer => peer.request(type, fields, timeout));
@@ -127,20 +139,40 @@ export class Engine {
     await this.#connect();
   }
 
-  async #connect(): Promise<Peer> {
+  async #connect(): Promise<Connection> {
     if (this.#stopped) throw offline();
     if (this.#boot) return this.#boot;
     if (this.#peer && this.status.online) return this.#peer;
-    const peer = new Peer(this.command, this.cwd, this.onEvent, error => {
+    const onExit = (error: WebError) => {
       if (this.#peer !== peer) return;
       this.#peer = undefined;
       this.capabilities = new Set();
       this.status = { online: false, error: error.message };
       this.onStatus(this.status);
-    });
-    this.#peer = peer;
+    };
+    const socket = this.transport?.kind === "socket" ? this.transport : undefined;
+    let peer: Connection | undefined;
+    const launchSocket = async (): Promise<Connection> => {
+      if (!socket) return new Peer(this.command, this.cwd, this.onEvent, onExit);
+      try {
+        return await SocketPeer.launch({
+          command: [...this.command, "--listen", `unix://${socket.socketPath}`, "--session-runtime", "in-process"],
+          cwd: this.cwd,
+          socketPath: socket.socketPath,
+          keyRoot: socket.keyRoot,
+          env: { ...process.env, OMO_CODING_AGENT_DIR: socket.keyRoot, SENPI_CODING_AGENT_DIR: socket.keyRoot, PI_CODING_AGENT_DIR: socket.keyRoot, SENPI_RPC_REQUIRE_TOKEN: "1" },
+        }, { onEvent: this.onEvent, onClose: onExit });
+      } catch (error) {
+        if (!(error instanceof WebError)) throw error;
+        this.status = { online: false, error: error.message };
+        this.onStatus(this.status);
+        throw error;
+      }
+    };
     this.#boot = (async () => {
       try {
+        peer = await launchSocket();
+        this.#peer = peer;
         const info = await peer.request("get_protocol_info", {}, 12_000);
         if (info.mode !== "multi" || info.protocolVersion !== 1) {
           throw new WebError(503, "incompatible_engine", "需要支持多会话 RPC v1 的 OmO Native。");
@@ -152,7 +184,7 @@ export class Engine {
         return peer;
       } catch (error) {
         if (!(error instanceof WebError)) throw error;
-        await peer.stop();
+        if (peer) await peer.stop();
         this.status = { online: false, error: error.message };
         this.onStatus(this.status);
         throw error;
@@ -165,6 +197,8 @@ export class Engine {
 
   async stop(): Promise<void> {
     this.#stopped = true;
+    const boot = this.#boot;
+    if (boot) await boot.then(() => undefined, () => undefined);
     await this.#peer?.stop();
   }
 }

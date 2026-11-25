@@ -7,6 +7,7 @@
   <title>OmO Web · 会话工作台</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/workbench.css">
   <script type="module" src="/app.js"></script>
 </head>
 <body>
@@ -30,6 +31,10 @@
           <button type="button" class="button button--quiet" id="recent" aria-pressed="true">最近</button>
           <button type="button" class="button button--quiet" id="archived" aria-pressed="false">已归档</button>
         </div>
+        <div class="row" role="group" aria-label="CLI 会话">
+          <button type="button" class="button button--quiet" id="cli-live-button" aria-haspopup="dialog">CLI 实时</button>
+          <button type="button" class="button button--quiet" id="cli-history-button" aria-haspopup="dialog">CLI 历史</button>
+        </div>
       </div>
       <nav class="sessions" aria-label="会话列表"><ul id="session-list"></ul><p id="list-empty" class="muted small">正在读取会话…</p></nav>
       <div class="sidebar-footer stack stack--tight">
@@ -52,6 +57,7 @@
         </div>
         <div class="row workspace-actions">
           <button type="button" class="button button--quiet" id="details-button" hidden>运行详情</button>
+          <button type="button" class="button button--quiet" id="web-branch-button" aria-haspopup="dialog" hidden>分支 / 复制</button>
           <button type="button" class="button button--quiet" id="manage-button" hidden>会话管理</button>
         </div>
       </header>
@@ -70,7 +76,15 @@
           <section id="inactive-session" class="welcome stack" hidden>
             <h2 id="inactive-title">继续此会话</h2>
             <p id="inactive-copy" class="muted"></p>
-            <p id="session-error" class="notice error small" role="alert" hidden></p>
+            <section id="handoff-receipt" class="stack stack--tight" aria-labelledby="handoff-title" hidden>
+              <h2 id="handoff-title" tabindex="-1">已从 Web 释放</h2>
+              <p class="muted">在本机终端手动运行以下命令。退出 CLI 后，可在这里恢复同一会话。</p>
+              <pre id="handoff-command" tabindex="0" aria-label="本机启动命令"><code></code></pre>
+              <div class="row"><button type="button" class="button button--primary" id="handoff-copy">复制命令</button></div>
+              <p id="handoff-copy-status" class="small muted" role="status" hidden></p>
+            </section>
+            <p id="handoff-draft-note" class="small muted" hidden></p>
+            <p id="session-error" class="notice error small" role="alert" tabindex="-1" hidden></p>
             <div><button type="button" class="button button--primary" id="resume" hidden>恢复会话</button></div>
           </section>
           <section id="active-session" aria-label="会话内容" hidden>
@@ -91,7 +105,7 @@
           </div>
           <div id="attachments" class="row attachments" aria-label="待发送图片" hidden></div>
           <div class="compose-box">
-            <label for="prompt" class="sr-only">消息</label>
+            <label for="prompt" id="prompt-label" class="sr-only">消息</label>
             <textarea id="prompt" rows="3" placeholder="输入消息…" aria-describedby="composer-hint"></textarea>
             <div class="compose-toolbar">
               <div class="row compose-options">
@@ -108,11 +122,17 @@
               <div class="row compose-submit">
                 <button type="button" class="button button--primary" id="stop" hidden>停止</button>
                 <button type="submit" class="button button--primary" id="send" disabled>发送</button>
+                <button type="submit" class="button button--primary" id="send-command" hidden disabled>执行命令</button>
               </div>
             </div>
           </div>
           <div class="row row--between composer-meta">
-            <p id="composer-hint" class="small muted"></p><p id="context-usage" class="small muted numerical" hidden></p>
+            <p id="composer-hint" class="small muted"></p>
+            <div class="row">
+              <p id="context-usage" class="small muted numerical" hidden></p>
+              <button type="button" class="button button--quiet" id="command-mode" aria-pressed="false">命令模式</button>
+              <button type="button" class="button" id="command-picker" aria-haspopup="dialog" hidden>查找命令</button>
+            </div>
           </div>
         </form>
       </section>
@@ -133,6 +153,13 @@
   <dialog id="manage-dialog" aria-labelledby="manage-title">
     <div class="stack">
       <div class="row row--between"><h2 id="manage-title">会话管理</h2><button type="button" class="button button--quiet" data-close autofocus>关闭</button></div>
+      <section class="stack stack--tight" aria-label="顺序换端">
+        <div class="row"><button type="button" class="button" id="manage-handoff" aria-describedby="manage-handoff-note manage-handoff-status" disabled>转到 CLI</button></div>
+        <p id="manage-handoff-note" class="small muted">释放当前会话后，使用本机终端继续。未发送的文字和图片留在此页面。</p>
+        <p id="manage-handoff-status" class="small muted" role="status" tabindex="-1" hidden></p>
+        <p id="manage-handoff-error" class="notice error small" role="alert" tabindex="-1" hidden></p>
+      </section>
+      <hr class="rule">
       <div id="manage-body" class="stack"></div>
       <p id="manage-error" class="notice error small" role="alert" hidden></p>
     </div>
@@ -140,8 +167,117 @@
   <dialog id="details-dialog" aria-labelledby="details-title">
     <div class="stack">
       <div class="row row--between"><h2 id="details-title">运行详情</h2><button type="button" class="button button--quiet" data-close autofocus>关闭</button></div>
+      <div class="row"><button type="button" class="button" id="details-refresh">刷新详情</button></div>
+      <div id="details-native-activity" class="stack stack--tight"></div>
       <div id="details-body" class="stack"></div>
       <p id="details-error" class="notice error small" role="alert" hidden></p>
+    </div>
+  </dialog>
+  <dialog id="cli-live-dialog" aria-labelledby="cli-live-title">
+    <div class="stack">
+      <div class="row row--between">
+        <h2 id="cli-live-title">CLI 实时</h2>
+        <button type="button" class="button button--quiet" id="cli-live-close" autofocus>关闭</button>
+      </div>
+      <label class="field"><span>本地 CLI 会话</span><select id="cli-live-session" aria-describedby="cli-live-workspace" disabled></select></label>
+      <p class="path small muted" id="cli-live-workspace" hidden></p>
+      <div class="row">
+        <button type="button" class="button button--primary" id="cli-live-connect" disabled>连接</button>
+        <button type="button" class="button" id="cli-live-disconnect" hidden>断开</button>
+        <button type="button" class="button button--quiet" id="cli-live-refresh">刷新</button>
+        <button type="button" class="button button--quiet" id="cli-live-branch" aria-haspopup="dialog" hidden>分支 / 复制</button>
+      </div>
+      <p id="cli-live-status" class="small muted" role="status"></p>
+      <p id="cli-live-error" class="notice error small" role="alert" hidden></p>
+      <section id="cli-live-conversation" class="stack stack--tight" aria-label="CLI 实时对话" hidden>
+        <div id="cli-live-transcript" tabindex="0" role="region" aria-label="CLI 实时消息">
+          <p id="cli-live-empty" class="small muted">暂无可显示的文字消息。</p>
+          <div id="cli-live-messages" class="messages"></div>
+        </div>
+        <form id="cli-live-form" class="stack stack--tight">
+          <label class="field"><span>发给 CLI 的普通消息</span><textarea id="cli-live-input" rows="3" maxlength="64000" aria-describedby="cli-live-hint"></textarea></label>
+          <p id="cli-live-hint" class="small muted">仅普通文字。命令、权限审批及私密交互请回到 CLI 处理。</p>
+          <div class="row">
+            <button type="submit" class="button button--primary" id="cli-live-send" disabled>发送</button>
+            <button type="button" class="button button--danger" id="cli-live-stop" hidden>停止当前回合</button>
+          </div>
+          <p id="cli-live-receipt" class="small muted" role="status" hidden></p>
+        </form>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="cli-history-dialog" aria-labelledby="cli-history-title">
+    <div class="stack">
+      <div class="row row--between">
+        <h2 id="cli-history-title">CLI 历史</h2>
+        <button type="button" class="button button--quiet" data-close>关闭</button>
+      </div>
+      <p class="small muted">浏览记录不会打开会话。选择「在 Web 继续」后才会尝试打开同一会话。</p>
+      <section id="cli-history-index" class="stack" aria-label="CLI 历史列表">
+        <label class="field"><span>筛选 CLI 历史</span><input id="cli-history-search" type="search" placeholder="名称或工作目录" autocomplete="off" autofocus></label>
+        <ul id="cli-history-list" class="command-list"></ul>
+        <p id="cli-history-list-status" class="small muted" role="status" hidden></p>
+        <p id="cli-history-list-error" class="notice error small" role="alert" hidden></p>
+        <div class="row"><button type="button" class="button" id="cli-history-refresh">刷新列表</button></div>
+      </section>
+      <section id="cli-history-record" class="stack" aria-labelledby="cli-history-record-title" hidden>
+        <div class="row row--between">
+          <button type="button" class="button" id="cli-history-back">返回列表</button>
+          <button type="button" class="button" id="cli-history-refresh-activity">刷新原生快照</button>
+        </div>
+        <div class="stack stack--tight">
+          <h3 id="cli-history-record-title" tabindex="-1"></h3>
+          <p id="cli-history-record-meta" class="small muted break"></p>
+          <div class="row">
+            <button type="button" class="button button--primary" id="cli-history-resume" aria-describedby="cli-history-resume-status" disabled>在 Web 继续</button>
+            <button type="button" class="button" id="cli-history-branch" aria-haspopup="dialog" disabled>分支 / 复制</button>
+          </div>
+          <p id="cli-history-resume-status" class="small muted" role="status" tabindex="-1" hidden></p>
+          <p id="cli-history-resume-error" class="notice error small" role="alert" tabindex="-1" hidden></p>
+        </div>
+        <div id="cli-history-activity" class="stack stack--tight"></div>
+        <section class="stack" aria-label="只读对话记录">
+          <p id="cli-history-record-status" class="small muted" role="status" hidden></p>
+          <p id="cli-history-record-error" class="notice error small" role="alert" hidden></p>
+          <div id="cli-history-empty" class="small muted" hidden>这条 CLI 历史没有可显示的消息。</div>
+          <div id="cli-history-messages" class="messages"></div>
+        </section>
+      </section>
+    </div>
+  </dialog>
+  <dialog id="command-dialog" aria-labelledby="command-title">
+    <div class="stack">
+      <div class="row row--between">
+        <h2 id="command-title">查找命令</h2>
+        <button type="button" class="button button--quiet" data-close>关闭</button>
+      </div>
+      <p class="small muted">选择条目只填入当前会话的命令草稿。</p>
+      <label class="field"><span>筛选命令</span><input id="command-search" type="search" placeholder="/命令、$技能或说明" autocomplete="off" autofocus></label>
+      <ul id="command-list" class="command-list"></ul>
+      <p id="command-status" class="small muted" role="status" hidden></p>
+      <p id="command-error" class="notice error small" role="alert" hidden></p>
+    </div>
+  </dialog>
+  <dialog id="branch-dialog" aria-labelledby="branch-title">
+    <div class="stack">
+      <div class="row row--between">
+        <h2 id="branch-title">分支 / 复制</h2>
+        <button type="button" class="button button--quiet" id="branch-close" autofocus>关闭</button>
+      </div>
+      <p id="branch-source" class="break"></p>
+      <p id="branch-context" class="small muted"></p>
+      <p id="branch-status" class="small muted" role="status" hidden></p>
+      <p id="branch-error" class="notice error small" role="alert" hidden></p>
+      <form id="branch-form" class="stack">
+        <label class="field"><span>选择用户消息</span><select id="branch-message" aria-describedby="branch-hint" disabled></select></label>
+        <p id="branch-message-preview" class="plain small muted" tabindex="0" hidden></p>
+        <p id="branch-hint" class="small muted">分支从所选消息之前开始，所选文字只填入新草稿，不会发送。复制保留当前来源的上下文。</p>
+        <div class="row">
+          <button type="submit" class="button button--primary" id="branch-fork" disabled>从消息前分支</button>
+          <button type="button" class="button" id="branch-clone" disabled>复制会话</button>
+          <button type="button" class="button button--quiet" id="branch-refresh">刷新选项</button>
+        </div>
+      </form>
     </div>
   </dialog>
   <noscript>此工作台需要 JavaScript 才能连接本机会话服务。</noscript>

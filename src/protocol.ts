@@ -26,7 +26,16 @@ export class WebError extends Error {
   }
 }
 
+const noControlChars = (value: string): boolean => {
+  for (const char of value) {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 32 || code === 127) return false;
+  }
+  return true;
+};
+
 export const openInput = z.strictObject({ cwd: z.string().min(1).max(4096), name: z.string().trim().min(1).max(120).optional() });
+export const emptyBody = z.strictObject({});
 export const actions = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("resume") }),
   z.strictObject({
@@ -38,6 +47,12 @@ export const actions = z.discriminatedUnion("action", [
       data: z.string().min(4).max(2_800_000).refine(value => value.length % 4 === 0 && /^[A-Za-z0-9+/]+={0,2}$/.test(value)),
       mimeType: z.enum(["image/png", "image/jpeg", "image/gif", "image/webp"]),
     })).max(4).optional(),
+  }),
+  z.strictObject({
+    action: z.literal("command"),
+    invocation: z.string().min(2).max(80).refine(value => /^[/$][A-Za-z0-9_\-:]+$/.test(value)),
+    arguments: z.string().max(2000).refine(value => noControlChars(value)).optional(),
+    clientMessageId: z.uuid().optional(),
   }),
   z.strictObject({ action: z.literal("abort") }),
   z.strictObject({ action: z.literal("rename"), name: z.string().trim().min(1).max(120) }),

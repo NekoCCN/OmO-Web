@@ -1,11 +1,13 @@
-import { button, el, fold, list, num, object, str } from "./dom.ts";
+import { branchPath, parseSession, RequestError } from "./api.ts";
+import type { Api, BranchChoice, BranchSource, Session } from "./api.ts";
+import { byId, button, el, errorText, fold, list, notice, num, object, option, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { renderNativeActivity } from "./native-activity.ts";
 
 type Controls = {
   readonly canWrite: boolean;
   readonly canNavigate: boolean;
   readonly queueCount?: number;
-  readonly refresh: () => void;
   readonly clearQueue: () => void;
   readonly navigate: (id: string | null) => void;
   readonly insertCommand: (value: string) => void;
@@ -81,7 +83,7 @@ function queuePanel(queue: Wire, controls: Controls): HTMLElement {
 }
 
 function commandPanel(options: Wire, controls: Controls): HTMLElement {
-  const commands = list(options.commands).map(object).filter(command => Boolean(str(command.name)));
+  const commands = list(options.commands).map(object).filter(command => Boolean(str(command.invocation)));
   const section = part("可用命令");
   if (!commands.length) {
     section.append(el("p", "muted small", "未读取到可用命令。"));
@@ -89,8 +91,7 @@ function commandPanel(options: Wire, controls: Controls): HTMLElement {
   }
   const result = el("ul", "command-list");
   for (const command of commands) {
-    const name = str(command.name);
-    const syntax = name.startsWith("/") || name.startsWith("$") ? name : `/${name}`;
+    const syntax = str(command.invocation);
     const action = button(syntax, () => controls.insertCommand(syntax), "button--quiet path");
     action.title = "插入输入框，不会立即发送";
     action.setAttribute("aria-label", `插入命令：${syntax}`);
@@ -163,12 +164,134 @@ function treePanel(data: Wire, controls: Controls): HTMLElement {
 
 export function renderDetails(host: HTMLElement, data: Wire, state: Wire, options: Wire, controls: Controls): void {
   const opened = [...host.querySelectorAll("details")].map(node => node.open);
-  const actions = el("div", "row");
-  const refresh = button("刷新详情", controls.refresh);
-  actions.append(refresh);
   host.replaceChildren(
-    actions, activity(object(data.stats), state), queuePanel(object(data.queue), controls),
+    activity(object(data.stats), state), queuePanel(object(data.queue), controls),
     commandPanel(options, controls), treePanel(object(data.tree), controls),
   );
   host.querySelectorAll("details").forEach((node, i) => { node.open = opened[i] ?? false; });
+}
+
+export function showNativeActivity(host: HTMLElement, data: Wire): void {
+  const opened = new Set([...host.querySelectorAll("details[open]")].map(node => node.firstElementChild?.textContent));
+  const snapshot = renderNativeActivity(data);
+  snapshot.setAttribute("aria-label", "原生 DAG 与子代理快照");
+  host.replaceChildren(snapshot);
+  snapshot.querySelectorAll("details").forEach(node => { node.open = opened.has(node.firstElementChild?.textContent); });
+}
+
+export function branchDialog(api: Api, enter: (session: Session, editorText: string, source: BranchSource) => void) {
+  const modal = byId("branch-dialog", HTMLDialogElement);
+  const message = byId("branch-message", HTMLSelectElement);
+  const box = (id: string) => byId(id, HTMLElement);
+  const btn = (id: string) => byId(id, HTMLButtonElement);
+  const context = {
+    web: "来源：Web 会话。新会话和原会话可分别继续。",
+    history: "来源：CLI 最后保存的上下文，不修改 CLI 记录。",
+    live: "来源：CLI 当前上下文。无法校验实时位置时不会改用历史记录。",
+  } satisfies Record<BranchSource["kind"], string>;
+  let selected: BranchSource | undefined;
+  let request: AbortController | undefined;
+  let pending = false;
+  let canClone = false;
+  let messages = new Map<string, string>();
+
+  function render(): void {
+    const disabled = pending || Boolean(request);
+    const preview = messages.get(message.value);
+    message.disabled = disabled || !messages.size;
+    btn("branch-fork").disabled = disabled || preview === undefined;
+    btn("branch-clone").disabled = disabled || !canClone;
+    btn("branch-refresh").disabled = disabled;
+    btn("branch-close").disabled = pending;
+    notice(box("branch-message-preview"), preview);
+  }
+
+  async function load(source: BranchSource): Promise<void> {
+    if (pending || request) return;
+    const run = request = new AbortController();
+    const status = box("branch-status");
+    notice(status, "正在读取可用分支与复制选项…");
+    notice(box("branch-error"));
+    render();
+    try {
+      const data = await api.request(`${branchPath(source)}/branch-options`, undefined, run.signal);
+      if (run.signal.aborted || !modal.open || selected !== source) return;
+      canClone = data.canClone === true;
+      messages = new Map(list(data.forkMessages).map(object).flatMap(row => {
+        const id = str(row.entryId);
+        return id && typeof row.text === "string" ? [[id, row.text] as const] : [];
+      }));
+      const previous = message.value;
+      message.replaceChildren(option("选择一条用户消息", ""), ...Array.from(messages, ([id, text], i) => {
+        const label = text.trim().replace(/\s+/g, " ");
+        return option(`${i + 1} · ${label.slice(0, 100)}${label.length > 100 ? "…" : ""}`, id);
+      }));
+      if (messages.has(previous)) message.value = previous;
+      notice(status, !canClone && !messages.size ? "此来源没有可分支或复制的上下文。" : "");
+    } catch (error) {
+      if (!run.signal.aborted && modal.open && selected === source) {
+        canClone = false;
+        messages.clear();
+        message.replaceChildren(option("未读取到选项", ""));
+        notice(status);
+        notice(box("branch-error"), `无法读取分支选项：${errorText(error)}`);
+      }
+    } finally {
+      if (request === run) request = undefined;
+      render();
+    }
+  }
+
+  async function submit(choice: BranchChoice): Promise<void> {
+    const source = selected;
+    if (!source || pending || request) return;
+    pending = true;
+    notice(box("branch-error"));
+    notice(box("branch-status"), "正在创建独立的 Web 会话…");
+    render();
+    try {
+      const result = await api.request(`${branchPath(source)}/branches`, choice);
+      if (result.cancelled === true) {
+        notice(box("branch-status"), "已取消，原会话没有修改。");
+        return;
+      }
+      const session = parseSession(result.session);
+      if (!session?.active) throw new RequestError("没有收到可继续的 Web 会话。请检查会话列表。", 502, "");
+      modal.close();
+      enter(session, str(result.editorText), source);
+    } catch (error) {
+      notice(box("branch-status"));
+      notice(box("branch-error"), `无法确认新会话：${errorText(error)}`);
+    } finally {
+      pending = false;
+      render();
+    }
+  }
+
+  message.addEventListener("change", render);
+  byId("branch-form", HTMLFormElement).addEventListener("submit", event => {
+    event.preventDefault();
+    if (!btn("branch-fork").disabled) void submit({ kind: "fork", entryId: message.value });
+  });
+  btn("branch-clone").addEventListener("click", () => void submit({ kind: "clone" }));
+  btn("branch-close").addEventListener("click", () => modal.close());
+  btn("branch-refresh").addEventListener("click", () => { if (selected) void load(selected); });
+  modal.addEventListener("cancel", event => { if (pending) event.preventDefault(); });
+  modal.addEventListener("close", () => {
+    if (modal.open) return;
+    request?.abort();
+    request = undefined;
+    selected = undefined;
+  });
+  return (source: BranchSource): void => {
+    if (modal.open) return;
+    selected = source;
+    canClone = false;
+    messages.clear();
+    message.replaceChildren(option("选择一条用户消息", ""));
+    box("branch-source").textContent = source.name;
+    box("branch-context").textContent = context[source.kind];
+    modal.showModal();
+    void load(source);
+  };
 }
