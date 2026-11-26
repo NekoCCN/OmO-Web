@@ -12,6 +12,7 @@ import { canShowSnapshot, renderJournal, renderRuntimePane } from "./runtime-sum
 import { cliHistory } from "./cli-history.ts";
 import { cliLive } from "./cli-live.ts";
 import { cliFollow } from "./cli-follow.ts";
+import { workspaceBrowser, workspacePaths } from "./workspace-browser.ts";
 import { BUILTIN_COMMANDS, parseBuiltinInput } from "./builtin-commands.ts";
 import type { BuiltinCommand } from "./builtin-commands.ts";
 
@@ -109,6 +110,8 @@ let cliSeq = 0;
 const CLI_REFRESH_MS = 30_000;
 const cliTime = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" });
 let workspaces: readonly string[] = [];
+let workspaceRevision = 0;
+let windowsWorkspaceLabels = false;
 const workspaceKey = "omo-web-workspace";
 let workspace = "";
 const workspaceSessions = new Map<string, string>();
@@ -144,6 +147,11 @@ const follow = cliFollow(api, cwd => workspaces.includes(cwd), () => {
   renderView();
 });
 const live = cliLive(api, () => focusCliLauncher("cli-live-button"), openBranch, inWorkspace);
+const browser = workspaceBrowser(api, () => ({ roots: workspaces, selected: displayedWorkspace() }), selectBrowsedWorkspace, () => {
+  if (mobile.matches && !navOpen) btn("open-navigation").focus();
+  else if (btn("workspace-browser-button").hidden) inp("search").focus();
+  else btn("workspace-browser-button").focus();
+});
 let leavingHistory = false;
 const history = cliHistory(api, () => {
   if (!leavingHistory && !document.querySelector("dialog:modal")) focusCliLauncher("cli-history-button");
@@ -272,7 +280,9 @@ function updateConnection(): void {
   btn("new-sidebar").disabled = !available;
   btn("new-welcome").disabled = !available;
   box("welcome-copy").textContent = bootstrapped && !workspaces.length
-    ? "没有可选的工作目录。请检查本机 Web 服务的工作目录配置。"
+    ? btn("workspace-browser-button").hidden
+      ? "没有可选的工作目录。请检查本机 Web 服务的工作目录配置。"
+      : "还没有可用的工作目录。可从会话导航打开「浏览」，输入并确认工作目录。"
     : "选择工作目录后开始新会话，或从会话列表继续此前的工作。";
   btn("create").disabled = !available || createPending;
   history.update();
@@ -377,10 +387,14 @@ function storeWorkspace(cwd: string): void {
 }
 
 function workspaceLabel(cwd: string): string {
-  const parts = cwd.split("/").filter(Boolean);
+  const labelPath = (path: string) => windowsWorkspaceLabels ? path.replaceAll("\\", "/") : path;
+  const parts = labelPath(cwd).split("/").filter(Boolean);
+  if (windowsWorkspaceLabels && parts.length === 1) return cwd;
   for (let depth = 1; depth <= parts.length; depth++) {
     const suffix = parts.slice(-depth).join("/");
-    if (!workspaces.some(root => root !== cwd && root.endsWith(`/${suffix}`))) return suffix;
+    if (!workspaces.some(root => root !== cwd && labelPath(root).endsWith(`/${suffix}`))) {
+      return windowsWorkspaceLabels ? suffix.replaceAll("/", "\\") : suffix;
+    }
   }
   return cwd;
 }
@@ -432,21 +446,43 @@ function selectWorkspace(cwd: string): void {
   renderView();
 }
 
+function selectBrowsedWorkspace(cwd: string, roots: readonly string[]): void {
+  workspaceRevision++;
+  workspaces = roots;
+  follow.stop();
+  storeWorkspace(cwd);
+  // A picker receipt changes the scope, not the active native session or its draft.
+  if (current && current.session.cwd !== cwd) clearCurrentView();
+  renderWorkspace();
+  live.scopeChanged();
+  // The dialog's close handler restores focus using the updated drawer state.
+  toggleNav(false);
+  void fetchSessions();
+  void fetchCliRows(true);
+  updateConnection();
+}
+
 async function bootstrap(reconcile = false): Promise<void> {
   const ticket = ++bootSeq;
   const version = mutation;
+  const rootRevision = workspaceRevision;
   try {
     const data = await api.request("/api/bootstrap");
     if (ticket !== bootSeq) return;
-    api.token = str(data.token);
+    const token = str(data.token);
+    const tokenChanged = token !== api.token;
+    api.token = token;
     engine = object(data.engine);
     handoffSupport = object(data.handoff);
-    workspaces = [...new Set(list(data.workspaces).filter((cwd): cwd is string => typeof cwd === "string" && Boolean(cwd)))];
+    const fileBrowser = object(data.fileBrowser);
+    windowsWorkspaceLabels = fileBrowser.platform === "win32";
+    if (rootRevision === workspaceRevision || tokenChanged) workspaces = workspacePaths(data.workspaces);
     if (!bootstrapped) {
       try { workspace = localStorage.getItem(workspaceKey) ?? ""; }
       catch { /* The default is all workspaces. */ }
     }
-    if (workspace && (workspaces.length < 2 || !workspaces.includes(workspace))) storeWorkspace("");
+    if (workspace && !workspaces.includes(workspace)) storeWorkspace("");
+    browser.update(fileBrowser, tokenChanged);
     if (current && !workspaces.includes(current.session.cwd)) clearCurrentView();
     follow.recheckWorkspace();
     renderWorkspace();

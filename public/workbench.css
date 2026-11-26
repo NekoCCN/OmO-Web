@@ -32,7 +32,47 @@
 #brand-prism stop:last-child { stop-color: var(--runtime-violet); }
 
 #cli-history-list .session-link { justify-content: stretch; }
+.workspace-tools { display: grid; grid-template-columns: minmax(0, 1fr); gap: inherit; }
+.workspace-tools:has(#workspace-browser-button:not([hidden])) { grid-template-columns: minmax(0, 1fr) auto; }
+.workspace-tools:has(#workspace-field:not([hidden])) > #new-sidebar { grid-column: 1 / -1; }
+#new-sidebar { justify-content: flex-start; color: var(--accent); }
+#workspace-browser-button { padding-inline: var(--s2); font-size: var(--small); white-space: nowrap; }
 #workspace-select { inline-size: 100%; font-size: var(--small); text-overflow: ellipsis; }
+.workspace-path-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--s2); align-items: end; }
+.workspace-path-form > p { grid-column: 1 / -1; }
+.workspace-path-form input, #workspace-browser-root { inline-size: 100%; min-inline-size: 0; }
+#workspace-browser-root { font-size: var(--small); text-overflow: ellipsis; }
+.workspace-full-path { white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; unicode-bidi: isolate; }
+.workspace-approval h3:focus { outline: var(--focus) solid var(--accent); outline-offset: var(--s1); }
+.workspace-entries {
+  list-style: none;
+  padding: 0 var(--s1);
+  border-block: var(--stroke) solid var(--line);
+  max-block-size: min(var(--code-height), 36dvh);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.workspace-entries > li + li { border-block-start: var(--stroke) solid var(--line); }
+.workspace-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--s2);
+  align-items: center;
+  inline-size: 100%;
+  min-block-size: var(--control);
+  padding: var(--s1) var(--s2);
+  text-align: start;
+}
+button.workspace-entry { color: var(--accent); }
+.workspace-entry:focus-visible { outline-offset: calc(-1 * var(--focus)); }
+.workspace-approval {
+  padding: var(--s4);
+  border: var(--stroke) solid var(--warning-edge);
+  border-radius: var(--r2);
+  background: var(--warning-tint);
+  color: var(--warning);
+}
+.workspace-approval > .workspace-full-path { color: var(--ink); }
 .cli-launchers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s1); }
 .cli-launchers .button { padding-inline: var(--s1); font-size: var(--small); white-space: nowrap; }
 #cli-follow-button[aria-pressed="true"] { background: var(--tint); color: var(--accent); }
@@ -231,7 +271,7 @@
   .brand svg { color: CanvasText; }
   .brand svg rect { fill: none; stroke: currentColor; }
   .brand-cursor { stroke: currentColor; }
-  .button.button--primary, .sidebar-head > .button { border-color: ButtonText; }
+  .button.button--primary, #new-sidebar { border-color: ButtonText; }
   .status-dot { border: var(--stroke) solid CanvasText; }
   .sidebar .session-link[aria-current="true"], .sidebar .filters [aria-pressed="true"],
   #details-button[aria-expanded="true"] { border-color: Highlight; }
@@ -360,8 +400,13 @@
 }
 
 @media (width > 760px) and (height <= 36rem) {
-  .sidebar-head:has(#workspace-field:not([hidden])) { grid-template-columns: max-content minmax(0, 1fr); }
-  .sidebar-head:has(#workspace-field:not([hidden])) > :not(#new-sidebar, #workspace-field) { grid-column: 1 / -1; }
+  .workspace-tools:has(#workspace-field:not([hidden])) { grid-template-columns: max-content minmax(0, 1fr); }
+  .workspace-tools:has(#workspace-field:not([hidden]), #workspace-browser-button:not([hidden])) > #new-sidebar { grid-column: auto; }
+  .workspace-tools:has(#workspace-field:not([hidden])):has(#workspace-browser-button:not([hidden])) { grid-template-columns: max-content minmax(0, 1fr) auto; }
+  .workspace-tools:has(#workspace-field:not([hidden]) ~ #workspace-browser-button:not([hidden])) > #new-sidebar { padding-inline: var(--s2); }
+  .workspace-tools:has(#workspace-field:not([hidden]) ~ #workspace-browser-button:not([hidden])) > #new-sidebar svg { display: none; }
+  #workspace-browser-button { min-inline-size: var(--control); }
+  #workspace-browser-button > span { display: none; }
   #workspace-select { padding-inline: var(--s2); }
 }
 
@@ -412,6 +457,7 @@
 }
 
 @media (max-width: 360px) {
+  .workspace-path-form { grid-template-columns: minmax(0, 1fr); }
   .trace-inner:has(.trace-node:nth-child(4 of .trace-node:not([hidden]))) {
     grid-template-columns: minmax(0, 1fr);
     gap: 0;

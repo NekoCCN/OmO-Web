@@ -1,5 +1,4 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z, ZodError } from "zod";
@@ -12,9 +11,10 @@ import type { NativeActivityView } from "./native-activity.ts";
 import { actions, emptyBody, openInput, sessionKey, WebError } from "./protocol.ts";
 import type { WireObject } from "./protocol.ts";
 import { branchSelection } from "./session-branches.ts";
-import { authorizedRoots, Sessions } from "./sessions.ts";
+import { Sessions } from "./sessions.ts";
 import { TerminalSessions } from "./terminal-sessions.ts";
 import { terminalInput } from "./terminal-view.ts";
+import { WorkspaceAccess, workspacePlatform } from "./workspace-access.ts";
 
 export type AppSettings = {
   readonly dataDir: string;
@@ -44,6 +44,8 @@ const assets: Readonly<Record<string, string>> = {
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_STREAM_CLIENTS = 16;
 const encoder = new TextEncoder();
+const workspacePath = z.strictObject({ path: z.string().min(1).max(4096) });
+const workspaceDecision = z.strictObject({ confirmation: z.uuid(), allow: z.boolean() });
 const cliLiveActions = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("connect") }),
   z.strictObject({ action: z.literal("disconnect") }),
@@ -73,19 +75,19 @@ async function payload(request: Request): Promise<unknown> {
 }
 
 export async function startApp(settings: AppSettings) {
-  const roots = await authorizedRoots(settings.workspaces);
-  const root = roots[0];
+  const workspaces = await WorkspaceAccess.fromConfig(settings.workspaces);
+  const [root] = await workspaces.paths();
   if (!root) throw new WebError(400, "invalid_workspace", "至少需要一个允许的工作目录。");
   const secret = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("hex");
   const tokenBytes = Buffer.from(secret);
   const profile = settings.cliAgentDir?.trim() || undefined;
-  const history = new CliHistory(profile, roots);
+  const history = new CliHistory(profile, workspaces);
   const native = new NativeActivity(profile);
-  let historySessions = new Map<string, CliSessionSummary & { readonly nativeSessionId: string }>();
-  const historyKey = (session: CliSessionSummary) =>
-    createHmac("sha256", tokenBytes).update(JSON.stringify([session.cwd, session.id])).digest("hex");
+  let historySessions = new Map<string, CliSessionSummary & { readonly nativeSessionId: string; readonly workspaceKey?: string }>();
+  const historyKey = (session: CliSessionSummary & { readonly workspaceKey?: string }) =>
+    createHmac("sha256", tokenBytes).update(JSON.stringify([session.cwd, session.id, session.workspaceKey])).digest("hex");
   async function activityFor(durableId: string, cwd: string): Promise<Response> {
-    if (!roots.includes(cwd) || await realpath(cwd).catch(() => undefined) !== cwd) {
+    if (await workspaces.exact(cwd) === undefined) {
       throw new WebError(403, "workspace_refused", "此工作目录已不可用。");
     }
     return activityResponse(await native.read(durableId, cwd));
@@ -102,7 +104,7 @@ export async function startApp(settings: AppSettings) {
     }
   };
   const fanout = (event: WireObject) => { if (clients.size) publish(frame(event)); };
-  const terminals = new TerminalSessions(profile, roots, id => fanout({ type: "cli-live", id }));
+  const terminals = new TerminalSessions(profile, workspaces, id => fanout({ type: "cli-live", id }));
   // Default sharing primary: the engine is a Web-owned private non-listening
   // stdio host whose profile env is pinned to the configured agent dir, so its
   // journals land in the same bucket CliHistory scans. Listening socket hosts
@@ -120,14 +122,16 @@ export async function startApp(settings: AppSettings) {
     // omo 5.1.81: this env restores real pendingQuestions with explicit settle.
     OMO_RPC_CLIENT_CAPABILITIES: "question", SENPI_RPC_CLIENT_CAPABILITIES: "question",
     PI_RPC_CLIENT_CAPABILITIES: "question" } });
-  const sessions = new Sessions(settings.dataDir, roots, engine, fanout,
+  const sessions = new Sessions(settings.dataDir, workspaces, engine, fanout,
     async (nativeSessionId, cwd) => history.branchSource(nativeSessionId, cwd),
     { sameProfile: cliProfileDir !== undefined,
       ...(cliProfileDir === undefined ? {} : { profileDir: cliProfileDir }) });
   await sessions.load();
-  function selectedHistory(id: string | undefined): CliSessionSummary {
+  async function selectedHistory(id: string | undefined) {
     const selected = id === undefined ? undefined : historySessions.get(id);
-    if (!selected) throw new WebError(404, "history_not_found", "找不到这条 CLI 历史，请刷新列表。");
+    if (!selected || selected.workspaceKey === undefined || await workspaces.exact(selected.cwd) !== selected.workspaceKey) {
+      throw new WebError(404, "history_not_found", "找不到这条 CLI 历史，请刷新列表。");
+    }
     return selected;
   }
   async function liveBranchSource(id: string) {
@@ -160,13 +164,13 @@ export async function startApp(settings: AppSettings) {
           return new Response(file, { headers: { ...headers, "Content-Type": file.type } });
         }
         if (pathname === "/api/bootstrap") {
-          try { await engine.probe(); } catch (error) {
+          try { if (await workspaces.exact(root) !== undefined) await engine.probe(); } catch (error) {
             if (!(error instanceof WebError)) throw error;
           }
-          return json({ token: secret, engine: engine.status, workspaces: roots, sessions: sessions.list(),
-            handoff: sessions.handoffSupport() });
+          return json({ token: secret, engine: engine.status, workspaces: await workspaces.paths(), sessions: await sessions.scopedList(),
+            handoff: sessions.handoffSupport(), fileBrowser: { platform: workspacePlatform } });
         }
-        if (pathname === "/api/sessions") return json({ sessions: sessions.list() });
+        if (pathname === "/api/sessions") return json({ sessions: await sessions.scopedList() });
         if (pathname === "/api/cli-follow") return json(await terminals.follow());
         if (pathname === "/api/cli-live") return json(await terminals.list());
         if (pathname === "/api/cli-history") {
@@ -174,24 +178,24 @@ export async function startApp(settings: AppSettings) {
           historySessions = new Map(rows.map(row => [historyKey(row), row]));
           return json({
             available,
-            sessions: [...historySessions].map(([id, { name, cwd, updatedAt, nativeSessionId }]) => ({
+            sessions: [...historySessions].map(([id, { name, cwd, updatedAt, nativeSessionId, workspaceKey }]) => ({
               id, name, cwd, updatedAt,
               // Coalesce logical aliases by native id and cwd: an adopted row
               // enters the existing Web alias (holder admission still applies).
-              adopted: sessions.findAlias(nativeSessionId, cwd) !== undefined,
+              adopted: sessions.findAlias(nativeSessionId, cwd, workspaceKey) !== undefined,
             })),
           });
         }
         const historyRoute = /^\/api\/cli-history\/([a-f0-9]{64})(\/activity)?$/.exec(pathname);
         if (historyRoute) {
           const [, id, activity] = historyRoute;
-          const selected = selectedHistory(id);
-          const { session, messages, internal } = await history.read(selected.id);
+          const selected = await selectedHistory(id);
+          const { session, messages, internal } = await history.read(selected.id, selected.cwd, selected.workspaceKey);
           if (session.cwd !== selected.cwd) throw new WebError(404, "history_not_found", "找不到这条 CLI 历史，请刷新列表。");
           if (activity) return await activityFor(internal.nativeSessionId, session.cwd);
           const { name, cwd, updatedAt } = session;
           return json({ session: { id, name, cwd, updatedAt,
-            adopted: sessions.findAlias(internal.nativeSessionId, session.cwd) !== undefined }, messages });
+            adopted: sessions.findAlias(internal.nativeSessionId, session.cwd, selected.workspaceKey) !== undefined }, messages });
         }
         if (pathname === "/api/events") {
           if (clients.size >= MAX_STREAM_CLIENTS) throw new WebError(429, "too_many_streams", "打开的页面太多，请关闭部分页面后重试。");
@@ -210,6 +214,15 @@ export async function startApp(settings: AppSettings) {
       } else if (pathname === "/api/sessions") {
         const { cwd, name } = openInput.parse(await payload(request));
         return json({ session: await sessions.create(cwd, name) }, 201);
+      } else if (pathname === "/api/workspaces/browse") {
+        const { path } = workspacePath.parse(await payload(request));
+        return json(await workspaces.browse(path));
+      } else if (pathname === "/api/workspaces/prepare") {
+        const { path } = workspacePath.parse(await payload(request));
+        return json(await workspaces.prepare(path));
+      } else if (pathname === "/api/workspaces/confirm") {
+        const { confirmation, allow } = workspaceDecision.parse(await payload(request));
+        return json(await workspaces.confirm(confirmation, allow));
       }
 
       const live = /^\/api\/cli-live\/([a-f0-9]{64})(?:\/(actions|branch-options|branches))?$/.exec(pathname);
@@ -241,8 +254,8 @@ export async function startApp(settings: AppSettings) {
       if (historyResume) {
         if (request.method === "POST") {
           emptyBody.parse(await payload(request));
-          const selected = selectedHistory(historyResume[1]);
-          const source = await history.branchSource(selected.id, selected.cwd);
+          const selected = await selectedHistory(historyResume[1]);
+          const source = await history.branchSource(selected.id, selected.cwd, selected.workspaceKey);
           return json({ session: await sessions.resumeCli(source, selected.name) });
         }
       }
@@ -250,13 +263,13 @@ export async function startApp(settings: AppSettings) {
       if (historyBranch) {
         const [, id, resource] = historyBranch;
         if (request.method === "GET" && resource === "branch-options") {
-          const selected = selectedHistory(id);
-          return json(await sessions.branchOptionsFor(await history.branchSource(selected.id, selected.cwd)));
+          const selected = await selectedHistory(id);
+          return json(await sessions.branchOptionsFor(await history.branchSource(selected.id, selected.cwd, selected.workspaceKey)));
         }
         if (request.method === "POST" && resource === "branches") {
           const selection = branchSelection.parse(await payload(request));
-          const selected = selectedHistory(id);
-          const result = await sessions.branchFrom(await history.branchSource(selected.id, selected.cwd), selection);
+          const selected = await selectedHistory(id);
+          const result = await sessions.branchFrom(await history.branchSource(selected.id, selected.cwd, selected.workspaceKey), selection);
           return json(result, result.cancelled ? 200 : 201);
         }
       }
@@ -289,7 +302,7 @@ export async function startApp(settings: AppSettings) {
           if (route[2] === "native-runtime") return json(await sessions.nativeRuntime(id));
           if (route[2] === "last-assistant") return json(await sessions.lastAssistant(id));
           if (route[2] === "activity") {
-            const row = sessions.list().find(session => session.id === id);
+            const row = (await sessions.scopedList()).find(session => session.id === id);
             if (!row) throw new WebError(404, "session_not_found", "找不到这个会话。");
             if (!row.active) throw new WebError(409, "session_not_open", "会话未接入引擎，请先恢复会话。");
             if (!profile) return json({ status: "unavailable", reason: "no-agent-dir" });

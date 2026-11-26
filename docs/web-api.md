@@ -4,8 +4,8 @@
 
 ## 读取
 
-- `GET /api/bootstrap` → `{ token, engine: {online,version?,error?}, workspaces: string[], sessions: Session[], handoff: {supported,reason?} }`。`handoff.supported` 表示当前配置有私有认证宿主、同一 CLI profile 和必需的原生能力；不是具体会话的释放承诺。
-- `GET /api/sessions` → `{sessions: Session[]}`。`Session = { id, name, cwd, updatedAt, archived, settled, active, running }`；`id` 是 Web 端 UUID，与临时路由句柄无关。`updatedAt` 为毫秒。
+- `GET /api/bootstrap` → `{ token, engine: {online,version?,error?}, workspaces: string[], sessions: Session[], handoff: {supported,reason?}, fileBrowser: {platform:"win32"|"posix"} }`。旧服务没有 `fileBrowser` 时不显示浏览入口。`handoff.supported` 表示当前配置有私有认证宿主、同一 CLI profile 和必需的原生能力；不是具体会话的释放承诺。
+- `GET /api/sessions` → `{sessions: Session[]}`。与 bootstrap 一样，只列当前目录身份仍获授权的记录。`Session = { id, name, cwd, updatedAt, archived, settled, active, running }`；`id` 是 Web 端 UUID，与临时路由句柄无关。`updatedAt` 为毫秒。
 - `GET /api/sessions/:id` → `{ session: Session, state, messages, handoff: {eligible,reason?} }`，原生状态经字段筛选后返回：`model`, `thinkingLevel`, `fastMode`, `isStreaming`, `isCompacting`, `currentTurnId`, `pendingDialogs`, `pendingQuestions`, `pendingMessageCount`, `permissionPreset`, `effectivePermissionPreset`, `autoCompactionEnabled`, `contextUsage`, `usageTotals`。审批选择器显示 `effectivePermissionPreset || permissionPreset`；每次恢复/重开会话都回到 `ask`，不会自动沿用上次的 `auto`/`full-access`。``model` 至多包含 `{id,provider,name,contextWindow,maxTokens,reasoning,input,supportedThinkingLevels}`。`messages` 保持原生 `role/content/timestamp/toolName/toolCallId/isError/stopReason/errorMessage` 形状。未加载的历史会话先显式执行 `resume`，然后读取。`handoff.eligible` 是当前状态提示；实际释放时原生引擎会再次判断。
 - `GET /api/sessions/:id/last-assistant` → `{text: string | null}`，只读取当前已加载会话的原生最后一条可复制助手文本。
 - `GET /api/sessions/:id/options` → `{models, levels, commands}`，模型按上面的投影，命令含 `{name,description,source,invocation}`，其中 `source` 是 `extension`、`prompt` 或 `skill`，`invocation` 是规范的 `/命令` 或 `$技能`。不返回原生 `sourceInfo`。
@@ -26,6 +26,16 @@
 CLI 实时的事件仅为 `{type:"cli-live", id}`；客户端只刷新当前已连接且 ID 匹配的实时快照。连接成功及 SSE 重连读取基线，可重试快照读取，不自动重做任何动作。
 
 `Activity` 是 `{status:"ok", updatedAt, connected?, language?, runs, tasks}` 或 `{status:"unavailable", reason}`。`updatedAt` 是快照时间（毫秒），`connected` 若有值，是快照写入时的状态；两者不代表当前活动。运行包括 DAG 节点、状态、尝试次数和依赖，任务包括子代理的摘要元数据；不返回 durable session ID、原始日志或快照文件路径。运行详情仅在原生明确返回 `unsupported` 时才回退读旧快照；普通 `500`、归属变化、超时与 HTTP 拒绝均不触发对 `/activity` 的读取，不把不可用当作空。
+
+## 工作区浏览与授权
+
+- `POST /api/workspaces/browse` `{path}` → `{path, parent: string|null, entries: [{name, path, kind:"directory"|"file"}], truncated: boolean}`。只列已授权根及其规范子目录；没有可浏览的上级时 `parent:null`。每次从目录迭代器至多处理 256 项（另取一项判断是否截断），跳过符号链接、目录联接等非普通条目。不打开所列文件，不返回文件内容，不提供下载或执行。
+- `POST /api/workspaces/prepare` `{path}` → `{status:"authorized", path, workspaces: string[]}`（已授权的精确根）或 `{status:"confirmation_required", path, confirmation: string, expiresAt: number}`（`expiresAt` 为毫秒时间戳）。只校验目录，不枚举内容、不授权。路径使用宿主绝对路径；Windows 仅接受本机盘符绝对路径，不接受 UNC、设备、盘符相对路径或备用数据流。路径及浏览条目不接受控制字符、Unicode 格式控制（含双向格式字符）和行／段分隔符。不展开 `~` 或环境变量。
+- `POST /api/workspaces/confirm` `{confirmation, allow: boolean}` → 同意返回 `{path, workspaces: string[]}`；拒绝返回 `{status:"cancelled"}`。确认编号两分钟内有效，两种决定都只可提交一次；过期、重放或目录身份已变化返回 `409`。不接受路径。
+
+Bun 1.4.5 的 `opendir().read()` 可在首次读取时将整个目录的条目载入内存。256 项限制的是应用处理和响应大小，不是运行时枚举或内存的硬上限。
+
+会话新建、恢复、CLI 发现及跟随要求精确根；浏览某个子目录不会授权在其中运行。没有记录目录身份的旧 Web 会话，只能在仍与本次启动配置相符的原目录下列出和恢复，不能借临时授权重新绑定。新增授权只在当前 Web 服务运行期有效，不改配置、既有会话的工作目录或原生工具权限，也不是原生运行时沙箱。服务重启只加载配置的根。
 
 ## 写入
 

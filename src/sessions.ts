@@ -11,10 +11,12 @@ import { WebError, array, browserEvent, model, pick, record, sessionKey, state, 
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
 import type { Engine } from "./engine.ts";
 import { readOwnedJournalHeader, sessionDirName } from "./cli-history.ts";
+import type { ScopedBranchSource } from "./cli-history.ts";
 import { projectRuntimeBranch } from "./runtime-branch.ts";
 import { projectSessionMemory } from "./runtime-metrics.ts";
 import { branchBusy, loadBranchSource, loadSavedWebBranch, nativeBranchError, SessionBranches, staleBranch } from "./session-branches.ts";
-import type { BranchOptions, BranchSelection, BranchSource, LoadedBranchSource, PreparedBranch } from "./session-branches.ts";
+import type { BranchOptions, BranchSelection, LoadedBranchSource, PreparedBranch } from "./session-branches.ts";
+import { WorkspaceAccess } from "./workspace-access.ts";
 
 const savedSession = z.strictObject({
   id: sessionKey,
@@ -25,26 +27,18 @@ const savedSession = z.strictObject({
   settled: z.boolean(),
   nativeId: z.string().min(1).max(200).optional(),
   cliBookmark: z.boolean().optional(),
+  workspaceKey: z.string().optional(),
   /** Web session whose journal lives in the shared native profile bucket (native-placed).
    * Legacy rows without this flag keep their private dataDir journal. */
   shared: z.boolean().optional(),
 });
 type SavedSession = Readonly<z.infer<typeof savedSession>>;
-export type SessionView = Omit<SavedSession, "nativeId" | "cliBookmark"> & { readonly active: boolean; readonly running: boolean };
-export type CliResumeSource = { readonly cwd: string; readonly nativeSessionId: string; readonly sourcePath: string };
+export type SessionView = Omit<SavedSession, "nativeId" | "cliBookmark" | "workspaceKey"> & { readonly active: boolean; readonly running: boolean };
+export type CliResumeSource = { readonly cwd: string; readonly nativeSessionId: string; readonly sourcePath: string; readonly workspaceKey?: string };
 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 export type BranchResult = { readonly cancelled: true; readonly session?: never; readonly editorText?: never } |
   { readonly session: SessionView; readonly editorText?: string; readonly cancelled?: false };
-
-export async function authorizedRoots(roots: readonly string[]): Promise<readonly string[]> {
-  const canonical = await Promise.all(roots.map(async root => {
-    const target = await realpath(root);
-    if (!(await lstat(target)).isDirectory()) throw new WebError(400, "invalid_workspace", `不是目录：${target}`);
-    return target;
-  }));
-  return [...new Set(canonical)];
-}
 
 export class Sessions {
   readonly #rows = new Map<SessionKey, SavedSession>();
@@ -57,7 +51,7 @@ export class Sessions {
   readonly #directory: string;
   readonly #branches: SessionBranches;
 
-  constructor(dataDir: string, readonly workspaces: readonly string[], readonly engine: Engine,
+  constructor(dataDir: string, readonly workspaces: readonly string[] | WorkspaceAccess, readonly engine: Engine,
     readonly fanout: (value: WireObject) => void,
     readonly resolveCli?: (nativeSessionId: string, cwd: string) => Promise<{ sourcePath: string }>,
     readonly hostGuard?: { sameProfile: boolean; profileDir?: string }) {
@@ -79,7 +73,20 @@ export class Sessions {
   }
 
   list(): SessionView[] {
-    return [...this.#rows.values()].sort((a, b) => b.updatedAt - a.updatedAt).map(row => this.#view(row));
+    return this.#views([...this.#rows.values()]);
+  }
+
+  async scopedList(): Promise<SessionView[]> {
+    const policy = this.workspaces;
+    if (!(policy instanceof WorkspaceAccess)) return this.list();
+    const rows = [...this.#rows.values()];
+    const cwds = new Set(rows.filter(row => this.#workspaceKeyForRow(row) !== undefined).map(row => row.cwd));
+    const keys = new Map(await Promise.all([...cwds].map(async cwd => [cwd, await policy.exact(cwd)] as const)));
+    return this.#views(rows.filter(row => keys.get(row.cwd) !== undefined && keys.get(row.cwd) === this.#workspaceKeyForRow(row)));
+  }
+
+  #views(rows: SavedSession[]): SessionView[] {
+    return rows.sort((a, b) => b.updatedAt - a.updatedAt).map(row => this.#view(row));
   }
 
   #view(row: SavedSession): SessionView {
@@ -104,6 +111,29 @@ export class Sessions {
     const live = this.#live.get(id);
     if (!live) throw new WebError(409, "session_not_open", "会话未接入引擎，请先恢复会话。");
     return live;
+  }
+
+  #workspaceKeyForRow(row: SavedSession): string | undefined {
+    return row.workspaceKey ?? (this.workspaces instanceof WorkspaceAccess ? this.workspaces.launchKey(row.cwd) : undefined);
+  }
+
+  async #requireRowWorkspace(row: SavedSession): Promise<string | undefined> {
+    const expected = this.#workspaceKeyForRow(row);
+    if (this.workspaces instanceof WorkspaceAccess && expected === undefined) {
+      throw new WebError(403, "workspace_refused", "此旧会话不属于启动时获准的工作目录。");
+    }
+    return this.#requireWorkspace(row.cwd, expected);
+  }
+
+  async #requireWorkspace(cwd: string, expectedKey?: string): Promise<string | undefined> {
+    if (this.workspaces instanceof WorkspaceAccess) {
+      const key = await this.workspaces.exact(cwd);
+      if (key !== undefined && (expectedKey === undefined || key === expectedKey)) return key;
+    } else if (this.workspaces.includes(cwd) && await realpath(cwd).catch(() => undefined) === cwd &&
+      (await lstat(cwd).catch(() => undefined))?.isDirectory()) {
+      return undefined;
+    }
+    throw new WebError(403, "workspace_refused", "此工作目录未获授权或已不可用。");
   }
 
   async #persist(id: SessionKey, update: (previous: SavedSession | undefined) => SavedSession, exclusive = false) {
@@ -132,13 +162,14 @@ export class Sessions {
    * under the shared profile bucket and binds the durable id. Otherwise the
    * legacy private dataDir journal is used, never a silent half-shared mix. */
   async create(cwd: string, name = "新会话"): Promise<SessionView> {
-    if (!this.workspaces.includes(cwd)) throw new WebError(403, "workspace_refused", "只能选择启动配置中允许的工作目录。");
+    const key = await this.#requireWorkspace(cwd);
     const id = sessionKey.parse(crypto.randomUUID());
+    const base = { id, cwd, name, updatedAt: Date.now(), archived: false, settled: false,
+      ...(key === undefined ? {} : { workspaceKey: key }) };
     const sharedDir = await this.#sharedProfileDir().catch(() => undefined);
     if (sharedDir !== undefined) {
       const durable = crypto.randomUUID();
-      const row: SavedSession = { id, cwd, name, updatedAt: Date.now(), archived: false,
-        settled: false, nativeId: durable, shared: true };
+      const row: SavedSession = { ...base, nativeId: durable, shared: true };
       await this.#open(row, { durableId: durable, nativePlaced: { profileDir: sharedDir }, publishName: true });
       try {
         await this.#persist(id, () => row);
@@ -150,7 +181,7 @@ export class Sessions {
       }
       return this.#view(row);
     }
-    const row: SavedSession = { id, cwd, name, updatedAt: Date.now(), archived: false, settled: false };
+    const row: SavedSession = base;
     await this.#open(row, { publishName: true });
     try {
       await this.#persist(id, () => row);
@@ -178,13 +209,8 @@ export class Sessions {
 
   async #open(row: SavedSession, opts: { branchNativeId?: string; sourcePath?: string; durableId?: string;
     publishName?: boolean; nativePlaced?: { profileDir: string } } = {}): Promise<WireObject> {
-    let actual: string | undefined;
-    try { actual = await realpath(row.cwd); } catch (error) {
-      if (!(error instanceof Error) || !("code" in error) || error.code !== "ENOENT") throw error;
-    }
-    if (!this.workspaces.includes(row.cwd) || actual !== row.cwd) {
-      throw new WebError(403, "workspace_refused", "工作目录已不在启动配置中，或目标路径已改变。");
-    }
+    if (this.workspaces instanceof WorkspaceAccess && !this.engine.status.online) await this.#requireWorkspace(this.engine.cwd);
+    await this.#requireRowWorkspace(row);
     // Native-placed (shared) opens omit sessionPath: the runtime generates the
     // journal under the shared profile bucket. All other opens pin the path.
     const sessionPath = opts.nativePlaced ? undefined : (opts.sourcePath ?? join(this.#directory, `${row.id}.jsonl`));
@@ -279,6 +305,7 @@ export class Sessions {
   }
 
   async #resume(row: SavedSession) {
+    if (this.workspaces instanceof WorkspaceAccess) await this.#requireRowWorkspace(row);
     if (this.#live.has(row.id)) return;
     if (this.#releasing.has(row.id)) throw new WebError(409, "handoff_in_progress", "交接正在进行，请稍后再试。");
     const opening = this.#opening.get(row.id);
@@ -331,6 +358,7 @@ export class Sessions {
    * sequential handoff or bookmarked reopen, including after a restart. Probes
    * the engine first so an unstarted or replaced host fails closed. */
   async #requirePrivateHost(code: "resume_unsupported" | "handoff_unsupported") {
+    if (this.workspaces instanceof WorkspaceAccess && !this.engine.status.online) await this.#requireWorkspace(this.engine.cwd);
     try {
       await this.engine.probe();
     } catch (error) {
@@ -403,10 +431,7 @@ export class Sessions {
    * native durable id and log file. The transcript is never copied; the source file
    * is resolved through the current authorized profile on every open. */
   async resumeCli(source: CliResumeSource, nameHint = ""): Promise<SessionView> {
-    if (!this.workspaces.includes(source.cwd) || await realpath(source.cwd).catch(() => undefined) !== source.cwd ||
-      !(await lstat(source.cwd).catch(() => undefined))?.isDirectory()) {
-      throw new WebError(403, "workspace_refused", "此工作目录已不可用。");
-    }
+    const workspaceKey = await this.#requireWorkspace(source.cwd, source.workspaceKey);
     if (!source.nativeSessionId || !source.sourcePath) {
       throw new WebError(400, "history_invalid", "这条 CLI 历史记录已损坏，无法读取。");
     }
@@ -414,7 +439,7 @@ export class Sessions {
     const key = `${source.cwd}\n${source.nativeSessionId}`;
     const pending = this.#cliOpening.get(key);
     if (pending) return pending;
-    const task = this.#resumeCliSource(source, nameHint);
+    const task = this.#resumeCliSource({ ...source, ...(workspaceKey === undefined ? {} : { workspaceKey }) }, nameHint);
     this.#cliOpening.set(key, task);
     try { return await task; } finally { if (this.#cliOpening.get(key) === task) this.#cliOpening.delete(key); }
   }
@@ -429,7 +454,8 @@ export class Sessions {
     const trimmed = nameHint.trim().slice(0, 120);
     const row: SavedSession = { id, cwd: source.cwd, name: trimmed || source.cwd,
       updatedAt: Date.now(), archived: false, settled: false,
-      nativeId: source.nativeSessionId, cliBookmark: true };
+      nativeId: source.nativeSessionId, cliBookmark: true,
+      ...(source.workspaceKey === undefined ? {} : { workspaceKey: source.workspaceKey }) };
     const initial = await this.#open(row, { sourcePath: source.sourcePath, durableId: source.nativeSessionId });
     const adopted = this.#adoptedRow(row, initial);
     try {
@@ -496,15 +522,18 @@ export class Sessions {
   /** Web alias for a known durable native session in this workspace, if any.
    * Coalesces logical aliases by native id and cwd so the sidebar and history
    * enter the same session instead of minting a second bookmark. */
-  findAlias(nativeSessionId: string, cwd: string): SessionKey | undefined {
+  findAlias(nativeSessionId: string, cwd: string, workspaceKey?: string): SessionKey | undefined {
     for (const row of this.#rows.values()) {
-      if (row.cwd === cwd && row.nativeId === nativeSessionId) return row.id;
+      if (row.cwd === cwd && row.nativeId === nativeSessionId &&
+        (!(this.workspaces instanceof WorkspaceAccess) ||
+          (workspaceKey !== undefined && this.#workspaceKeyForRow(row) === workspaceKey))) return row.id;
     }
     return undefined;
   }
 
   /** Durable native session id from `get_state`, for server-side integration only (never sent to the browser). */
   async nativeSessionId(id: SessionKey): Promise<string | undefined> {
+    if (this.workspaces instanceof WorkspaceAccess) await this.#requireRowWorkspace(this.#row(id));
     const raw = await this.engine.requestExisting("get_state", { sessionId: this.#route(id) });
     const durable = record(raw).sessionId;
     return typeof durable === "string" && durable.length > 0 ? durable : undefined;
@@ -516,6 +545,7 @@ export class Sessions {
    * transport outcomes drop the route without replay and reconcile on next resume. */
   async handoff(id: SessionKey): Promise<{ session: SessionView; command: string }> {
     const row = this.#row(id);
+    if (this.workspaces instanceof WorkspaceAccess) await this.#requireRowWorkspace(row);
     const live = this.#live.get(id);
     if (!live) throw new WebError(409, "session_not_open", "会话未接入引擎，请先恢复会话。");
     if (this.#opening.has(id) || this.#releasing.has(id)) {
@@ -549,6 +579,7 @@ export class Sessions {
       if (row.nativeId === undefined) {
         await this.#persist(id, previous => ({ ...(previous ?? row), nativeId: durable }));
       }
+      if (this.workspaces instanceof WorkspaceAccess) await this.#requireRowWorkspace(row);
       try {
         await this.#releaseNative(live.route, row.cwd, durable, sessionFile);
       } catch (error) {
@@ -666,41 +697,40 @@ export class Sessions {
     const loaded = await this.#webBranchSource(id);
     if (!loaded) throw staleBranch();
     const branch = await this.#branches.prepare(this.#directory, loaded, selection);
-    return this.#publishBranch(loaded.source.cwd, branch, this.#row(id).name, selection, loaded.source.sourcePath);
+    const row = this.#row(id);
+    return this.#publishBranch(loaded.source.cwd, branch, row.name, selection, loaded.source.sourcePath, this.#workspaceKeyForRow(row));
   }
 
   /** CLI history: use CliHistory.branchSource(id, cwd) after resolving the opaque key.
    * Attached CLI: also supply leafId from an authorized, idle native get_tree (omit only for offline history).
    * Do not serialize `source` or let the browser provide any part of it. */
-  async branchOptionsFor(source: BranchSource): Promise<BranchOptions> {
-    await this.#authorizeBranchSource(source.cwd);
+  async branchOptionsFor(source: ScopedBranchSource): Promise<BranchOptions> {
+    await this.#authorizeBranchSource(source.cwd, source.workspaceKey);
     return this.#branches.options(await loadBranchSource(source));
   }
 
   /** See branchOptionsFor for source resolution. Returns the same result as branchWeb. */
-  async branchFrom(source: BranchSource, selection: BranchSelection): Promise<BranchResult> {
-    await this.#authorizeBranchSource(source.cwd);
+  async branchFrom(source: ScopedBranchSource, selection: BranchSelection): Promise<BranchResult> {
+    const workspaceKey = await this.#authorizeBranchSource(source.cwd, source.workspaceKey);
     const branch = await this.#branches.prepare(this.#directory, await loadBranchSource(source), selection);
     return this.#publishBranch(source.cwd, branch, branch.cancelled ? undefined : branch.name,
-      selection, source.sourcePath);
+      selection, source.sourcePath, workspaceKey);
   }
 
-  async #authorizeBranchSource(cwd: string) {
-    if (!this.workspaces.includes(cwd) || await realpath(cwd).catch(() => undefined) !== cwd ||
-      !(await lstat(cwd).catch(() => undefined))?.isDirectory()) {
-      throw new WebError(403, "workspace_refused", "此工作目录已不可用。");
-    }
+  async #authorizeBranchSource(cwd: string, expectedKey?: string) {
+    const key = await this.#requireWorkspace(cwd, expectedKey);
     const store = await lstat(this.#directory);
     if (!store.isDirectory() || (store.mode & 0o077) !== 0 || (process.getuid && store.uid !== process.getuid()) ||
       await realpath(this.#directory) !== this.#directory) {
       throw new WebError(500, "invalid_store", "分支需要独立的 Web 会话目录。");
     }
+    return key;
   }
 
   async #webBranchSource(id: SessionKey): Promise<LoadedBranchSource | undefined> {
     const row = this.#row(id);
     const { cwd } = row;
-    await this.#authorizeBranchSource(cwd);
+    await this.#authorizeBranchSource(cwd, await this.#requireRowWorkspace(row));
     let sourcePath = join(this.#directory, `${id}.jsonl`);
     let bookmarked: string | undefined;
     if (row.cliBookmark) {
@@ -738,9 +768,9 @@ export class Sessions {
   }
 
   async #publishBranch(cwd: string, branch: PreparedBranch, name: string | undefined,
-    selection: BranchSelection, placeNear?: string): Promise<BranchResult> {
+    selection: BranchSelection, placeNear?: string, expectedKey?: string): Promise<BranchResult> {
     if (branch.cancelled) return { cancelled: true };
-    await this.#authorizeBranchSource(cwd);
+    const workspaceKey = await this.#authorizeBranchSource(cwd, expectedKey);
     const id = sessionKey.parse(crypto.randomUUID());
     const suffix = selection.kind === "fork" ? "分支" : "副本";
     const base = name?.trim().slice(0, 116);
@@ -753,10 +783,11 @@ export class Sessions {
       : join(profileDir, "sessions", sessionDirName(cwd));
     const sharedPlacement = bucket !== undefined && placeNear !== undefined && dirname(placeNear) === bucket;
     let row: SavedSession = { id, cwd, name: base ? `${base} · ${suffix}` : suffix,
-      updatedAt: Date.now(), archived: false, settled: false };
+      updatedAt: Date.now(), archived: false, settled: false, ...(workspaceKey === undefined ? {} : { workspaceKey }) };
     const path = sharedPlacement
       ? join(bucket as string, `${Date.now()}_${branch.nativeId}.jsonl`)
       : join(this.#directory, `${id}.jsonl`);
+    await this.#requireWorkspace(cwd, workspaceKey);
     await writeFile(path, branch.transcript, { flag: "wx", mode: 0o600 });
     if (sharedPlacement) row = { ...row, nativeId: branch.nativeId, shared: true };
     // An unconfirmed open (e.g. RPC timeout) might still be writing. Never unlink
@@ -921,6 +952,9 @@ export class Sessions {
     if (action.action === "resume") {
       await this.#resume(row);
       return { result: {}, session: this.#view(this.#row(id)) };
+    }
+    if (this.workspaces instanceof WorkspaceAccess && action.action !== "abort") {
+      await this.#requireRowWorkspace(row);
     }
     const sessionId = this.#route(id);
     const request = (name: string, fields: WireObject = {}, timeout?: number) =>

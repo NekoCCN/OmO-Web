@@ -1,0 +1,42 @@
+name: Workspace file browser
+
+on:
+  push:
+    paths:
+      - ".github/workflows/workspace-browser.yml"
+      - "public/**"
+      - "src/**"
+      - "test/workspace-access.test.ts"
+      - "test/engine-fixture.ts"
+      - "package.json"
+      - "bun.lock"
+  pull_request:
+    paths:
+      - ".github/workflows/workspace-browser.yml"
+      - "public/**"
+      - "src/**"
+      - "test/workspace-access.test.ts"
+      - "test/engine-fixture.ts"
+      - "package.json"
+      - "bun.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  filesystem:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.5"
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - run: bun test ./test/workspace-access.test.ts --timeout 15000

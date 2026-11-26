@@ -9,6 +9,7 @@ import {
 } from "./terminal-view.ts";
 import type { TerminalBranchIdentity, TerminalInput, TerminalInputResult, TerminalMessage, TerminalSession, TerminalSnapshot } from "./terminal-view.ts";
 import { TERMINAL_ENTRY_BYTES, TerminalPeer, TerminalRefusal, terminalOffline, terminalProtocol } from "./terminal-wire.ts";
+import { WorkspaceAccess } from "./workspace-access.ts";
 
 export type { TerminalBranchIdentity, TerminalInput, TerminalInputResult, TerminalMessage, TerminalSession, TerminalSnapshot, TerminalState } from "./terminal-view.ts";
 
@@ -16,6 +17,7 @@ type Candidate = {
   readonly id: string;
   readonly sessionId: string;
   readonly cwd: string;
+  readonly workspaceKey: string;
   readonly registry: TerminalRegistry;
   readonly endpoint: TerminalEndpoint;
 };
@@ -64,7 +66,7 @@ const leafUnavailable = () => new WebError(409, "terminal_leaf_unavailable", "æ—
 export class TerminalSessions {
   readonly #agentDir: string | undefined;
   readonly #onChange: (opaqueId: string) => void;
-  readonly #authorized: ReadonlySet<string>;
+  readonly #authorized: ReadonlySet<string> | WorkspaceAccess;
   readonly #key = randomBytes(32);
   readonly #attachments = new Map<string, Attachment>();
   readonly #peers = new Set<TerminalPeer>();
@@ -74,11 +76,15 @@ export class TerminalSessions {
   #following?: Promise<Follow>;
   #stopped = false;
 
-  constructor(agentDir: string | undefined, authorizedCwds: readonly string[], onChange: (opaqueId: string) => void) {
+  constructor(agentDir: string | undefined, authorizedCwds: readonly string[] | WorkspaceAccess, onChange: (opaqueId: string) => void) {
     this.#agentDir = agentDir;
     this.#onChange = onChange;
-    this.#authorized = new Set(authorizedCwds);
+    this.#authorized = authorizedCwds instanceof WorkspaceAccess ? authorizedCwds : new Set(authorizedCwds);
   }
+
+  #workspace = async (cwd: string): Promise<string | undefined> =>
+    this.#authorized instanceof WorkspaceAccess ? this.#authorized.exact(cwd) :
+      this.#authorized.has(cwd) && await canonicalDirectory(cwd) ? cwd : undefined;
 
   list(): Promise<Listing> {
     this.#listing ??= this.#discover().finally(() => { this.#listing = undefined; });
@@ -265,8 +271,8 @@ export class TerminalSessions {
       peer = await this.#connect(registry, endpoint, active, undefined, expires);
       const initial = await selection();
       if (initial !== "ok") return { status: initial };
-      const { row: { sessionId, cwd, name: label } } = await readTerminalIdentity(peer, endpoint.instance, this.#authorized);
-      const identity = { registry, endpoint, sessionId, cwd };
+      const { row: { sessionId, cwd, name: label }, workspaceKey } = await readTerminalIdentity(peer, endpoint.instance, this.#workspace);
+      const identity = { registry, endpoint, sessionId, cwd, workspaceKey };
       await this.#verifyRegistration(identity);
       const before = await selection();
       if (before !== "ok") return { status: before };
@@ -277,7 +283,7 @@ export class TerminalSessions {
       if (after !== "ok") return { status: after };
       if (peer.closed) return { status: "unavailable" };
       const id = createHmac("sha256", this.#key)
-        .update(JSON.stringify(["follow", endpoint.instance, endpoint.stamp, sessionId, cwd])).digest("hex");
+        .update(JSON.stringify(["follow", endpoint.instance, endpoint.stamp, sessionId, cwd, workspaceKey])).digest("hex");
       return { status: "ok", session: { id, cwd, name: displayText(label ?? "", 200).trim() || "OmO CLI",
         running: projectState(state).running }, messages };
     } catch (error) {
@@ -289,7 +295,8 @@ export class TerminalSessions {
   }
 
   async #discover(): Promise<Listing> {
-    const registry = this.#stopped || this.#authorized.size === 0 ? undefined : await discoverTerminalRegistry(this.#agentDir);
+    const rootCount = this.#authorized instanceof WorkspaceAccess ? (await this.#authorized.paths()).length : this.#authorized.size;
+    const registry = this.#stopped || rootCount === 0 ? undefined : await discoverTerminalRegistry(this.#agentDir);
     if (this.#stopped || !registry) {
       this.#candidates.clear();
       return { available: false, sessions: [] };
@@ -306,11 +313,12 @@ export class TerminalSessions {
         let peer;
         try {
           peer = await this.#connect(registry, endpoint, () => !expires.aborted, undefined, expires);
-          const reading = await readTerminalIdentity(peer, endpoint.instance, this.#authorized);
+          const reading = await readTerminalIdentity(peer, endpoint.instance, this.#workspace);
           const { sessionId, cwd } = reading.row;
+          const { workspaceKey } = reading;
           const id = createHmac("sha256", this.#key)
-            .update(JSON.stringify([endpoint.instance, endpoint.stamp, sessionId, cwd])).digest("hex");
-          const candidate = { id, registry, endpoint, sessionId, cwd };
+            .update(JSON.stringify([endpoint.instance, endpoint.stamp, sessionId, cwd, workspaceKey])).digest("hex");
+          const candidate = { id, registry, endpoint, sessionId, cwd, workspaceKey };
           await this.#verifyRegistration(candidate);
           if (!peer.closed && !expires.aborted) found.push({ candidate, reading });
         } catch (error) {
@@ -381,6 +389,7 @@ export class TerminalSessions {
   async #attach(slot: Attachment): Promise<TerminalSnapshot> {
     const { candidate } = slot;
     try {
+      await this.#verifyRegistration(candidate);
       const peer = await this.#connect(candidate.registry, candidate.endpoint, () => !slot.closing, slot);
       const reading = await this.#refresh(candidate, peer);
       this.#ensureSelected(slot);
@@ -433,15 +442,16 @@ export class TerminalSessions {
 
   async #refresh(candidate: Candidate, peer: TerminalPeer): Promise<Reading> {
     await this.#verifyRegistration(candidate);
-    const reading = await readTerminalIdentity(peer, candidate.endpoint.instance, this.#authorized);
+    const reading = await readTerminalIdentity(peer, candidate.endpoint.instance, this.#workspace);
     if (reading.row.sessionId !== candidate.sessionId || reading.row.cwd !== candidate.cwd) throw terminalMissing();
     await this.#verifyRegistration(candidate);
     return reading;
   }
 
-  async #verifyRegistration(candidate: Pick<Candidate, "registry" | "endpoint" | "cwd">): Promise<void> {
+  async #verifyRegistration(candidate: Pick<Candidate, "registry" | "endpoint" | "cwd" | "workspaceKey">): Promise<void> {
     const current = await registeredTerminal(candidate.registry, candidate.endpoint.name);
-    if (current?.endpoint.stamp !== candidate.endpoint.stamp || !await canonicalDirectory(candidate.cwd)) throw terminalMissing();
+    if (current?.endpoint.stamp !== candidate.endpoint.stamp ||
+        await this.#workspace(candidate.cwd) !== candidate.workspaceKey) throw terminalMissing();
   }
 
   #isAttached(id: string): boolean {

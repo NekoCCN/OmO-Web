@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { WebError, record, transcriptMessage } from "./protocol.ts";
 import type { WireObject } from "./protocol.ts";
 import type { BranchSource } from "./session-branches.ts";
+import { WorkspaceAccess } from "./workspace-access.ts";
 
 /**
  * Scan and read budgets. list() stats every candidate, ranks newest first,
@@ -42,7 +43,9 @@ export type CliSessionDetail = {
   readonly internal: { readonly nativeSessionId: string };
 };
 
-type FileRef = { readonly root: string; readonly dir: string; readonly path: string };
+type FileRef = { readonly root: string; readonly dir: string; readonly path: string; readonly workspaceKey?: string };
+export type ScopedBranchSource = BranchSource & { readonly workspaceKey?: string };
+type ScopedSummary = CliSessionSummary & { readonly nativeSessionId: string; readonly workspaceKey?: string };
 
 type LoadedContent = {
   readonly sessionId: string;
@@ -97,12 +100,12 @@ export async function readOwnedJournalHeader(path: string): Promise<OwnedJournal
 
 export class CliHistory {
   readonly #agentDir: string | undefined;
-  readonly #workspaces: readonly string[];
+  readonly #workspaces: readonly string[] | WorkspaceAccess;
   #roots: Promise<readonly string[]> | undefined;
 
-  constructor(agentDir: string | undefined, workspaces: readonly string[]) {
+  constructor(agentDir: string | undefined, workspaces: readonly string[] | WorkspaceAccess) {
     this.#agentDir = agentDir === undefined ? undefined : resolve(agentDir);
-    this.#workspaces = [...workspaces];
+    this.#workspaces = workspaces instanceof WorkspaceAccess ? workspaces : [...workspaces];
   }
 
   async list(): Promise<CliHistoryList> {
@@ -115,7 +118,7 @@ export class CliHistory {
   /** Server-only list carrying the durable native id per row for alias coalescing.
    * Never serialize nativeSessionId to the browser; the public list stays opaque. */
   async listWithIds(): Promise<{ readonly available: boolean;
-    readonly sessions: readonly (CliSessionSummary & { readonly nativeSessionId: string })[] }> {
+    readonly sessions: readonly ScopedSummary[] }> {
     const scanned = await this.#scan();
     if (!scanned.available) return { available: false, sessions: [] };
     const candidates: { file: FileRef; mtimeMs: number; size: number }[] = [];
@@ -129,7 +132,7 @@ export class CliHistory {
       }
     }
     candidates.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.file.path < b.file.path ? -1 : 1));
-    const sessions: (CliSessionSummary & { readonly nativeSessionId: string })[] = [];
+    const sessions: ScopedSummary[] = [];
     let bytes = 0;
     let parsed = 0;
     for (const candidate of candidates) {
@@ -137,12 +140,14 @@ export class CliHistory {
         parsed >= CLI_HISTORY_LIMITS.maxListFiles || bytes >= CLI_HISTORY_LIMITS.maxListBytes) break;
       if (candidate.size > CLI_HISTORY_LIMITS.maxFileBytes) continue;
       try {
+        if (!await this.#rootMatches(candidate.file)) continue;
         const loaded = await this.#loadContent(candidate.file.path);
         parsed += 1;
         bytes += loaded.bytes;
-        if (loaded.cwd !== candidate.file.root) continue;
+        if (loaded.cwd !== candidate.file.root || !await this.#rootMatches(candidate.file)) continue;
         sessions.push({ id: loaded.sessionId, name: nameOf(loaded.entries, loaded.cwd),
-          cwd: loaded.cwd, updatedAt: loaded.updatedAt, nativeSessionId: loaded.sessionId });
+          cwd: loaded.cwd, updatedAt: loaded.updatedAt, nativeSessionId: loaded.sessionId,
+          ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
       } catch {
         continue;
       }
@@ -151,15 +156,19 @@ export class CliHistory {
     return { available: true, sessions: sessions.slice(0, CLI_HISTORY_LIMITS.maxSessions) };
   }
 
-  async read(id: string): Promise<CliSessionDetail> {
+  async read(id: string, cwd?: string, workspaceKey?: string): Promise<CliSessionDetail> {
     checkId(id);
     const scanned = await this.#scan();
     if (!scanned.available) throw unavailable();
     for (const file of scanned.files) {
+      if ((cwd !== undefined && cwd !== file.root) ||
+          (workspaceKey !== undefined && workspaceKey !== file.workspaceKey) || !await this.#rootMatches(file)) continue;
       const header = await this.#headerOf(file.path);
       if (!header || header.sessionId !== id || header.cwd !== file.root) continue;
+      if (!await this.#rootMatches(file)) throw notFound();
       const loaded = await this.#loadContent(file.path);
       if (loaded.cwd !== file.root || loaded.sessionId !== id) throw invalid();
+      if (!await this.#rootMatches(file)) throw notFound();
       const session = { id: loaded.sessionId, name: nameOf(loaded.entries, loaded.cwd),
         cwd: loaded.cwd, updatedAt: loaded.updatedAt };
       return { session, messages: project(loaded.entries), internal: { nativeSessionId: loaded.sessionId } };
@@ -169,27 +178,34 @@ export class CliHistory {
 
   /** Server-only branch source. Resolve the previously authorized history id AND cwd,
    * not any candidate path supplied by a client. Sessions revalidates the file on its own descriptor. */
-  async branchSource(id: string, cwd: string): Promise<BranchSource> {
+  async branchSource(id: string, cwd: string, expectedKey?: string): Promise<ScopedBranchSource> {
     checkId(id);
-    if (!this.#workspaces.includes(cwd) || await realpath(cwd).catch(() => undefined) !== cwd) throw notFound();
+    const policy = this.#workspaces;
+    const workspaceKey = policy instanceof WorkspaceAccess ? await policy.exact(cwd) : undefined;
+    if (policy instanceof WorkspaceAccess ? workspaceKey === undefined ||
+      (expectedKey !== undefined && workspaceKey !== expectedKey) :
+      !policy.includes(cwd) || await realpath(cwd).catch(() => undefined) !== cwd) throw notFound();
     const scanned = await this.#scan();
     if (!scanned.available) throw unavailable();
     let sourcePath: string | undefined;
     for (const file of scanned.files) {
-      if (file.root !== cwd || await realpath(file.path).catch(() => undefined) !== file.path) continue;
+      if (file.root !== cwd || file.workspaceKey !== workspaceKey ||
+        await realpath(file.path).catch(() => undefined) !== file.path || !await this.#rootMatches(file)) continue;
       const header = await readOwnedJournalHeader(file.path);
       if (!header || header.sessionId !== id || header.cwd !== cwd || header.version !== 3) continue;
       if (sourcePath !== undefined) throw new WebError(409, "branch_stale", "CLI 会话身份不唯一，请刷新列表。");
       sourcePath = file.path;
     }
-    if (!sourcePath) throw notFound();
-    return { cwd, nativeSessionId: id, sourcePath };
+    if (!sourcePath || (policy instanceof WorkspaceAccess && await policy.exact(cwd) !== workspaceKey)) throw notFound();
+    return { cwd, nativeSessionId: id, sourcePath, ...(workspaceKey === undefined ? {} : { workspaceKey }) };
   }
 
   async #rootsList(): Promise<readonly string[]> {
+    const policy = this.#workspaces;
+    if (policy instanceof WorkspaceAccess) return policy.paths();
     this.#roots ??= (async () => {
       const canonical: string[] = [];
-      for (const root of this.#workspaces) {
+      for (const root of policy) {
         try {
           const target = await realpath(root);
           if ((await lstat(target)).isDirectory() && !canonical.includes(target)) canonical.push(target);
@@ -202,6 +218,11 @@ export class CliHistory {
     return this.#roots;
   }
 
+  async #rootMatches(file: FileRef): Promise<boolean> {
+    return !(this.#workspaces instanceof WorkspaceAccess) ||
+      (file.workspaceKey !== undefined && await this.#workspaces.exact(file.root) === file.workspaceKey);
+  }
+
   async #scan(): Promise<{ available: boolean; files: FileRef[] }> {
     if (this.#agentDir === undefined) return { available: false, files: [] };
     const base = join(this.#agentDir, "sessions");
@@ -212,6 +233,8 @@ export class CliHistory {
     }
     const files: FileRef[] = [];
     for (const root of await this.#rootsList()) {
+      const workspaceKey = this.#workspaces instanceof WorkspaceAccess ? await this.#workspaces.exact(root) : undefined;
+      if (this.#workspaces instanceof WorkspaceAccess && workspaceKey === undefined) continue;
       const dir = join(base, sessionDirName(root));
       try {
         if (!(await lstat(dir)).isDirectory()) continue;
@@ -219,7 +242,7 @@ export class CliHistory {
         const names = dirents.filter(entry => entry.isFile() && entry.name.endsWith(".jsonl")).map(entry => entry.name);
         names.sort();
         for (const name of names.slice(0, CLI_HISTORY_LIMITS.maxFilesPerDir)) {
-          files.push({ root, dir, path: join(dir, name) });
+          files.push({ root, dir, path: join(dir, name), ...(workspaceKey === undefined ? {} : { workspaceKey }) });
         }
       } catch {
         continue;

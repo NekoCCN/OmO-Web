@@ -4,7 +4,7 @@ OmO Native 的本机浏览器工作台。后端直接使用 OmO 的多会话 RPC
 
 ## 启动
 
-需要 Linux 或 macOS、Bun 1.3+，以及已安装并配置模型凭据的 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)。已实测 OmO **5.1.81**（Senpi **2026.11.19-5**）。这里的 `omo` 是 Native CLI，不是旧版 OpenCode 插件。
+需要 Bun 1.3+。运行会话还需要已安装并配置模型凭据的 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)。Linux 上已实测 OmO **5.1.83**（Senpi **2026.11.23**）。这里的 `omo` 是 Native CLI，不是旧版 OpenCode 插件。Windows 的文件浏览与目录授权单独验证，不代表完整 CLI 功能可用。
 
 ```sh
 omo --version
@@ -15,6 +15,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 把示例目录换成真实存在的项目。用浏览器打开终端打印的地址，默认是 **http://127.0.0.1:4317**。不设置工作目录时使用启动目录。打开多个项目时，在 Linux/macOS 用 `:` 分隔绝对路径。
 
 配置多个目录后，左栏可切换工作区。Web 会话和 CLI 列表随之筛选，新会话默认使用当前目录。切换只改变视图，不移动旧会话，也不会自动恢复或停止会话。
+
+左栏的「浏览工作区」可查看已授权目录下的文件名和子目录，不读取文件内容。要使用未授权的位置，在文件浏览器输入绝对目录路径，选择使用该目录，再核对完整路径并确认。确认后工作区立即可用；取消不授权。浏览过的子目录不自动变成可执行的工作区。新增授权只在当前 Web 服务运行期间有效；要长期保留，请把目录写入启动时的 `OMO_WEB_WORKSPACES`。
+
+文件浏览器按 **Web 服务所在机器** 的路径规则工作：Linux 用 `/home/you/project`；Windows 用本机盘符绝对路径，如 `C:\Users\you\project`，多目录环境变量用 `;` 分隔。不接受 UNC、设备路径或将目标指向外部的符号链接／junction。文件浏览和目录授权不依赖 CLI 的实时控制；Windows 若还要运行会话，需要一个可由服务启动、支持多会话 RPC 的原生 OmO 可执行文件，当前版本不在 Windows 开放基于 TUI socket 的 CLI 实时／跟随。
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
@@ -31,6 +35,7 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 | 领域 | Web 支持 |
 | --- | --- |
 | 会话 | 新建、搜索、重命名、归档/取消归档、完成标记、保存及恢复 Web 会话 |
+| 文件浏览 | 已授权范围内看文件名和子目录；明确确认后可把新目录加入本次服务的工作区 |
 | 执行 | 流式回复、停止、运行中修正/后续输入、队列查看和清空、PNG/JPEG/GIF/WebP 图片输入（每张约 2 MiB，最多 4 张） |
 | 模型 | 原生模型列表、仅切换当前会话、思考档、快速模式、上下文用量、手动与自动压缩 |
 | 可观测性 | 工作台直达子代理、DAG 快照和当前分支待办；待办视图附长期记忆召回计数，不含原文。运行详情显示会话树、原生 CTX、最新与累计缓存命中率、宿主主堆与会话内核内存 |

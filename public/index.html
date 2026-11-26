@@ -26,11 +26,16 @@
           </div>
           <button type="button" class="button button--quiet mobile-only" id="close-navigation">关闭</button>
         </div>
-        <button type="button" class="button" id="new-sidebar" disabled>
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-          新会话
-        </button>
-        <label class="field" id="workspace-field" hidden><span class="sr-only">工作区</span><select id="workspace-select"></select></label>
+        <div class="workspace-tools">
+          <button type="button" class="button" id="new-sidebar" disabled>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            新会话
+          </button>
+          <label class="field" id="workspace-field" hidden><span class="sr-only">工作区</span><select id="workspace-select"></select></label>
+          <button type="button" class="button" id="workspace-browser-button" aria-label="浏览工作区" title="浏览工作区" aria-haspopup="dialog" aria-controls="workspace-browser-dialog" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span aria-hidden="true">浏览</span>
+          </button>
+        </div>
         <label class="field"><span class="sr-only">搜索会话</span><input id="search" type="search" placeholder="搜索会话或目录" autocomplete="off"></label>
         <div class="filters" role="group" aria-label="会话筛选">
           <button type="button" class="button button--quiet" id="recent" aria-pressed="true">最近</button>
@@ -205,6 +210,45 @@
       </div>
     </dialog>
   </div>
+  <dialog id="workspace-browser-dialog" aria-labelledby="workspace-browser-title">
+    <div class="stack">
+      <header class="row row--between">
+        <h2 id="workspace-browser-title">浏览工作区</h2>
+        <button type="button" class="button button--quiet" id="workspace-browser-close" autofocus>关闭</button>
+      </header>
+      <p id="workspace-browser-feedback" class="notice small" role="status" hidden></p>
+      <div id="workspace-browser-navigation" class="stack">
+        <form id="workspace-browser-form" class="workspace-path-form">
+          <label class="field">
+            <span>目录的绝对路径</span>
+            <input id="workspace-browser-path" class="path" type="text" dir="ltr" required autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="workspace-browser-hint">
+          </label>
+          <button type="submit" id="workspace-browser-use" class="button button--primary">使用此目录</button>
+          <p id="workspace-browser-hint" class="small muted">可输入新目录，获准后才显示内容。</p>
+        </form>
+        <section class="subpanel stack stack--tight" aria-label="已授权目录浏览">
+          <label class="field" id="workspace-browser-root-field"><span>已授权工作区</span><select id="workspace-browser-root" class="path" dir="ltr"></select></label>
+          <div class="row row--between">
+            <h3>子目录与文件</h3>
+            <button type="button" id="workspace-browser-up" class="button" disabled>上一级</button>
+          </div>
+          <p id="workspace-browser-current" class="path notice small workspace-full-path" dir="ltr" tabindex="-1" hidden></p>
+          <p id="workspace-browser-status" class="small muted" role="status"></p>
+          <ul id="workspace-browser-entries" class="workspace-entries" aria-label="目录与文件名" hidden></ul>
+          <p class="small muted">只显示目录和文件名，不打开文件。</p>
+        </section>
+      </div>
+      <section class="workspace-approval stack" id="workspace-browser-approval" aria-labelledby="workspace-browser-approval-title" hidden>
+        <h3 id="workspace-browser-approval-title" tabindex="-1" aria-describedby="workspace-browser-approval-path workspace-browser-consequence">允许使用这个目录？</h3>
+        <p id="workspace-browser-approval-path" class="path workspace-full-path" dir="ltr"></p>
+        <p id="workspace-browser-consequence" class="small">允许后，此目录可在当前 Web 服务运行期间用于浏览、新建、恢复与发现会话（含只读跟随）。服务重启后失效，不更改现有会话目录或原生工具权限。</p>
+        <footer class="row">
+          <button type="button" id="workspace-browser-deny" class="button">拒绝</button>
+          <button type="button" id="workspace-browser-confirm" class="button button--primary">允许并切换</button>
+        </footer>
+      </section>
+    </div>
+  </dialog>
   <dialog id="new-dialog" aria-labelledby="new-title">
     <form id="new-form" class="stack">
       <h2 id="new-title">新会话</h2>

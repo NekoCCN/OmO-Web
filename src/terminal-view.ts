@@ -85,16 +85,17 @@ export async function readTerminalState(peer: TerminalPeer, identity: { readonly
   return state;
 }
 
-export async function readTerminalIdentity(peer: TerminalPeer, instance: string, authorizedCwds: ReadonlySet<string>) {
+export async function readTerminalIdentity(peer: TerminalPeer, instance: string, authorize: (cwd: string) => Promise<string | undefined>) {
   const info = parse(protocol, await peer.request({ type: "get_protocol_info", observe: true }));
   if (info.instanceId !== instance ||
     !["tui_control", "tui_observer", "observe_reads", "session_status", "entries_tail"].every(cap => info.capabilities.includes(cap)) ||
     !TERMINAL_COMMANDS.every(command => info.commands.includes(command))) throw terminalMissing();
   const { sessions: [row] } = parse(sessionRows, await peer.request({ type: "list_sessions", observe: true }));
   // TUI rows have no separate durableSessionId in 5.1.81. The state must corroborate the route.
-  if ((row.durableSessionId !== undefined && row.durableSessionId !== row.sessionId) ||
-      !authorizedCwds.has(row.cwd) || !await canonicalDirectory(row.cwd)) throw terminalMissing();
-  return { row, state: await readTerminalState(peer, row) };
+  if (row.durableSessionId !== undefined && row.durableSessionId !== row.sessionId) throw terminalMissing();
+  const workspaceKey = await authorize(row.cwd);
+  if (workspaceKey === undefined) throw terminalMissing();
+  return { row, workspaceKey, state: await readTerminalState(peer, row) };
 }
 
 export async function canonicalDirectory(cwd: string): Promise<boolean> {
