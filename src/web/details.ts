@@ -4,6 +4,8 @@ import { byId, button, el, errorText, fold, list, notice, num, object, option, s
 import type { Wire } from "./dom.ts";
 import { renderNativeActivity } from "./native-activity.ts";
 import { projectCacheRates, projectContextUsage } from "../runtime-metrics.ts";
+import { thinkingLabels } from "./session-sidebar.ts";
+import type { GenerationSpeed } from "../stream-speed.ts";
 
 type Controls = {
   readonly canWrite: boolean;
@@ -22,16 +24,19 @@ const format = (value: unknown): string => {
 };
 const bool = (value: unknown): string => typeof value === "boolean" ? value ? "开启" : "关闭" : "";
 
+function appendUnreported(cell: HTMLElement): void {
+  const dash = el("span", "", "—");
+  dash.setAttribute("aria-hidden", "true");
+  cell.append(dash, el("span", "sr-only", NO_SIGNAL));
+}
+
 function values(pairs: readonly (readonly [string, string])[], sharedUnavailable = false): HTMLElement {
   const result = el("dl", "details-list small numerical");
   for (const [label, value] of pairs) if (value) {
     const unreported = value === NO_SIGNAL || value === "未报告" || value === "已报告，无数值";
     const cell = el("dd", unreported ? "metric-unreported" : "");
-    if (sharedUnavailable && value === NO_SIGNAL) {
-      const dash = el("span", "", "—");
-      dash.setAttribute("aria-hidden", "true");
-      cell.append(dash, el("span", "sr-only", NO_SIGNAL));
-    } else cell.textContent = value;
+    if (sharedUnavailable && value === NO_SIGNAL) appendUnreported(cell);
+    else cell.textContent = value;
     result.append(el("dt", "", label), cell);
   }
   return result.childElementCount ? result : el("p", "small muted", "当前没有可用数据。");
@@ -41,6 +46,13 @@ function part(title: string, ...children: Node[]): HTMLElement {
   const section = el("section", "subpanel stack stack--tight");
   section.append(el("h3", "", title), ...children);
   return section;
+}
+
+function overviewFold(key: string, label: string, ...children: Node[]): HTMLDetailsElement {
+  const details = fold(label, ...children);
+  details.dataset.overviewDisclosure = key;
+  details.querySelector("summary")?.setAttribute("data-overview-focus", key);
+  return details;
 }
 
 function metricGroup(title: string, rows: readonly (readonly [string, string])[]): HTMLElement {
@@ -70,14 +82,32 @@ function formatTime(value: unknown): string {
   return Number.isNaN(date.getTime()) ? "" : date.toLocaleString("zh-CN", { hour12: false });
 }
 
-function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
-  const model = object(state.model);
-  const tokens = object(stats.tokens ?? state.usageTotals);
-  const context = projectContextUsage(object(stats.contextUsage ?? state.contextUsage));
+function activityContext(current: Wire, detail: Wire, stats: Wire) {
+  const live = projectContextUsage(current.contextUsage);
+  if (live.status === "ok" && (live.tokens !== undefined || live.window !== undefined || live.percent === 0)) return live;
+  if (live.status !== "ok" && Object.hasOwn(current, "contextUsage")) return live;
+  const read = projectContextUsage(detail.contextUsage);
+  if (read.status === "ok") return read;
+  const fallback = projectContextUsage(stats.contextUsage);
+  // Older details can report a complete reading while state only carries a rounded percentage.
+  // Keep that reading together rather than pairing numbers from different samples.
+  if (fallback.status === "ok" && (!Object.hasOwn(current, "contextUsage") ||
+    (live.status === "ok" && fallback.tokens !== undefined && fallback.window !== undefined))) return fallback;
+  return live;
+}
+
+function activity(data: Wire, state: Wire, speed?: GenerationSpeed): HTMLElement {
+  const stats = object(data.stats);
+  const detailState = object(data.state);
+  const settings = { ...detailState, ...state };
+  const memory = object(data.sessionMemory);
+  const model = object(settings.model);
+  const tokens = object(stats.tokens ?? settings.usageTotals);
+  const context = activityContext(state, detailState, stats);
   const contextTokens = context.status === "ok" ? format(context.tokens) : "";
   const contextWindow = context.status === "ok" ? format(context.window) : "";
   const contextPercent = context.status === "ok" ? format(context.percent) : "";
-  const cache = projectCacheRates(object(state.usageTotals));
+  const cache = projectCacheRates(settings.usageTotals);
   const latest = cache.status === "ok" ? cache.latest : undefined;
   const cumulative = cache.status === "ok" ? cache.cumulative : undefined;
   const input = num(tokens.input);
@@ -92,30 +122,60 @@ function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
   const kernelCount = num(memory.kernelCount);
   const memoryKnown = mainHeap !== undefined || kernelHeap !== undefined || kernelCount !== undefined;
   const contextText = contextPercent ? (contextTokens ? `${contextTokens} (${contextPercent}%)` : `${contextPercent}%`) : contextTokens;
-  const section = part("运行状态与用量",
+  const cacheText = formatRate(latest);
+  const toolCalls = format(stats.toolCalls);
+  const costText = cost === undefined ? "" : dollars.format(cost);
+  const highlights = el("dl", "metric-highlights numerical");
+  for (const [tone, label, value] of [
+    ["context", "上下文已用", contextPercent ? `${contextPercent}%` : contextTokens ? `${contextTokens} token` : ""],
+    ["cache", "最新缓存命中率", cacheText],
+    ["tools", "工具调用", toolCalls],
+    ["cost", "估算费用", costText],
+  ] as const) {
+    const tile = el("div", "metric-tile");
+    tile.dataset.tone = tone;
+    const reading = el("dd", value ? "" : "metric-unreported", value);
+    if (!value) appendUnreported(reading);
+    tile.append(el("dt", "", label), reading);
+    highlights.append(tile);
+  }
+  const level = str(settings.thinkingLevel);
+  const heading = el("div", "row row--between");
+  const resources = el("button", "button button--quiet small", "规则与记忆");
+  resources.type = "button";
+  resources.id = "runtime-open-resources";
+  resources.dataset.overviewFocus = "resources";
+  resources.setAttribute("aria-controls", "runtime-resources");
+  heading.append(el("h3", "", "运行状态与用量"), resources);
+  const section = el("section", "subpanel stack stack--tight runtime-metrics");
+  section.append(heading, highlights, metricGroup("会话设置", [
+    ["模型", [str(model.provider), str(model.name) || str(model.id)].filter(Boolean).join(" · ") || NO_SIGNAL],
+    ["生效思考档", (Object.hasOwn(thinkingLabels, level) ? thinkingLabels[level] : level) || NO_SIGNAL],
+    ["快速模式", bool(settings.fastMode) || NO_SIGNAL],
+    ["最近流式 · Web 观测", speed ? `${speed.tokensPerSecond < .01 ? "<0.01" : number.format(speed.tokensPerSecond)} token/s` : "未测得"],
+  ]));
+  const breakdown = overviewFold("metrics", "完整运行明细",
     metricGroup("上下文与缓存", [
       ["上下文已用（原生）", contextText || NO_SIGNAL],
       ["上下文窗口", contextWindow ? `${contextWindow} token` : NO_SIGNAL],
-      ["缓存命中率（原生最新）", formatRate(latest) || (cache.status === "ok" ? "已报告，无数值" : NO_SIGNAL)],
+      ["缓存命中率（原生最新）", cacheText || (cache.status === "ok" ? "已报告，无数值" : NO_SIGNAL)],
       ["缓存累计命中率", formatRate(cumulative) || (cache.status === "ok" ? "已报告，无数值" : NO_SIGNAL)],
     ]),
-    metricGroup("会话设置", [
-      ["模型", [str(model.provider), str(model.name) || str(model.id)].filter(Boolean).join(" · ")],
-      ["权限预设", str(state.effectivePermissionPreset) || str(state.permissionPreset)],
-      ["快速模式", bool(state.fastMode)],
-      ["自动压缩", bool(state.autoCompactionEnabled)],
+    metricGroup("其他设置", [
+      ["权限预设", str(settings.effectivePermissionPreset) || str(settings.permissionPreset) || NO_SIGNAL],
+      ["自动压缩", bool(settings.autoCompactionEnabled) || NO_SIGNAL],
     ]),
     metricGroup("流量与费用", [
       ["用户消息", format(stats.userMessages)],
       ["助手消息", format(stats.assistantMessages)],
-      ["工具调用", format(stats.toolCalls)],
+      ["工具调用", toolCalls],
       ["输入 token（含缓存）", splitInput ? format(input + cacheRead + cacheWrite) : NO_SIGNAL],
       ["未缓存输入 token", splitInput ? format(input + cacheWrite) : format(input)],
       ["输出 token", format(tokens.output)],
       ["缓存读取 token", format(tokens.cacheRead)],
       ["缓存写入 token", format(tokens.cacheWrite)],
       ["总 token", format(tokens.total ?? tokens.totalTokens)],
-      ["估算费用", cost === undefined ? "" : dollars.format(cost)],
+      ["估算费用", costText],
       ["失败请求", format(failures.erroredRequests)],
     ]),
     metricGroup("原生内存", [
@@ -123,10 +183,13 @@ function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
       ["本会话内核堆", kernelHeap !== undefined ? formatBytes(kernelHeap) : (memoryKnown ? "未报告" : NO_SIGNAL)],
       ["本会话内核数", kernelCount !== undefined ? format(kernelCount) : (memoryKnown ? "未报告" : NO_SIGNAL)],
     ]));
-  if (section.querySelector(".metric-unreported [aria-hidden='true']")) {
-    section.append(el("p", "metric-key small", "— 表示原生未报告"));
+  breakdown.classList.add("metric-breakdown");
+  section.append(breakdown);
+  if (highlights.querySelector(".metric-unreported")) {
+    highlights.after(el("p", "metric-key small", "— 表示原生未报告"));
+  } else if (breakdown.querySelector(".metric-unreported [aria-hidden='true']")) {
+    breakdown.querySelector(".fold-body")?.append(el("p", "metric-key small", "— 表示原生未报告"));
   }
-  section.classList.add("runtime-metrics");
   return section;
 }
 
@@ -145,6 +208,7 @@ function queuePanel(queue: Wire, controls: Controls): HTMLElement {
   }
   const clear = button("清空队列", controls.clearQueue, "button--danger");
   clear.disabled = !controls.canWrite || !((controls.queueCount ?? 0) > 0 || inputs.length > 0);
+  clear.dataset.overviewFocus = "queue:clear";
   clear.dataset.write = "";
   if (clear.disabled && controls.canWrite) clear.dataset.unavailable = "";
   const actions = el("div", "row");
@@ -166,12 +230,13 @@ function commandPanel(options: Wire, controls: Controls): HTMLElement {
     const action = button(syntax, () => controls.insertCommand(syntax), "button--quiet path");
     action.title = "插入输入框，不会立即发送";
     action.setAttribute("aria-label", `插入命令：${syntax}`);
+    action.dataset.overviewFocus = `command:${syntax}`;
     const item = el("li", "stack stack--tight");
     item.append(action);
     if (str(command.description)) item.append(el("p", "small muted break", str(command.description)));
     result.append(item);
   }
-  section.append(fold(`${commands.length} 项 · 展开后可插入输入框`, result));
+  section.append(overviewFold("commands", `${commands.length} 项 · 展开后可插入输入框`, result));
   return section;
 }
 
@@ -208,6 +273,7 @@ function treePanel(data: Wire, controls: Controls): HTMLElement {
     if (id) {
       const action = button(entryTitle(node), () => controls.navigate(id), "button--quiet");
       action.disabled = !controls.canNavigate;
+      action.dataset.overviewFocus = `tree-node:${id}`;
       action.dataset.write = "";
       action.dataset.idle = "";
       if (leaf === id) action.setAttribute("aria-current", "true");
@@ -223,12 +289,13 @@ function treePanel(data: Wire, controls: Controls): HTMLElement {
   }
   const clear = button("切换到空上下文", () => controls.navigate(null));
   clear.disabled = !controls.canNavigate || !leaf;
+  clear.dataset.overviewFocus = "tree:empty";
   clear.dataset.write = "";
   clear.dataset.idle = "";
   if (!leaf) clear.dataset.unavailable = "";
   const actionBar = el("div", "row");
   actionBar.append(clear);
-  const body = table.childElementCount ? fold("查看会话节点", el("p", "small muted", "选择历史用户消息可将其载入输入框；不会自动发送。"), table, actionBar)
+  const body = table.childElementCount ? overviewFold("tree", "查看会话节点", el("p", "small muted", "选择历史用户消息可将其载入输入框；不会自动发送。"), table, actionBar)
     : el("p", "small muted", "没有可导航的会话节点。");
   const section = part("会话树", body);
   section.id = "runtime-tree";
@@ -253,14 +320,14 @@ const runtimeInvalidReason: Readonly<Record<string, string>> = {
 
 function runtimeBranchPanel(runtime: Wire): HTMLElement {
   const section = el("section", "subpanel stack stack--tight");
-  section.append(el("h3", "", "待办与长期记忆 · 当前活动分支"));
+  section.append(el("h3", "", "待办 · 当前活动分支"));
   if (str(runtime.status) === "invalid") {
     section.append(el("p", "small muted",
-      `分支投影无效（${runtimeInvalidReason[str(runtime.reason)] ?? "未知原因"}），不显示待办与记忆，避免混入其他分支。`));
+      `分支投影无效（${runtimeInvalidReason[str(runtime.reason)] ?? "未知原因"}），不显示待办，避免混入其他分支。`));
     return section;
   }
   if (str(runtime.status) !== "ok") {
-    section.append(el("p", "small muted", "分支投影不可用，没有可显示的待办与记忆。"));
+    section.append(el("p", "small muted", "分支投影不可用，没有可显示的待办。"));
     return section;
   }
   const leaf = str(runtime.leafId);
@@ -292,10 +359,14 @@ function runtimeBranchPanel(runtime: Wire): HTMLElement {
   } else {
     section.append(el("p", "small muted", "当前活动分支没有待办记录（缺失不伪造成空列表或零待办）。"));
   }
+  return section;
+}
+
+function branchMemory(runtime: Wire): Node[] {
+  if (runtime.status !== "ok") return [el("p", "small muted", "无法确认当前分支，未显示长期记忆计数。")];
   const memory = object(runtime.memory);
   if (str(memory.status) !== "ok") {
-    section.append(el("p", "small muted", "长期记忆（Kibitzer 召回聚合）：当前分支无记录，不判定为未启用；堆内存不计入此处。"));
-    return section;
+    return [el("p", "small muted", "当前分支没有召回记录；不代表未启用长期记忆。")];
   }
   const recalled = num(memory.recalledCount);
   const recent = formatTime(memory.recentRecalledAt);
@@ -311,27 +382,54 @@ function runtimeBranchPanel(runtime: Wire): HTMLElement {
     ["记忆不可用记录（仅计数）", unavailableCount !== undefined ? `${format(unavailableCount)}${formatTime(unavailable.at) ? ` · ${formatTime(unavailable.at)}` : ""}` : ""],
   ] as const;
   const filled = rows.filter(([, value]) => Boolean(value));
-  section.append(el("p", "small muted", "长期记忆（durable 召回聚合，只读计数与状态；不展示原文、路径与提示词，不扫描个人记忆目录）。"));
-  section.append(filled.length ? values(filled) : el("p", "small muted", "有记忆聚合记录，但暂无可显示的数值。"));
-  return section;
+  return [
+    el("p", "small muted", "仅活动分支的召回计数与状态，不含个人记忆原文、路径、提示词或宿主堆内存。"),
+    filled.length ? values(filled) : el("p", "small muted", "有记忆聚合记录，但暂无可显示的数值。"),
+  ];
 }
 
-export function renderDetails(data: Wire, state: Wire, options: Wire, controls: Controls): void {
+export function refreshDetailsActivity(data: Wire, state: Wire, speed?: GenerationSpeed): void {
+  const previous = byId("runtime-metrics", HTMLElement).querySelector(".runtime-metrics");
+  if (!previous) return;
+  const next = activity(data, state, speed);
+  const fold = previous.querySelector("details");
+  const nextFold = next.querySelector("details");
+  const focused = document.activeElement;
+  const focusKey = focused instanceof HTMLElement && previous.contains(focused) ? focused.dataset.overviewFocus : undefined;
+  if (fold && nextFold) nextFold.open = fold.open;
+  previous.replaceWith(next);
+  if (focusKey) next.querySelector<HTMLElement>(`[data-overview-focus="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
+}
+
+export function renderDetails(data: Wire, state: Wire, options: Wire, controls: Controls, speed?: GenerationSpeed): void {
   const metrics = byId("runtime-metrics", HTMLElement);
   const todo = byId("runtime-todo", HTMLElement);
-  const opened = [...metrics.querySelectorAll("details"), ...todo.querySelectorAll("details")].map(node => node.open);
+  const focused = document.activeElement;
+  const focusKey = focused instanceof HTMLElement && metrics.contains(focused) ? focused.dataset.overviewFocus : undefined;
+  const openedOverview = new Set([...metrics.querySelectorAll<HTMLDetailsElement>("details[open]")].map(node => node.dataset.overviewDisclosure));
   metrics.replaceChildren(
-    activity(object(data.stats), { ...state, ...object(data.state) }, object(data.sessionMemory)),
+    activity(data, state, speed),
     queuePanel(object(data.queue), controls), commandPanel(options, controls), treePanel(object(data.tree), controls),
   );
-  const branch = runtimeBranchPanel(object(data.runtime));
+  const runtime = object(data.runtime);
+  const branch = runtimeBranchPanel(runtime);
   const oldBranch = todo.querySelector("[data-runtime-branch]");
+  const previousTodo = oldBranch?.querySelector("details");
+  const nextTodo = branch.querySelector("details");
+  if (previousTodo && nextTodo) nextTodo.open = previousTodo.open;
+  const focusTodo = previousTodo?.querySelector("summary") === focused;
   branch.dataset.runtimeBranch = "";
   if (oldBranch) oldBranch.replaceWith(branch);
   else todo.prepend(branch);
-  [...metrics.querySelectorAll("details"), ...todo.querySelectorAll("details")].forEach((node, i) => {
-    node.open = opened[i] ?? false;
+  byId("runtime-memory-branch-content", HTMLElement).replaceChildren(...branchMemory(runtime));
+  if (focusTodo) (nextTodo?.querySelector("summary") ?? todo).focus({ preventScroll: true });
+  metrics.querySelectorAll<HTMLDetailsElement>("details[data-overview-disclosure]").forEach(node => {
+    node.open = openedOverview.has(node.dataset.overviewDisclosure);
   });
+  if (focusKey !== undefined) {
+    const next = metrics.querySelector<HTMLElement>(`[data-overview-focus="${CSS.escape(focusKey)}"]:not(:disabled)`);
+    (next?.getClientRects().length ? next : metrics).focus({ preventScroll: true });
+  }
 }
 
 export function showNativeActivity(host: HTMLElement, data: Wire): void {

@@ -6,7 +6,7 @@ import { Interactions, isRequest, requestId } from "./interactions.ts";
 import type { Answer } from "./interactions.ts";
 import { Transcript, messageKey, roleOf } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
-import { branchDialog, renderDetails } from "./details.ts";
+import { branchDialog, refreshDetailsActivity, renderDetails } from "./details.ts";
 import { renderCapabilities, renderLocalCompatibility } from "./capabilities.ts";
 import { canShowSnapshot, renderJournal, renderRuntimePane } from "./runtime-summary.ts";
 import { cliHistory } from "./cli-history.ts";
@@ -18,6 +18,8 @@ import type { BuiltinCommand } from "./builtin-commands.ts";
 import { commandCatalog, commandToken, inlineCommandCompletion } from "./command-completion.ts";
 import { bindCommandListKeys } from "./command-list-keys.ts";
 import { projectCacheRates, projectContextUsage } from "../runtime-metrics.ts";
+import { bindProjectRules, readGenerationSpeed, thinkingLabels } from "./session-sidebar.ts";
+import type { GenerationSpeed } from "../stream-speed.ts";
 
 const box = (id: string) => byId(id, HTMLElement);
 const btn = (id: string) => byId(id, HTMLButtonElement);
@@ -63,7 +65,7 @@ const manager = dialog("manage-dialog");
 const inspector = dialog("details-dialog");
 const commandDialog = dialog("command-dialog");
 const branchModal = dialog("branch-dialog");
-const settingLabels: Readonly<Record<string, string>> = { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" };
+const settingLabels = thinkingLabels;
 const thinkingSources: Readonly<Record<string, string>> = {
   explicit: "显式指定", session: "会话内记录", global: "设备记忆", "model-default": "模型默认",
   default: "默认设置", fallback: "回退档位", clamped: "按模型能力调整",
@@ -85,12 +87,20 @@ type Draft = {
   commandAdmission?: { readonly text: string; readonly id: string };
   admission?: { readonly imageList: readonly Attachment[]; readonly text: string; readonly mode: Mode; readonly turn: string; readonly id: string };
 };
+type RequestChange =
+  | { readonly type: "upsert"; readonly request: Wire }
+  | { readonly type: "timing"; readonly ids: readonly string[]; readonly timing: Wire }
+  | { readonly type: "resolve"; readonly ids: readonly string[] };
 type View = {
   session: Session; status: "inactive" | "loading" | "ready" | "failed"; error: string; state: Wire;
   messages: TranscriptEntry[]; liveKey: string; tools: Map<string, ToolTrace>; requests: Map<string, Wire>;
   options: Wire; optionsError: string; handoff: Wire; queue: number | undefined; revision: number; serial: number;
   sync: number; optionSync: number; running: boolean; compacting: boolean;
   workbench?: Wire;
+  consideredDesktopDock?: boolean;
+  snapshotRequestChanges?: RequestChange[];
+  detailData?: Wire;
+  generationSpeed?: GenerationSpeed;
   modelSelection?: string;
   modelPreview?: { readonly key: string; result?: Wire };
 };
@@ -98,6 +108,8 @@ type Release = { status: "pending" } | { status: "released"; command: string; co
   | { status: "failed" | "uncertain"; error: string };
 
 let current: View | undefined;
+const resetProjectRules = bindProjectRules(api,
+  () => inspector.open && current?.status === "ready" ? current.session.id : undefined);
 let engine: Wire = {};
 let handoffSupport: Wire = {};
 let connection: "connecting" | "online" | "offline" = "connecting";
@@ -132,6 +144,10 @@ let refreshTimer = 0;
 let workbenchRequest: AbortController | undefined;
 let createPending = false;
 let navOpen = false;
+const railPreference = "omo-web-navigation-collapsed";
+const inspectorPreference = "omo-web-desktop-inspector";
+let railCollapsed = false;
+let desktopInspectorOpen = true;
 const writes = new Set<string>();
 const sending = new Set<string>();
 const drafts = new Map<string, Draft>();
@@ -141,7 +157,7 @@ const compactInspector = matchMedia("(max-width: 1000px)");
 const system = matchMedia("(prefers-color-scheme: dark)");
 const countFormat = new Intl.NumberFormat("zh-CN");
 const rateFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
-const focusCliLauncher = (id: string) => btn(mobile.matches ? "open-navigation" : id).focus();
+const focusCliLauncher = (id: string) => btn(mobile.matches ? "open-navigation" : railCollapsed ? "rail-toggle" : id).focus();
 const showBranch = branchDialog(api, enterBranch);
 const openBranch = (source: BranchSource) => {
   if (branchModal.open) return;
@@ -209,10 +225,12 @@ function handoffUnavailable(view: View): string {
 function markInactive(view: View): void {
   view.sync++;
   view.optionSync++;
+  view.snapshotRequestChanges = undefined;
   view.status = "inactive";
   view.running = false;
   view.compacting = false;
   view.workbench = undefined;
+  view.generationSpeed = undefined;
   if (view === current) workbenchRequest?.abort();
 }
 
@@ -261,6 +279,30 @@ function startTheme(): void {
   });
   system.addEventListener("change", apply);
   apply();
+}
+
+function readLayoutPreference(key: string): string | null {
+  try { return localStorage.getItem(key); }
+  catch (error) {
+    if (!(error instanceof DOMException)) throw error;
+    return null;
+  }
+}
+
+function saveLayoutPreference(key: string, value: string): void {
+  try { localStorage.setItem(key, value); }
+  catch (error) {
+    if (!(error instanceof DOMException)) throw error;
+  }
+}
+
+function renderRail(): void {
+  box("workspace-shell").toggleAttribute("data-rail-collapsed", railCollapsed);
+  const toggle = btn("rail-toggle");
+  toggle.setAttribute("aria-expanded", String(!railCollapsed));
+  const label = railCollapsed ? "展开会话导航" : "收起会话导航";
+  toggle.setAttribute("aria-label", label);
+  toggle.title = label;
 }
 
 function toggleNav(open: boolean, restoreFocus = false): void {
@@ -706,6 +748,24 @@ function setTraceTarget(control: HTMLButtonElement, target?: HTMLElement): void 
   trace.hidden = box("active-session").hidden || !traceTargets.size;
 }
 
+function renderQuestionShortcut(requests: ReadonlyMap<string, Wire>): void {
+  const shortcut = btn("sidebar-question");
+  let count = 0;
+  for (const request of requests.values()) if (request.method === "question" && ++count === 100) break;
+  if (!count) {
+    if (shortcut === document.activeElement) inspector.querySelector<HTMLElement>('[aria-selected="true"]')?.focus();
+    shortcut.hidden = true;
+    return;
+  }
+  const display = count === 100 ? "99+" : String(count);
+  const label = `Agent 提问 · ${display}`;
+  if (shortcut.textContent !== label) {
+    shortcut.textContent = label;
+    shortcut.setAttribute("aria-label", `跳至首个 Agent 提问（${count === 100 ? "超过 99" : display} 个待答）`);
+  }
+  shortcut.hidden = false;
+}
+
 function renderView(): void {
   const following = follow.active;
   box("cli-follow-view").hidden = !following;
@@ -714,6 +774,7 @@ function renderView(): void {
   btn("cli-follow-button").setAttribute("aria-pressed", String(following));
   box("banner").hidden = following || !box("banner-text").textContent;
   if (following) {
+    if (current) current.consideredDesktopDock = false;
     completion.reset();
     trace.hidden = true;
     box("composer-shell").hidden = true;
@@ -861,8 +922,10 @@ function renderView(): void {
   notice(box("compose-error"), (commandMode ? draft.commandError : draft.error) || view.optionsError ||
     (!manager.open && release?.status === "failed" ? release.error : ""));
   interactions.render(view.requests, online && !pending, (id, answer) => answerRequest(view, id, answer));
+  renderQuestionShortcut(view.requests);
   setTraceTarget(traceControls.request, interactions.first);
   completion.render(view.options.commands, online && !blocked && !pending);
+  dockDetailsOnReady(view);
 }
 
 function renderHeading(name: string, cwd: string): void {
@@ -872,6 +935,8 @@ function renderHeading(name: string, cwd: string): void {
   const path = box("session-path");
   notice(path, cwd);
   path.title = cwd;
+  notice(box("session-path-short"), cwd ? workspaceLabel(cwd) : "");
+  btn("session-path-trigger").hidden = !cwd;
   if (follow.active && cwd) path.dataset.workspaceLabel = workspaceLabel(cwd);
   else delete path.dataset.workspaceLabel;
 }
@@ -896,7 +961,10 @@ async function snapshot(view: View, bottom = false): Promise<void> {
   if (requiresManualResume && (view.status !== "loading" || !writes.has(view.session.id))) return;
   const ticket = ++view.sync;
   const revision = view.revision;
-  const baseRequests = new Set(view.requests.keys());
+  const baseState = view.state;
+  const baseSpeed = view.generationSpeed;
+  const requestChanges: RequestChange[] = [];
+  view.snapshotRequestChanges = requestChanges;
   const baseLiveKey = view.liveKey;
   const baseRunningTools = new Set([...view.tools].filter(([, tool]) => tool.stage === "running").map(([id]) => id));
   try {
@@ -908,6 +976,10 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     if (requiresManualResume) releases.delete(session.id);
     remember(session);
     const state = object(data.state);
+    if (engine.online !== false) {
+      if (data.generationSpeed === undefined && view.generationSpeed === baseSpeed) view.generationSpeed = undefined;
+      else rememberGenerationSpeed(view, data.generationSpeed);
+    }
     const previousModel = modelKey(object(view.state.model));
     view.handoff = object(data.handoff);
     const messages = list(data.messages).map(object);
@@ -924,10 +996,9 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     if (changed) {
       const newer = new Map(view.messages.map(entry => [entry.key, entry]));
       view.messages = [...entries.map(entry => newer.get(entry.key) ?? entry), ...view.messages.filter(entry => !keys.has(entry.key))];
-      view.state = { ...state, ...view.state };
+      // If an event arrived during the HTTP read, preserve only the fields it changed.
+      view.state = { ...state, ...Object.fromEntries(Object.entries(view.state).filter(([key, value]) => value !== baseState[key])) };
       const streaming = session.running || state.isStreaming === true;
-      const liveAdded = [...view.requests].filter(([id]) => !baseRequests.has(id));
-      view.requests = new Map([...requestsFrom(state), ...liveAdded]);
       if (!streaming && !view.running) {
         view.liveKey = "";
         if (baseLiveKey && !keys.has(baseLiveKey)) view.messages = view.messages.filter(entry => entry.key !== baseLiveKey);
@@ -938,7 +1009,6 @@ async function snapshot(view: View, bottom = false): Promise<void> {
       view.state = state;
       view.running = session.running || state.isStreaming === true;
       view.compacting = state.isCompacting === true;
-      view.requests = requestsFrom(state);
       view.queue = num(state.pendingMessageCount);
       if (!view.running) {
         view.liveKey = "";
@@ -949,12 +1019,17 @@ async function snapshot(view: View, bottom = false): Promise<void> {
         if (live) view.messages.push({ key: view.liveKey, message: live });
       }
     }
+    const requests = requestsFrom(state);
+    // Replaying resolutions also covers requests that arrived and settled entirely during the GET.
+    for (const change of requestChanges) applyRequestChange(requests, change);
+    view.requests = requests;
     refreshModelOptions(view, previousModel);
     const becameReady = view.status !== "ready";
     view.status = "ready";
     view.error = "";
     renderView();
     renderMessages(view, bottom);
+    renderLiveDetailsActivity(view);
     if (becameReady || !view.workbench) void loadWorkbenchStatus(view);
   } catch (error) {
     if (current !== view || ticket !== view.sync) return;
@@ -966,6 +1041,8 @@ async function snapshot(view: View, bottom = false): Promise<void> {
       draftFor(view.session.id).error = `无法刷新会话：${errorText(error)}`;
     }
     renderView();
+  } finally {
+    if (view.snapshotRequestChanges === requestChanges) view.snapshotRequestChanges = undefined;
   }
 }
 
@@ -1062,9 +1139,37 @@ function scheduleSnapshot(view: View): void {
   refreshTimer = window.setTimeout(() => { if (current === view && view.session.active) void snapshot(view); }, 120);
 }
 
+function applyRequestChange(requests: Map<string, Wire>, change: RequestChange): void {
+  if (change.type === "upsert") {
+    requests.set(requestId(change.request), change.request);
+    return;
+  }
+  for (const [key, request] of requests) {
+    if (!change.ids.includes(key) && !change.ids.includes(str(request.requestId))) continue;
+    if (change.type === "resolve") requests.delete(key);
+    else if (request.method === "question") requests.set(key, { ...request, ...change.timing });
+  }
+}
+
+function changeRequests(view: View, change: RequestChange): void {
+  applyRequestChange(view.requests, change);
+  view.snapshotRequestChanges?.push(change);
+}
+
 function receiveRequest(view: View, raw: unknown): void {
   const request = object(raw);
-  if (isRequest(request)) view.requests.set(requestId(request), request);
+  if (isRequest(request)) changeRequests(view, { type: "upsert", request });
+}
+
+function rememberGenerationSpeed(view: View, value: unknown): boolean {
+  const speed = readGenerationSpeed(value);
+  if (!speed || (view.generationSpeed && view.generationSpeed.measuredAt >= speed.measuredAt)) return false;
+  view.generationSpeed = speed;
+  return true;
+}
+
+function renderLiveDetailsActivity(view: View): void {
+  if (inspector.open && view.detailData) refreshDetailsActivity(view.detailData, view.state, view.generationSpeed);
 }
 
 function onEvent(event: Wire): void {
@@ -1076,6 +1181,10 @@ function onEvent(event: Wire): void {
       if (typeof status.online !== "boolean") return;
       recovering = status.online && engine.online === false;
       engine = status;
+      if (!status.online && current) {
+        current.generationSpeed = undefined;
+        renderLiveDetailsActivity(current);
+      }
       updateConnection();
       if (status.online) void bootstrap(true);
       else void fetchSessions();
@@ -1089,6 +1198,10 @@ function onEvent(event: Wire): void {
   const view = current;
   if (!view || event.sessionId !== view.session.id) return;
   if (view.status !== "ready" && view.status !== "loading") return;
+  if (type === "generation_speed") {
+    if (rememberGenerationSpeed(view, event.generationSpeed)) renderLiveDetailsActivity(view);
+    return;
+  }
   view.revision++;
   switch (type) {
     case "agent_start":
@@ -1110,6 +1223,7 @@ function onEvent(event: Wire): void {
       view.state = { ...view.state, currentTurnId: undefined };
       scheduleSnapshot(view);
       void loadWorkbenchStatus(view);
+      if (view.status === "ready" && inspector.open) loadDetailStats(view);
       break;
     case "agent_idle":
       scheduleSnapshot(view);
@@ -1141,19 +1255,29 @@ function onEvent(event: Wire): void {
     case "ui_request_pending":
       receiveRequest(view, event.request);
       break;
-    case "question_updated":
+    case "question_updated": {
       if (isRequest(event)) receiveRequest(view, event);
+      else {
+        const ids = [str(event.id), str(event.requestId)].filter(Boolean);
+        const deadlineAtMs = num(event.deadlineAtMs);
+        const remainingMs = num(event.remainingMs);
+        if (!ids.length || (deadlineAtMs === undefined && remainingMs === undefined)) return;
+        changeRequests(view, { type: "timing", ids, timing: {
+          ...(deadlineAtMs === undefined ? {} : { deadlineAtMs }),
+          ...(remainingMs === undefined ? {} : { remainingMs }),
+        } });
+      }
       break;
+    }
     case "question_resolved":
     case "ui_request_resolved":
     case "extension_ui_resolved":
-    case "extension_ui_request_resolved":
-      for (const [id, request] of view.requests) {
-        const values = [event.id, event.requestId, event.uiRequestId].map(str).filter(Boolean);
-        if (values.includes(id) || values.includes(str(request.requestId))) view.requests.delete(id);
-      }
+    case "extension_ui_request_resolved": {
+      const ids = [event.id, event.requestId, event.uiRequestId].map(str).filter(Boolean);
+      if (ids.length) changeRequests(view, { type: "resolve", ids });
       scheduleSnapshot(view);
       break;
+    }
     case "compaction_start":
       view.compacting = true;
       break;
@@ -1172,7 +1296,10 @@ function onEvent(event: Wire): void {
     case "model_changed":
     case "service_tier_changed": {
       const previousModel = modelKey(object(view.state.model));
-      if (event.model) view.state = { ...view.state, model: event.model, thinkingLevel: event.thinkingLevel ?? view.state.thinkingLevel };
+      if (event.model) view.state = { ...view.state, model: event.model };
+      if (typeof event.thinkingLevel === "string") view.state = { ...view.state, thinkingLevel: event.thinkingLevel };
+      if (typeof event.fastMode === "boolean") view.state = { ...view.state, fastMode: event.fastMode };
+      renderLiveDetailsActivity(view);
       if (!previousModel || previousModel === modelKey(object(view.state.model))) {
         view.modelPreview = undefined;
         void loadOptions(view);
@@ -1193,6 +1320,10 @@ function onEvent(event: Wire): void {
     case "session_replaced":
       workbenchRequest?.abort();
       view.workbench = undefined;
+      view.generationSpeed = undefined;
+      resetProjectRules();
+      renderLiveDetailsActivity(view);
+      if (inspector.open) loadDetails(view);
       scheduleSnapshot(view);
       break;
     case "transcript_write_failed":
@@ -1230,8 +1361,9 @@ async function write(view: View, action: Action): Promise<Wire> {
 }
 
 async function answerRequest(view: View, id: string, answer: Answer): Promise<void> {
+  const ids = [id, str(view.requests.get(id)?.requestId)].filter(Boolean);
   await write(view, { action: "answer", requestId: id, ...answer });
-  view.requests.delete(id);
+  changeRequests(view, { type: "resolve", ids });
   if (view === current) renderView();
   scheduleSnapshot(view);
 }
@@ -1759,7 +1891,7 @@ function insertCommand(view: View, invocation: string): void {
   draft.commandText = `${invocation}${rest || " "}`;
   draft.commandError = "";
   if (commandDialog.open) commandDialog.close();
-  closeDetails(false);
+  if (inspector.matches(":modal")) closeDetails(false);
   showCommandMode(view, true);
   prompt.setSelectionRange(invocation.length + 1, invocation.length + 1);
 }
@@ -1815,6 +1947,7 @@ async function openCommandPicker(view: View, help = false): Promise<void> {
 }
 
 let detailsRequest: AbortController | undefined;
+let runtimeRequest: AbortController | undefined;
 let dagRequest: AbortController | undefined;
 let detailsOpener: HTMLElement | undefined;
 type DetailReveal = "tree" | "todo";
@@ -1884,6 +2017,7 @@ function selectDetailsView(tab: HTMLButtonElement): void {
     button.tabIndex = selected ? 0 : -1;
     const target = button.getAttribute("aria-controls");
     if (target) box(target).hidden = !selected;
+    if (target === "runtime-todo" && !selected) resetProjectRules();
   }
   box("details-scroll").scrollTop = 0;
   detailReveal = undefined;
@@ -1910,23 +2044,45 @@ function openDetails(tab = "overview", opener: HTMLElement = btn("details-button
   selectDetailsView(target);
   detailsOpener = opener;
   detailReveal = reveal;
-  if (!inspector.open) {
-    for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities)')) panel.replaceChildren();
-    if (compactInspector.matches) inspector.showModal();
-    else inspector.show();
-    btn("details-button").setAttribute("aria-expanded", "true");
-    box("details-scroll").scrollTop = 0;
-    loadDetails(current);
+  if (!compactInspector.matches && !desktopInspectorOpen) {
+    desktopInspectorOpen = true;
+    saveLayoutPreference(inspectorPreference, "open");
   }
+  if (!inspector.open) showDetails(current);
   target.focus({ preventScroll: true });
   revealDetailsTarget();
+}
+
+function showDetails(view: View): void {
+  for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities, #runtime-todo)')) panel.replaceChildren();
+  box("runtime-todo").querySelector("[data-runtime-branch]")?.remove();
+  box("runtime-memory-journal").replaceChildren();
+  box("runtime-memory-branch-content").replaceChildren();
+  byId("runtime-memory-branch", HTMLDetailsElement).open = false;
+  // HTMLDialogElement.show() runs the dialog focusing steps even when non-modal.
+  if (compactInspector.matches) inspector.showModal();
+  else inspector.open = true;
+  btn("details-button").setAttribute("aria-expanded", "true");
+  box("details-scroll").scrollTop = 0;
+  loadDetails(view);
+}
+
+function dockDetailsOnReady(view: View | undefined, enteringDesktop = false): void {
+  if (!view || view.status !== "ready" || follow.active || (view.consideredDesktopDock && !enteringDesktop)) return;
+  view.consideredDesktopDock = true;
+  if (!desktopInspectorOpen || compactInspector.matches || inspector.open) return;
+  selectDetailsView(btn("runtime-open-overview"));
+  showDetails(view);
 }
 
 function closeDetails(restoreFocus = true): void {
   if (!inspector.open) return;
   inspector.close();
   detailsRequest?.abort();
+  runtimeRequest?.abort();
   dagRequest?.abort();
+  resetProjectRules();
+  if (current) current.detailData = undefined;
   detailReveal = undefined;
   clearCapabilities();
   const trigger = btn("details-button");
@@ -1936,18 +2092,30 @@ function closeDetails(restoreFocus = true): void {
   if (restoreFocus) (opener.getClientRects().length ? opener : trigger.hidden ? box("conversation") : trigger).focus({ preventScroll: true });
 }
 
+function dismissDetails(): void {
+  if (!inspector.matches(":modal")) {
+    desktopInspectorOpen = false;
+    saveLayoutPreference(inspectorPreference, "closed");
+  }
+  closeDetails();
+}
+
 function syncDetailsPresentation(): void {
-  const compact = compactInspector.matches;
-  if (!inspector.open || inspector.matches(":modal") === compact || document.querySelector("dialog:modal:not(#details-dialog)")) return;
+  const trigger = btn("details-button");
+  if (compactInspector.matches) {
+    trigger.setAttribute("aria-haspopup", "dialog");
+    if (inspector.open && !inspector.matches(":modal")) closeDetails(inspector.contains(document.activeElement));
+    return;
+  }
+  trigger.removeAttribute("aria-haspopup");
+  if (!inspector.matches(":modal") || document.querySelector("dialog:modal:not(#details-dialog)")) return;
   const scroller = box("details-scroll");
   const scrollTop = scroller.scrollTop;
   const active = document.activeElement;
-  // Reopen the same node in the other native mode without invoking closeDetails.
+  // The user already opened this modal. Keep its contents when it becomes a dock.
   inspector.close();
-  if (compact) inspector.showModal();
-  else inspector.show();
-  if (active instanceof HTMLElement && (inspector.contains(active) || !compact)) active.focus({ preventScroll: true });
-  else inspector.querySelector<HTMLElement>('[aria-selected="true"]')?.focus({ preventScroll: true });
+  inspector.open = true;
+  if (active instanceof HTMLElement && inspector.contains(active)) active.focus({ preventScroll: true });
   scroller.scrollTop = scrollTop;
 }
 
@@ -1972,45 +2140,18 @@ function syncComposeOptionsLayout(): void {
   }
 }
 
-function loadDetails(view: View): void {
+function loadDetailStats(view: View): void {
   detailsRequest?.abort();
   const request = detailsRequest = new AbortController();
-  dagRequest?.abort();
-  const dag = box("runtime-dag");
-  const selectedRun = dag.querySelector<HTMLDetailsElement>(".dag-run[open]")?.dataset.dagKey;
-  const focusedRun = document.activeElement?.closest<HTMLElement>(".dag-run")?.dataset.dagKey;
-  const treeRequest = dagRequest = new AbortController();
   const live = () => !request.signal.aborted && inspector.open && view === current;
-  const path = sessionPath(view.session.id);
   const overview = box("runtime-metrics");
-  const todo = box("runtime-todo");
   const fail = (message: string) => notice(box("details-error"), message);
   if (!overview.childElementCount) overview.append(el("p", "muted", "正在读取上下文与运行详情…"));
-  const setJournal = (data?: Wire) => {
-    const next = renderJournal(data);
-    const previous = todo.querySelector("#runtime-journal");
-    if (previous) previous.replaceWith(next);
-    else todo.prepend(next);
-  };
-  const setActivity = (tasks?: Wire, dag?: Wire, snapshot?: "waiting" | Wire) => {
-    box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", tasks, snapshot));
-    const runs = box("runtime-dag");
-    runs.replaceChildren(...renderRuntimePane("dag", dag, snapshot, async key => {
-      const signal = AbortSignal.any([treeRequest.signal, AbortSignal.timeout(28_000)]);
-      return api.request(`${path}/native-runtime/dag/${key}`, undefined, signal);
-    }));
-    for (const detail of runs.querySelectorAll<HTMLDetailsElement>(".dag-run")) {
-      if (detail.dataset.dagKey === selectedRun) detail.open = true;
-      if (focusedRun && detail.dataset.dagKey === focusedRun && document.activeElement === document.body) {
-        detail.querySelector("summary")?.focus({ preventScroll: true });
-      }
-    }
-  };
-  setJournal();
-  if (!dag.childElementCount) setActivity();
   fail("");
-  const stats = api.request(`${path}/details`, undefined, request.signal).then(data => {
+  void api.request(`${sessionPath(view.session.id)}/details`, undefined, request.signal).then(data => {
     if (!live()) return;
+    view.detailData = data;
+    if (engine.online !== false) rememberGenerationSpeed(view, data.generationSpeed);
     renderDetails(data, view.state, view.options, {
       canWrite: connection === "online",
       canNavigate: connection === "online" && !view.running && !view.compacting && !sending.has(view.session.id),
@@ -2030,13 +2171,48 @@ function loadDetails(view: View): void {
         }
       },
       insertCommand: command => insertCommand(view, command),
-    });
+    }, view.generationSpeed);
     revealDetailsTarget();
   }).catch(error => {
     if (!live()) return;
     if (!overview.querySelector("section")) overview.replaceChildren();
     fail(`无法读取运行详情：${errorText(error)}`);
+  }).finally(() => {
+    if (detailsRequest === request) detailsRequest = undefined;
   });
+}
+
+function loadDetails(view: View): void {
+  loadDetailStats(view);
+  runtimeRequest?.abort();
+  const request = runtimeRequest = new AbortController();
+  dagRequest?.abort();
+  const dag = box("runtime-dag");
+  const selectedRun = dag.querySelector<HTMLDetailsElement>(".dag-run[open]")?.dataset.dagKey;
+  const focusedRun = document.activeElement?.closest<HTMLElement>(".dag-run")?.dataset.dagKey;
+  const treeRequest = dagRequest = new AbortController();
+  const live = () => !request.signal.aborted && inspector.open && view === current;
+  const path = sessionPath(view.session.id);
+  const journal = box("runtime-memory-journal");
+  const setJournal = (data?: Wire) => {
+    journal.replaceChildren(renderJournal(data));
+  };
+  const setActivity = (tasks?: Wire, dag?: Wire, snapshot?: "waiting" | Wire) => {
+    box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", tasks, snapshot));
+    const runs = box("runtime-dag");
+    runs.replaceChildren(...renderRuntimePane("dag", dag, snapshot, async key => {
+      const signal = AbortSignal.any([treeRequest.signal, AbortSignal.timeout(28_000)]);
+      return api.request(`${path}/native-runtime/dag/${key}`, undefined, signal);
+    }));
+    for (const detail of runs.querySelectorAll<HTMLDetailsElement>(".dag-run")) {
+      if (detail.dataset.dagKey === selectedRun) detail.open = true;
+      if (focusedRun && detail.dataset.dagKey === focusedRun && document.activeElement === document.body) {
+        detail.querySelector("summary")?.focus({ preventScroll: true });
+      }
+    }
+  };
+  if (!journal.childElementCount) setJournal();
+  if (!dag.childElementCount) setActivity();
   const runtime = async () => {
     let data: Wire;
     try {
@@ -2063,8 +2239,8 @@ function loadDetails(view: View): void {
       if (live()) setActivity(tasks, dag, snapshot);
     }
   };
-  void Promise.all([stats, runtime()]).then(() => {
-    if (detailsRequest === request) detailsRequest = undefined;
+  void runtime().finally(() => {
+    if (runtimeRequest === request) runtimeRequest = undefined;
   });
 }
 
@@ -2101,8 +2277,27 @@ function listen(): void {
   btn("open-navigation").addEventListener("click", () => toggleNav(true));
   btn("close-navigation").addEventListener("click", () => toggleNav(false, true));
   btn("nav-scrim").addEventListener("click", () => toggleNav(false, true));
-  mobile.addEventListener("change", () => toggleNav(false));
-  compactInspector.addEventListener("change", syncDetailsPresentation);
+  railCollapsed = readLayoutPreference(railPreference) === "true";
+  desktopInspectorOpen = readLayoutPreference(inspectorPreference) !== "closed";
+  renderRail();
+  btn("rail-toggle").addEventListener("click", () => {
+    railCollapsed = !railCollapsed;
+    saveLayoutPreference(railPreference, String(railCollapsed));
+    renderRail();
+  });
+  mobile.addEventListener("change", () => {
+    const active = document.activeElement;
+    const restore = navOpen || active === btn("open-navigation") || active === btn("rail-toggle") || box("navigation").contains(active);
+    toggleNav(false);
+    if (restore && !document.querySelector("dialog:modal")) {
+      btn(mobile.matches ? "open-navigation" : "rail-toggle").focus({ preventScroll: true });
+    }
+  });
+  syncDetailsPresentation();
+  compactInspector.addEventListener("change", () => {
+    syncDetailsPresentation();
+    if (!compactInspector.matches) dockDetailsOnReady(current, true);
+  });
   document.addEventListener("close", event => {
     if (event.target !== inspector) syncDetailsPresentation();
   }, true);
@@ -2121,7 +2316,7 @@ function listen(): void {
     else if (optionsOpen()) {
       setComposeOptions(false);
       composeOptionsButton.focus({ preventScroll: true });
-    } else if (inspector.open) closeDetails();
+    } else if (inspector.open) dismissDetails();
   });
   inp("search").addEventListener("input", () => { renderSessions(); renderCliSessions(); });
   sel("workspace-select").addEventListener("change", () => selectWorkspace(sel("workspace-select").value));
@@ -2142,9 +2337,26 @@ function listen(): void {
   btn("new-welcome").addEventListener("click", openChooser);
   btn("new-sidebar").addEventListener("click", openChooser);
   form("new-form").addEventListener("submit", event => { event.preventDefault(); void createSession(); });
-  for (const modal of [chooser, manager, commandDialog]) {
+  const pathDialog = dialog("session-path-dialog");
+  for (const modal of [chooser, manager, commandDialog, pathDialog]) {
     for (const close of modal.querySelectorAll("[data-close]")) close.addEventListener("click", () => modal.close());
   }
+  btn("session-path-trigger").addEventListener("click", () => {
+    const cwd = box("session-path").textContent;
+    if (!cwd || pathDialog.open) return;
+    box("session-path-full").textContent = cwd;
+    notice(box("session-path-status"));
+    pathDialog.showModal();
+  });
+  btn("session-path-copy").addEventListener("click", async () => {
+    const path = box("session-path-full");
+    const cwd = path.textContent;
+    if (!cwd) return;
+    let message = "已复制路径。";
+    try { await navigator.clipboard.writeText(cwd); }
+    catch { message = "无法访问剪贴板；可选中路径手动复制。"; }
+    if (pathDialog.open && path.textContent === cwd) notice(box("session-path-status"), message);
+  });
   btn("manage-button").addEventListener("click", () => {
     if (!current || manager.open) return;
     notice(box("manage-error"));
@@ -2167,8 +2379,15 @@ function listen(): void {
     }
     if (current?.session.id === view.session.id && releases.get(view.session.id) === receipt) renderView();
   });
-  btn("details-button").addEventListener("click", () => { if (inspector.open) closeDetails(); else openDetails(); });
+  btn("details-button").addEventListener("click", () => { if (inspector.open) dismissDetails(); else openDetails(); });
   btn("current-todo").addEventListener("click", () => openDetails("todo", btn("current-todo"), "todo"));
+  box("runtime-metrics").addEventListener("click", event => {
+    if (!(event.target instanceof Element) || !event.target.closest("#runtime-open-resources")) return;
+    selectDetailsView(btn("runtime-open-todo"));
+    const heading = box("runtime-resources-title");
+    heading.focus({ preventScroll: true });
+    heading.scrollIntoView({ block: "start" });
+  });
   for (const tab of detailsTabs()) tab.addEventListener("click", () => selectDetailsView(tab));
   box("runtime-shortcuts").addEventListener("keydown", event => {
     const tabs = detailsTabs();
@@ -2187,10 +2406,10 @@ function listen(): void {
     if (capabilitiesSelected()) loadCapabilities(current);
     else loadDetails(current);
   });
-  inspector.querySelector("[data-close]")?.addEventListener("click", () => closeDetails());
+  inspector.querySelector("[data-close]")?.addEventListener("click", dismissDetails);
   inspector.addEventListener("cancel", event => {
     event.preventDefault();
-    closeDetails();
+    dismissDetails();
   });
   btn("command-mode").addEventListener("click", () => {
     if (current) showCommandMode(current, !draftFor(current.session.id).commandMode);
@@ -2284,9 +2503,7 @@ function listen(): void {
   const traceMotion = matchMedia("(prefers-reduced-motion: no-preference) and (forced-colors: none)");
   let traceArrival: Animation | undefined;
   traceMotion.addEventListener("change", () => traceArrival?.cancel());
-  for (const control of Object.values(traceControls)) control.addEventListener("click", () => {
-    const target = traceTargets.get(control);
-    if (trace.hidden || !target?.isConnected) return;
+  const focusTraceTarget = (target: HTMLElement) => {
     if (target.tagName !== "SUMMARY") target.tabIndex = -1;
     target.focus({ preventScroll: true });
     target.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -2299,6 +2516,16 @@ function listen(): void {
     arrival.onfinish = arrival.oncancel = () => {
       if (traceArrival === arrival) traceArrival = undefined;
     };
+  };
+  for (const control of Object.values(traceControls)) control.addEventListener("click", () => {
+    const target = traceTargets.get(control);
+    if (!trace.hidden && target?.isConnected) focusTraceTarget(target);
+  });
+  btn("sidebar-question").addEventListener("click", () => {
+    const target = interactions.firstQuestion;
+    if (!target?.isConnected) return;
+    if (inspector.matches(":modal")) closeDetails(false);
+    focusTraceTarget(target);
   });
   modelSelect.addEventListener("change", () => {
     const view = current;

@@ -159,17 +159,37 @@ type MessageView = {
 function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, index: number) => HTMLElement | undefined, previous?: MessageView): MessageView {
   const role = roleOf(message);
   const before = previous?.role === role ? previous : undefined;
-  const node = before?.node ?? el("article", `message ${role === "user" ? "message--user" : ""}`);
+  const conversational = role === "user" || role === "assistant";
+  const node = before?.node ?? el("article", conversational ? `message message--${role}` : "message");
   const speaker = before?.speaker ?? el("span", "speaker");
   const label = role === "assistant" ? live ? "助手 · 正在生成" : "助手" : role === "user" ? "你" : role === "bashExecution" ? "命令输出" : "会话记录";
   if (speaker.textContent !== label) speaker.textContent = label;
   const body = before?.body ?? el("div", "message-body");
   const time = before?.timestamp === message.timestamp ? before?.time : timeLabel(message.timestamp);
   const header = before?.header ?? el("header");
-  if (!before) { header.append(speaker); node.append(body); }
+  if (!before) {
+    if (conversational) {
+      const ns = "http://www.w3.org/2000/svg";
+      const icon = document.createElementNS(ns, "svg");
+      const path = document.createElementNS(ns, "path");
+      icon.setAttribute("viewBox", "0 0 24 24");
+      icon.setAttribute("fill", "currentColor");
+      icon.setAttribute("aria-hidden", "true");
+      icon.setAttribute("focusable", "false");
+      path.setAttribute("fill-rule", "evenodd");
+      path.setAttribute("d", role === "user"
+        ? "M3 6 6 3h15v15l-3 3H3V6Zm9 1-1.4 1.4 2.6 2.6H7v2h6.2l-2.6 2.6L12 17l5-5-5-5Z"
+        : "M12 2 22 12 12 22 2 12 12 2Zm0 3-7 7 7 7 7-7-7-7Zm0 4 3 3-3 3-3-3 3-3Z");
+      icon.append(path);
+      const identity = el("span", "message-identity");
+      identity.append(icon, speaker);
+      header.append(identity);
+    } else header.append(speaker);
+    node.append(body);
+  }
   if (before?.time !== time) {
     before?.time?.remove();
-    if (time) speaker.after(time);
+    if (time) header.append(time);
   }
   const rendered = parts(message.content).map((entry, index): PartView => {
     const part = object(entry);

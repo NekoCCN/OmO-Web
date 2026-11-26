@@ -12,27 +12,24 @@
 </head>
 <body>
   <a class="button skip-link" id="skip-link" href="#conversation">跳至对话</a>
-  <div class="workspace">
+  <div class="workspace" id="workspace-shell">
     <aside class="sidebar" id="navigation" aria-labelledby="brand">
       <div class="sidebar-head stack">
         <div class="row row--between">
           <div class="brand" id="brand">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <rect x="3" y="4" width="18" height="16" rx="3" stroke="none"/>
-              <path d="m7 9 3 3-3 3"/><path class="brand-cursor" d="M13 15h4"/>
-            </svg>
+            <svg class="brand-mark" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-terminal"/></svg>
             <span>OmO Web</span>
           </div>
           <button type="button" class="button button--quiet mobile-only" id="close-navigation">关闭</button>
         </div>
         <div class="workspace-tools">
           <button type="button" class="button" id="new-sidebar" disabled>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#new-session"/></svg>
             新会话
           </button>
           <label class="field" id="workspace-field" hidden><span class="sr-only">工作区</span><select id="workspace-select"></select></label>
           <button type="button" class="button" id="workspace-browser-button" aria-label="浏览工作区" title="浏览工作区" aria-haspopup="dialog" aria-controls="workspace-browser-dialog" hidden>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h5l2 2h7a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span aria-hidden="true">浏览</span>
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#browse"/></svg><span aria-hidden="true">浏览</span>
           </button>
         </div>
         <label class="field"><span class="sr-only">搜索会话</span><input id="search" type="search" placeholder="搜索会话或目录" autocomplete="off"></label>
@@ -41,9 +38,15 @@
           <button type="button" class="button button--quiet" id="archived" aria-pressed="false">已归档</button>
         </div>
         <div class="cli-launchers" role="group" aria-label="CLI 会话">
-          <button type="button" class="button button--quiet" id="cli-live-button" aria-haspopup="dialog">CLI 实时</button>
-          <button type="button" class="button button--quiet" id="cli-history-button" aria-haspopup="dialog">CLI 历史</button>
-          <button type="button" class="button button--quiet" id="cli-follow-button" aria-controls="cli-follow-view" aria-pressed="false">跟随 CLI</button>
+          <button type="button" class="button button--quiet" id="cli-live-button" aria-haspopup="dialog">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#live"/></svg><span>CLI 实时</span>
+          </button>
+          <button type="button" class="button button--quiet" id="cli-history-button" aria-haspopup="dialog">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#history"/></svg><span>CLI 历史</span>
+          </button>
+          <button type="button" class="button button--quiet" id="cli-follow-button" aria-controls="cli-follow-view" aria-pressed="false">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#follow"/></svg><span>跟随 CLI</span>
+          </button>
         </div>
       </div>
       <div class="session-rail">
@@ -63,22 +66,28 @@
       <header class="workspace-head">
         <div class="workspace-head-inner">
           <button type="button" class="button button--quiet mobile-only" id="open-navigation" aria-controls="navigation" aria-expanded="false" title="会话导航">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M9 5v14"/></svg><span class="sr-only">会话导航</span>
+            <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-navigation"/></svg><span class="sr-only">会话导航</span>
           </button>
           <div class="session-heading">
             <h1 id="session-title">会话工作台</h1>
             <p id="session-path" class="path small muted" hidden></p>
+            <p id="session-path-short" class="path small" aria-hidden="true" hidden></p>
+            <button type="button" id="session-path-trigger" aria-label="查看完整工作目录" aria-describedby="session-path"
+              aria-haspopup="dialog" aria-controls="session-path-dialog" hidden></button>
           </div>
           <div class="row workspace-actions">
+            <button type="button" class="button button--quiet" id="rail-toggle" aria-controls="navigation" aria-expanded="true" aria-label="收起会话导航" title="收起会话导航">
+              <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-navigation"/></svg>
+            </button>
             <button type="button" class="button" id="cli-follow-stop" hidden>退出跟随</button>
-            <button type="button" class="button button--quiet" id="details-button" aria-haspopup="dialog" aria-controls="details-dialog" aria-expanded="false" title="运行详情" hidden>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14m3-10h2m-2 4h2"/></svg><span class="action-label">运行详情</span>
+            <button type="button" class="button" id="details-button" aria-haspopup="dialog" aria-controls="details-dialog" aria-expanded="false" title="会话侧栏 · 运行详情" hidden>
+              <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-panel"/></svg><span class="action-label">会话侧栏</span>
             </button>
             <button type="button" class="button button--quiet" id="web-branch-button" aria-haspopup="dialog" title="分支 / 复制" hidden>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M7 15V9m10 0a6 6 0 0 1-6 6H7"/><circle cx="7" cy="6" r="2.5"/><circle cx="7" cy="18" r="2.5"/><circle cx="17" cy="6" r="2.5"/></svg><span class="action-label">分支 / 复制</span>
+              <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#fork"/></svg><span class="action-label">分支 / 复制</span>
             </button>
             <button type="button" class="button button--quiet" id="manage-button" aria-haspopup="dialog" title="会话管理" hidden>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M4 7h7m4 0h5M4 17h3m4 0h9"/><circle cx="13" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg><span class="action-label">会话管理</span>
+              <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#manage"/></svg><span class="action-label">会话管理</span>
             </button>
           </div>
         </div>
@@ -103,7 +112,9 @@
           <section id="welcome" class="welcome stack">
             <h2>在本机开始一段会话</h2>
             <p class="muted" id="welcome-copy">选择工作目录后开始新会话，或从会话列表继续此前的工作。</p>
-            <div><button type="button" class="button button--primary" id="new-welcome" disabled>新会话</button></div>
+            <div><button type="button" class="button button--primary" id="new-welcome" disabled>
+              <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#new-session"/></svg><span>新会话</span>
+            </button></div>
           </section>
           <section id="inactive-session" class="welcome stack" hidden>
             <h2 id="inactive-title">继续此会话</h2>
@@ -156,18 +167,18 @@
               </div>
               <label class="approval-control"><span class="sr-only">审批</span><select id="approval" title="审批模式：询问 / 自动 / 无审批" disabled><option>审批</option></select></label>
               <button class="button button--quiet" id="attach" type="button" title="添加图片">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M20 11.2 11.4 20a5 5 0 0 1-7.1-7.1l9-9a3.5 3.5 0 0 1 5 5l-8.8 8.8a2 2 0 1 1-2.8-2.8l7.6-7.6"/></svg><span class="sr-only">添加图片</span>
+                <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#attach"/></svg><span class="sr-only">添加图片</span>
               </button>
               <input id="files" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
               <div class="row compose-submit">
                 <button type="button" class="button button--primary" id="stop" title="停止" hidden>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg><span>停止</span>
+                  <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#stop"/></svg><span>停止</span>
                 </button>
                 <button type="submit" class="button button--primary" id="send" title="发送" disabled>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5m-6 6 6-6 6 6"/></svg><span id="send-label">发送</span>
+                  <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#send"/></svg><span id="send-label">发送</span>
                 </button>
                 <button type="submit" class="button button--primary" id="send-command" title="执行命令" hidden disabled>
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 7 5 5-5 5m8 0h6"/></svg><span>执行命令</span>
+                  <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-code"/></svg><span>执行命令</span>
                 </button>
               </div>
             </div>
@@ -192,22 +203,56 @@
       <header class="row row--between details-toolbar">
         <h2 id="details-title">运行详情</h2>
         <div class="row">
-          <button type="button" class="button button--quiet" id="details-refresh">刷新</button>
-          <button type="button" class="button button--quiet" data-close>关闭</button>
+          <button type="button" class="button button--quiet" id="details-refresh">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#refresh"/></svg><span>刷新</span>
+          </button>
+          <button type="button" class="button button--quiet" data-close>
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#close"/></svg><span>关闭</span>
+          </button>
         </div>
+        <button type="button" class="button small" id="sidebar-question" aria-controls="interactions" hidden></button>
       </header>
       <div id="runtime-shortcuts" class="runtime-index" role="tablist" aria-label="会话运行视图">
-        <button type="button" class="button button--quiet" id="runtime-open-overview" role="tab" aria-selected="true" aria-controls="runtime-metrics">概览</button>
-        <button type="button" class="button button--quiet" id="runtime-open-subagents" role="tab" aria-selected="false" aria-controls="runtime-subagent" tabindex="-1">子代理</button>
-        <button type="button" class="button button--quiet" id="runtime-open-dag" role="tab" aria-selected="false" aria-controls="runtime-dag" tabindex="-1">DAG</button>
-        <button type="button" class="button button--quiet" id="runtime-open-todo" role="tab" aria-selected="false" aria-controls="runtime-todo" tabindex="-1">待办</button>
-        <button type="button" class="button button--quiet" id="runtime-open-capabilities" role="tab" aria-selected="false" aria-controls="runtime-capabilities" tabindex="-1">能力</button>
+        <button type="button" class="button button--quiet" id="runtime-open-overview" role="tab" aria-selected="true" aria-controls="runtime-metrics">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#overview"/></svg><span>概览</span>
+        </button>
+        <button type="button" class="button button--quiet" id="runtime-open-subagents" role="tab" aria-selected="false" aria-controls="runtime-subagent" tabindex="-1">
+          <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#agents"/></svg><span>子代理</span>
+        </button>
+        <button type="button" class="button button--quiet" id="runtime-open-dag" role="tab" aria-selected="false" aria-controls="runtime-dag" tabindex="-1">
+          <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-dag"/></svg><span>DAG</span>
+        </button>
+        <button type="button" class="button button--quiet" id="runtime-open-todo" role="tab" aria-selected="false" aria-controls="runtime-todo" tabindex="-1">
+          <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-todo"/></svg><span>待办</span>
+        </button>
+        <button type="button" class="button button--quiet" id="runtime-open-capabilities" role="tab" aria-selected="false" aria-controls="runtime-capabilities" tabindex="-1">
+          <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-tools"/></svg><span>能力</span>
+        </button>
       </div>
       <div id="details-scroll" class="details-scroll">
         <p id="details-error" class="notice error small" role="alert" hidden></p>
         <div id="details-body">
           <div id="runtime-metrics" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-overview" tabindex="0"></div>
-          <div id="runtime-todo" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-todo" tabindex="0" hidden></div>
+          <div id="runtime-todo" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-todo" tabindex="0" hidden>
+            <section id="runtime-resources" class="runtime-panel stack runtime-resources" aria-labelledby="runtime-resources-title">
+              <h3 id="runtime-resources-title" tabindex="-1">资料</h3>
+              <section id="runtime-memory" class="subpanel stack stack--tight" aria-label="记忆">
+                <div id="runtime-memory-journal"></div>
+                <details id="runtime-memory-branch" class="metric-breakdown">
+                  <summary>当前分支的长期记忆</summary>
+                  <div id="runtime-memory-branch-content" class="fold-body stack stack--tight"></div>
+                </details>
+              </section>
+              <details id="runtime-instructions" class="subpanel metric-breakdown">
+                <summary>项目规则 · AGENTS.md</summary>
+                <div class="fold-body stack stack--tight">
+                  <p class="small muted">仅当前工作目录的原文件，不含上级、全局或动态注入的规则。</p>
+                  <p id="runtime-instructions-status" class="small muted" role="status"></p>
+                  <pre id="runtime-instructions-text" tabindex="0" aria-label="AGENTS.md 原文" hidden></pre>
+                </div>
+              </details>
+            </section>
+          </div>
         </div>
         <div id="details-native-activity">
           <div id="runtime-subagent" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-subagents" tabindex="0" hidden></div>
@@ -371,6 +416,7 @@
           <dt>Ctrl / ⌘ + Enter</dt><dd>发送消息或执行已填写的命令</dd>
           <dt>/ 或 $</dt><dd>在空输入框中打开命令或技能候选</dd>
           <dt>↑ / ↓</dt><dd>在命令候选中移动</dd>
+          <dt>PageUp / PageDown</dt><dd>按可见范围翻页浏览命令</dd>
           <dt>← / →</dt><dd>在运行详情页签中移动</dd>
           <dt>Enter / Tab</dt><dd>将高亮候选填入草稿，不执行</dd>
           <dt>Escape</dt><dd>关闭候选或当前面板</dd>
@@ -402,6 +448,17 @@
           <button type="button" class="button button--quiet" id="branch-refresh">刷新选项</button>
         </div>
       </form>
+    </div>
+  </dialog>
+  <dialog id="session-path-dialog" aria-labelledby="session-path-title">
+    <div class="stack">
+      <header class="row row--between">
+        <h2 id="session-path-title">工作目录</h2>
+        <button type="button" class="button button--quiet" data-close autofocus>关闭</button>
+      </header>
+      <p id="session-path-full" class="workspace-full-path path notice" dir="ltr"></p>
+      <footer class="row"><button type="button" id="session-path-copy" class="button button--primary">复制路径</button></footer>
+      <p id="session-path-status" class="small muted" role="status" hidden></p>
     </div>
   </dialog>
   <noscript>此工作台需要 JavaScript 才能连接本机会话服务。</noscript>

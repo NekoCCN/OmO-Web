@@ -118,8 +118,9 @@ function page(view: Bun.WebView, width: number) {
     async check(name: string) {
       expect(await view.evaluate("innerWidth")).toBe(width);
       expect(await view.evaluate(`(() => {
-        const modal = document.querySelector("dialog[open]");
-        return [document.documentElement.scrollWidth - innerWidth, modal ? modal.scrollWidth - modal.clientWidth : 0];
+        const openDialogs = [...document.querySelectorAll("dialog[open]")];
+        return [document.documentElement.scrollWidth - innerWidth,
+          Math.max(0, ...openDialogs.map(dialog => dialog.scrollWidth - dialog.clientWidth))];
       })()`)).toEqual([0, 0]);
       if (!evidence) return;
       await mkdir(evidence, { recursive: true });
@@ -199,9 +200,10 @@ for (const width of [1440, 390]) {
         await p.visible(`#session-list button[data-session="${bookmarkId}"] small`, "已释放");
         expect(await view.evaluate(`({
           title: document.querySelector("#session-title").textContent,
-          modal: [...document.querySelectorAll("dialog[open]")].map(item => item.id),
+          modals: [...document.querySelectorAll("dialog:modal")].map(item => item.id),
+          docked: document.querySelector("#details-dialog").matches("[open]:not(:modal)"),
           receiptHidden: document.querySelector("#handoff-receipt").hidden,
-        })`)).toEqual({ title: other.name, modal: ["cli-live-dialog"], receiptHidden: true });
+        })`)).toEqual({ title: other.name, modals: ["cli-live-dialog"], docked: true, receiptHidden: true });
         await p.click("#cli-live-close");
         await p.select(bookmarkId);
       } else {

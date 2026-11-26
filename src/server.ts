@@ -32,6 +32,7 @@ const assets: Readonly<Record<string, string>> = {
   "/workbench.css": "../public/workbench.css",
   "/app.js": "../dist/app.js",
   "/favicon.svg": "../public/favicon.svg",
+  "/icons.svg": "../public/icons.svg",
 };
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_STREAM_CLIENTS = 16;
