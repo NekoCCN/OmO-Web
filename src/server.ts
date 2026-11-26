@@ -31,6 +31,7 @@ const assets: Readonly<Record<string, string>> = {
   "/styles.css": "../public/styles.css",
   "/workbench.css": "../public/workbench.css",
   "/tool-ledger.css": "../public/tool-ledger.css",
+  "/dag-graph.css": "../public/dag-graph.css",
   "/app.js": "../dist/app.js",
   "/favicon.svg": "../public/favicon.svg",
   "/icons.svg": "../public/icons.svg",

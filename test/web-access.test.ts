@@ -31,6 +31,9 @@ test.if(supportsPasswordFiles)("password-protected loopback challenges before se
   for (const [path, authorization, method] of [
     ["/", "", "GET"],
     ["/styles.css", "Basic @@@", "GET"],
+    ["/icons.svg", "", "GET"],
+    ["/tool-ledger.css", "", "GET"],
+    ["/dag-graph.css", "", "GET"],
     ["/api/bootstrap", `Basic ${Buffer.from(`other:${password}`).toString("base64")}`, "GET"],
     ["/api/events", `Basic ${Buffer.from(`omo:${"x".repeat(password.length)}`).toString("base64")}`, "GET"],
     ["/api/sessions", "", "POST"],
@@ -56,6 +59,16 @@ test.if(supportsPasswordFiles)("authenticated loopback retains root, bootstrap, 
   const page = await request("/");
   expect(page.status).toBe(200);
   expect(await page.text()).toContain("<!doctype html>");
+  const icons = await request("/icons.svg");
+  expect(icons.status).toBe(200);
+  expect(icons.headers.get("content-type")).toMatch(/^image\/svg\+xml/);
+  await icons.body?.cancel();
+  for (const path of ["/tool-ledger.css", "/dag-graph.css"]) {
+    const styles = await request(path);
+    expect(styles.status).toBe(200);
+    expect(styles.headers.get("content-type")).toMatch(/^text\/css/);
+    await styles.body?.cancel();
+  }
   const bootstrap = await request("/api/bootstrap");
   const { token } = z.object({ token: z.string(), engine: z.object({ online: z.literal(true) }) }).parse(await bootstrap.json());
   const post = (headers: Record<string, string>) => request("/api/sessions", {

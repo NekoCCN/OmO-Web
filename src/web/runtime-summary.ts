@@ -1,6 +1,7 @@
 import { el, list, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { knownActivityState, timeText } from "./native-activity.ts";
+import { MAX_DAG_NODES, renderDagGraph } from "./dag-graph.ts";
 
 const unavailable = new Map([
   ["inactive", "会话尚未接入，或正在交接。"],
@@ -36,29 +37,30 @@ export function canShowSnapshot(data: Wire): boolean {
 
 const dagKey = /^[a-f0-9]{64}$/u;
 
-function dagWaves(data: Wire): HTMLElement {
+function dagWaves(data: Wire, verified = false): HTMLElement {
   const content = el("div", "dag-readout stack stack--tight");
   if (data.status !== "ok") {
     content.append(el("p", "small muted", data.status === "not_found"
       ? "该运行不在当前列表中，请刷新。" : message(data)));
     return content;
   }
-  const nodes = new Map(list(data.nodes).map(object).flatMap(node => {
+  const nodes = new Map(list(data.nodes).slice(0, MAX_DAG_NODES).map(object).flatMap(node => {
     const id = count(node.id);
     return id === undefined ? [] : [[id, node] as const];
   }));
-  for (const raw of list(data.waves)) {
+  for (const raw of list(data.waves).slice(0, MAX_DAG_NODES)) {
     const wave = object(raw);
     const index = count(wave.index);
     if (index === undefined) continue;
     const section = el("section", "dag-wave stack stack--tight");
     const items = el("ol", "inline-list numerical");
-    for (const value of list(wave.nodes)) {
+    for (const value of list(wave.nodes).slice(0, MAX_DAG_NODES)) {
       const id = count(value);
       const node = id === undefined ? undefined : nodes.get(id);
       if (id === undefined || !node) continue;
-      const upstream = list(node.upstream).map(count).filter(value => value !== undefined);
-      const route = str(node.agent) || str(node.category);
+      nodes.delete(id);
+      const upstream = verified ? list(node.upstream).map(count).filter(value => value !== undefined) : [];
+      const route = verified ? str(node.agent) || str(node.category) : "";
       const state = knownActivityState(str(node.state)) ?? "状态未知";
       const attempt = count(node.attempt);
       const line = el("li", "stack stack--tight");
@@ -72,6 +74,19 @@ function dagWaves(data: Wire): HTMLElement {
     }
   }
   if (!content.childElementCount) content.append(el("p", "small muted", "运行未提供可显示的波次。"));
+  return content;
+}
+
+function dagView(data: Wire): HTMLElement {
+  if (data.status !== "ok") return dagWaves(data);
+  const graph = renderDagGraph(data);
+  const content = el("div", "dag-graph-view stack stack--tight");
+  if (graph) content.append(graph);
+  else content.append(el("p", "small muted", "无法验证完整拓扑；仅显示可识别的节点，不显示依赖连线。"));
+  const text = el("details", "dag-graph-text");
+  text.open = !graph;
+  text.append(el("summary", "small", "文字列表 · 波次与依赖"), dagWaves(data, !!graph));
+  content.append(text);
   return content;
 }
 
@@ -105,7 +120,7 @@ function rows(kind: Pane, data: readonly Wire[], persisted: boolean, readDag?: R
         reading = true;
         body.replaceChildren(loading);
         void readDag(key).then(data => {
-          if (details.isConnected) body.replaceChildren(dagWaves(data));
+          if (details.isConnected) body.replaceChildren(dagView(data));
           loaded = data.status === "ok";
         }, (error: unknown) => {
           if (error instanceof DOMException && error.name === "AbortError") return;

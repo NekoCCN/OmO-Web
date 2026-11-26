@@ -22,6 +22,7 @@ async function workbench(width: number, height: number, run: (browser: Bun.WebVi
       "/styles.css": () => new Response(Bun.file("public/styles.css")),
       "/workbench.css": () => new Response(Bun.file("public/workbench.css")),
       "/tool-ledger.css": () => new Response(Bun.file("public/tool-ledger.css")),
+      "/dag-graph.css": () => new Response(Bun.file("public/dag-graph.css")),
       "/icons.svg": () => new Response(Bun.file("public/icons.svg")),
       "/app.js": () => new Response(script),
       "/api/bootstrap": Response.json({ sessions: [session], workspaces: [session.cwd], engine: { online: true }, token: "fixture" }),
@@ -593,6 +594,9 @@ browserTest("slash DAG opens a read-only wave view and never sends a model promp
     await browser.click("#send-command");
     await visible(browser, "#runtime-dag .dag-run > summary");
     await browser.click("#runtime-dag .dag-run > summary");
+    await visible(browser, "#runtime-dag .dag-graph-map");
+    expect(await browser.evaluate(`getComputedStyle(document.querySelector(".dag-graph-map")).overflowX`)).toBe("auto");
+    await browser.click("#runtime-dag .dag-graph-text > summary");
     await visible(browser, "#runtime-dag .dag-wave li");
     expect(await browser.evaluate<string[]>(`[...document.querySelectorAll(".dag-wave li")].map(node => node.textContent)`))
       .toEqual([expect.stringContaining("节点 1"), expect.stringContaining("依赖：节点 1")]);

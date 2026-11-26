@@ -1,0 +1,80 @@
+.dag-graph-view,
+.dag-graph-map {
+  min-inline-size: 0;
+}
+
+.dag-graph-map {
+  max-block-size: 20rem;
+  overflow: auto;
+  overscroll-behavior-inline: contain;
+  border: var(--stroke) solid var(--line);
+  border-radius: var(--r1);
+  background: var(--page);
+}
+
+.dag-graph-map:focus-visible {
+  outline: var(--focus) solid var(--accent);
+  outline-offset: calc(-1 * var(--focus));
+}
+
+.dag-graph-canvas {
+  position: relative;
+  margin-inline: auto;
+}
+
+.dag-graph-edges {
+  position: absolute;
+  inset: 0;
+  inline-size: 100%;
+  block-size: 100%;
+  pointer-events: none;
+}
+
+.dag-graph-edges > path {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.15;
+  stroke-linejoin: round;
+}
+
+.dag-graph-edges marker path { fill: var(--muted); }
+
+.dag-graph-wave,
+.dag-graph-node {
+  position: absolute;
+}
+
+.dag-graph-wave {
+  left: .75rem;
+  background: var(--page);
+  color: var(--muted);
+  font-size: .75rem;
+  line-height: 1.2;
+}
+
+.dag-graph-node {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: .125rem;
+  border: var(--stroke) solid var(--line);
+  border-radius: var(--r1);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: .8125rem;
+  line-height: 1.18;
+}
+
+.dag-graph-node span { color: var(--muted); }
+.dag-graph-node[data-state="running"] { border-color: var(--accent); }
+.dag-graph-node[data-state="failed"] { border-color: var(--error); }
+.dag-graph-node:is([data-state="skipped"], [data-state="cancelled"]) { border-style: dashed; }
+.dag-graph-text > summary { cursor: pointer; }
+.dag-graph-text:not([open]) > .dag-readout { display: none; }
+.dag-graph-text > .dag-readout { margin-block-start: var(--s2); }
+
+@media (forced-colors: active) {
+  .dag-graph-edges > path { stroke: CanvasText; }
+  .dag-graph-edges marker path { fill: CanvasText; }
+  .dag-graph-map:focus-visible { outline-color: Highlight; }
+}
