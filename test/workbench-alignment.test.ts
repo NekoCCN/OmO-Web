@@ -328,6 +328,26 @@ browserTest("inline slash and skill discovery fills the active draft without sub
   });
 });
 
+browserTest("command picker browses real results by keyboard and inserts without sending", async () => {
+  await workbench(320, 480, async (browser, actions) => {
+    await browser.click("#command-mode");
+    await browser.click("#command-picker");
+    await visible(browser, "#command-list button[data-invocation]");
+    const row = () => browser.evaluate<string>("document.activeElement.dataset.invocation");
+    const invocations = await browser.evaluate<string[]>(`Array.from(
+      document.querySelectorAll("#command-list button"), button => button.dataset.invocation)`);
+    await browser.press("PageDown");
+    expect(await row()).toBe(invocations[0]);
+    await browser.press("ArrowDown");
+    expect(await row()).toBe(invocations[1]);
+    await browser.press("Enter");
+    expect(await browser.evaluate(`[
+      document.querySelector("#command-dialog").open, document.activeElement.id, document.querySelector("#prompt").value
+    ]`)).toEqual([false, "prompt", `${invocations[1]} `]);
+    expect(actions).toEqual([]);
+  });
+});
+
 browserTest("the current Todo opens its list in one tap and restores focus without dropping the draft", async () => {
   await workbench(320, 640, async (browser, actions) => {
     await browser.evaluate(`(() => {

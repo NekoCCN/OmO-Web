@@ -16,6 +16,7 @@ import { workspaceBrowser, workspacePaths } from "./workspace-browser.ts";
 import { opensReadOnlyView, parseBuiltinInput } from "./builtin-commands.ts";
 import type { BuiltinCommand } from "./builtin-commands.ts";
 import { commandCatalog, commandToken, inlineCommandCompletion } from "./command-completion.ts";
+import { bindCommandListKeys } from "./command-list-keys.ts";
 import { projectCacheRates, projectContextUsage } from "../runtime-metrics.ts";
 
 const box = (id: string) => byId(id, HTMLElement);
@@ -2195,6 +2196,7 @@ function listen(): void {
     if (current) showCommandMode(current, !draftFor(current.session.id).commandMode);
   });
   btn("command-picker").addEventListener("click", () => { if (current) void openCommandPicker(current); });
+  bindCommandListKeys(commandDialog, inp("command-search"), box("command-list"));
   commandDialog.addEventListener("close", () => { if (!commandDialog.open) commandRequest?.abort(); });
   inp("command-search").addEventListener("input", () => {
     if (current && !commandRequest && box("command-error").hidden) renderCommandOptions(current);

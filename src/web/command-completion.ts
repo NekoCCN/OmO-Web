@@ -1,4 +1,5 @@
 import { BUILTIN_COMMANDS, parseBuiltinInput } from "./builtin-commands.ts";
+import { commandListIndex, isPlainCommandKey, scrollCommandRow } from "./command-list-keys.ts";
 import { el, list, object, str } from "./dom.ts";
 
 export const commandToken = /^(?:\/(?:[A-Za-z0-9_-]{1,64}|skill:[A-Za-z0-9-]{1,64})|\$[A-Za-z0-9-]{1,64})$/;
@@ -68,9 +69,8 @@ export function inlineCommandCompletion(input: HTMLTextAreaElement, popup: HTMLE
           matches.set(invocation, { invocation, description: str(command.description) });
         }
       }
-      const ordered = [...matches.values()].sort((a, b) =>
+      const next = [...matches.values()].sort((a, b) =>
         Number(b.invocation === query) - Number(a.invocation === query) || a.invocation.localeCompare(b.invocation));
-      const next = ordered.slice(0, 7);
       if (!next.length) { close(); return; }
       if (next.length === choices.length && next.every((item, index) =>
         item.invocation === choices[index]?.invocation && item.description === choices[index]?.description)) return;
@@ -86,25 +86,27 @@ export function inlineCommandCompletion(input: HTMLTextAreaElement, popup: HTMLE
         return row;
       }));
       popup.hidden = false;
+      popup.scrollTop = 0;
     },
     key(event: KeyboardEvent): boolean {
-      if (composing || event.isComposing || popup.hidden || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return false;
+      if (composing || popup.hidden || !isPlainCommandKey(event)) return false;
       switch (event.key) {
         case "Escape":
           dismissed = input.value;
           close();
           break;
         case "ArrowDown":
-        case "ArrowUp": {
-          const length = choices.length;
-          active = (active < 0 && event.key === "ArrowUp" ? length - 1 :
-            (active + (event.key === "ArrowDown" ? 1 : -1) + length) % length);
-          for (const [i, row] of Array.from(popup.children).entries()) row.setAttribute("aria-selected", String(i === active));
+        case "ArrowUp":
+        case "PageDown":
+        case "PageUp": {
+          const next = commandListIndex(event.key, active, popup.children, popup);
+          if (next === undefined) return false;
+          popup.children[active]?.setAttribute("aria-selected", "false");
+          active = next;
           const current = popup.children[active];
-          if (current) {
-            input.setAttribute("aria-activedescendant", current.id);
-            current.scrollIntoView({ block: "nearest" });
-          }
+          current.setAttribute("aria-selected", "true");
+          input.setAttribute("aria-activedescendant", current.id);
+          scrollCommandRow(popup, current);
           break;
         }
         case "Enter":

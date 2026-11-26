@@ -1,5 +1,6 @@
 import { el, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { commandListIndex, isPlainCommandKey, scrollCommandRow } from "./command-list-keys.ts";
 
 type Row = { readonly name: string; readonly detail: string };
 type Section =
@@ -57,13 +58,28 @@ function group(title: string, explanation: string, section: Section): HTMLElemen
   if (explanation) group.append(el("p", "small muted", explanation));
   if (section.rows.length) {
     const list = el("dl", "capability-list small numerical");
+    list.tabIndex = 0;
+    list.setAttribute("aria-label", `${title} · 只读列表`);
     for (const row of section.rows) {
       const item = el("div");
+      item.tabIndex = -1;
       const name = el("dt");
       name.append(el("code", "", row.name));
       item.append(name, el("dd", "muted", row.detail));
       list.append(item);
     }
+    list.addEventListener("keydown", event => {
+      if (!isPlainCommandKey(event)) return;
+      const viewport = list.closest<HTMLElement>(".details-scroll");
+      if (!viewport) return;
+      const items = Array.from(list.children) as HTMLElement[];
+      const index = items.findIndex(item => item === event.target);
+      const next = commandListIndex(event.key, index, items, viewport);
+      if (next === undefined) return;
+      event.preventDefault();
+      items[next].focus({ preventScroll: true });
+      scrollCommandRow(viewport, items[next]);
+    });
     group.append(list);
   }
   if (section.incomplete) {
