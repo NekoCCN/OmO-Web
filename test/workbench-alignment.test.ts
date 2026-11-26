@@ -21,6 +21,7 @@ async function workbench(width: number, height: number, run: (browser: Bun.WebVi
       "/": () => new Response(Bun.file("public/index.html")),
       "/styles.css": () => new Response(Bun.file("public/styles.css")),
       "/workbench.css": () => new Response(Bun.file("public/workbench.css")),
+      "/tool-ledger.css": () => new Response(Bun.file("public/tool-ledger.css")),
       "/icons.svg": () => new Response(Bun.file("public/icons.svg")),
       "/app.js": () => new Response(script),
       "/api/bootstrap": Response.json({ sessions: [session], workspaces: [session.cwd], engine: { online: true }, token: "fixture" }),

@@ -30,6 +30,7 @@ const assets: Readonly<Record<string, string>> = {
   "/": "../public/index.html",
   "/styles.css": "../public/styles.css",
   "/workbench.css": "../public/workbench.css",
+  "/tool-ledger.css": "../public/tool-ledger.css",
   "/app.js": "../dist/app.js",
   "/favicon.svg": "../public/favicon.svg",
   "/icons.svg": "../public/icons.svg",
