@@ -1,8 +1,9 @@
-import { button, el, errorText, field, list, notice, object, option, str } from "./dom.ts";
+import { button, el, errorText, field, list, notice, num, object, option, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 
 type QuestionAnswer = { readonly selected: readonly string[]; readonly text?: string };
-export type Answer = { readonly value: string } | { readonly confirmed: boolean } | { readonly cancelled: true } | { readonly answers: Readonly<Record<string, QuestionAnswer>> };
+export type Answer = { readonly value: string } | { readonly confirmed: boolean } | { readonly cancelled: true } |
+  { readonly answers: Readonly<Record<string, QuestionAnswer>>; readonly comment?: string };
 type Submit = (id: string, answer: Answer) => Promise<void>;
 const supported = new Set(["select", "confirm", "input", "editor", "question"]);
 export const requestId = (request: Wire): string => str(request.id) || str(request.requestId);
@@ -35,6 +36,7 @@ function questionFields(body: HTMLElement, request: Wire): () => Answer | undefi
     }
     const custom = el("input");
     custom.type = "text";
+    custom.maxLength = 12000;
     custom.autocomplete = "off";
     block.append(field("自填回答（选填）", custom));
     body.append(block);
@@ -44,13 +46,37 @@ function questionFields(body: HTMLElement, request: Wire): () => Answer | undefi
       return selected.length || text ? [id, { selected, ...(text ? { text } : {}) }] : undefined;
     });
   }
+  const comment = el("textarea");
+  comment.rows = 2;
+  comment.maxLength = 12000;
+  body.append(field("补充说明（选填）", comment));
+  body.append(el("p", "small muted", "可以只回答部分问题，或仅提交补充说明；至少填写一项。"));
   return () => {
     const pairs = inputs.flatMap(read => {
       const answer = read();
       return answer ? [answer] : [];
     });
-    return pairs.length ? { answers: Object.fromEntries(pairs) } : undefined;
+    const extra = comment.value.trim();
+    return pairs.length || extra ? { answers: Object.fromEntries(pairs), ...(extra ? { comment: extra } : {}) } : undefined;
   };
+}
+
+function updateQuestionMetadata(node: HTMLFormElement, request: Wire): void {
+  const metadata = node.querySelector<HTMLElement>("[data-question-metadata]");
+  if (!metadata) return;
+  const parts: string[] = [];
+  if (request.waitForAnswer === true) parts.push("等待回答");
+  else if (request.waitForAnswer === false) parts.push("异步提问");
+  if (str(request.raisedBy)) parts.push(`提问人：${str(request.raisedBy)}`);
+  const remaining = num(request.remainingMs);
+  if (remaining !== undefined) parts.push(`更新时剩余 ${Math.ceil(Math.max(0, remaining) / 1000)} 秒`);
+  const deadline = num(request.deadlineAtMs);
+  if (deadline !== undefined) {
+    const date = new Date(deadline);
+    if (!Number.isNaN(date.getTime())) parts.push(`截止：${date.toLocaleString()}`);
+  }
+  metadata.textContent = parts.join(" · ");
+  metadata.hidden = parts.length === 0;
 }
 
 const permissionOptions: Readonly<Record<string, string>> = {
@@ -65,10 +91,16 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   const node = el("form", "request-form");
   const label = method === "question" ? "待回答问题" : permission ? "工具批准" : "等待你的决定";
   node.setAttribute("aria-label", label);
-  const heading = el(title ? "p" : "h2", "request-kind", label);
+  node.dataset.method = method;
+  const heading = el(title ? "p" : "h2", "request-kind", method === "question" ? "Agent 提问" : label);
   const copy = el("div", "request-copy");
   if (title) copy.append(el("h2", "plain request-title", title));
   if (str(request.message)) copy.append(el("p", "plain", str(request.message)));
+  if (method === "question") {
+    const metadata = el("p", "small muted");
+    metadata.dataset.questionMetadata = "";
+    copy.append(metadata);
+  }
   const remote = object(request.remoteOrigin);
   const origin = str(remote.deviceName) || str(remote.deviceId);
   if (origin) copy.append(el("p", "small muted break", `请求设备：${origin}`));
@@ -151,6 +183,7 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   const body = el("div", "request-body");
   body.append(copy, controls, status);
   node.append(heading, body);
+  if (method === "question") updateQuestionMetadata(node, request);
   return node;
 }
 
@@ -161,6 +194,10 @@ export class Interactions {
 
   get first(): HTMLFormElement | undefined {
     return this.nodes.values().next().value;
+  }
+
+  get firstQuestion(): HTMLFormElement | undefined {
+    return [...this.nodes.values()].find(node => node.dataset.method === "question");
   }
 
   render(requests: ReadonlyMap<string, Wire>, online: boolean, submit: Submit): void {
@@ -175,6 +212,7 @@ export class Interactions {
         this.nodes.set(id, node);
         this.root.append(node);
       }
+      if (request.method === "question") updateQuestionMetadata(node, request);
       node.dataset.offline = String(!online);
       if (node.getAttribute("aria-busy") !== "true") {
         for (const control of node.querySelectorAll("button")) control.disabled = !online;

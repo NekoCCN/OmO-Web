@@ -262,7 +262,7 @@ export async function startApp(settings: AppSettings) {
       }
       const dag = /^\/api\/sessions\/([a-z0-9-]+)\/native-runtime\/dag\/([a-f0-9]{64})$/u.exec(pathname);
       if (request.method === "GET" && dag?.[2]) return json(await sessions.nativeDag(sessionKey.parse(dag[1]), dag[2]));
-      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|capabilities|activity|native-runtime|workbench-status|actions|branch-options|branches|handoff|last-assistant))?$/i.exec(pathname);
+      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|instructions|capabilities|activity|native-runtime|workbench-status|actions|branch-options|branches|handoff|last-assistant))?$/i.exec(pathname);
       if (route) {
         const id = sessionKey.parse(route[1]);
         if (request.method === "POST" && route[2] === "actions") return json(await sessions.action(id, actions.parse(await payload(request))));
@@ -287,6 +287,7 @@ export async function startApp(settings: AppSettings) {
           }
           if (route[2] === "branch-options") return json(await sessions.webBranchOptions(id));
           if (route[2] === "details") return json(await sessions.details(id));
+          if (route[2] === "instructions") return json(await sessions.instructions(id));
           if (route[2] === "capabilities") return json(await sessions.capabilities(id));
           if (route[2] === "native-runtime") return json(await sessions.nativeRuntime(id));
           if (route[2] === "workbench-status") return json(await sessions.workbenchStatus(id));

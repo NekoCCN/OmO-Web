@@ -116,18 +116,57 @@ export function transcriptTree(value: unknown): WireObject {
   return { tree: nodes, ...pick(tree, ["leafId"]) };
 }
 
+const safeLabel = z.string().trim().min(1).max(120).refine(noControlChars);
+const questionOption = z.object({
+  label: z.string().min(1).max(2000),
+  description: z.string().max(12000).optional(),
+});
+const questionRow = z.object({
+  id: z.string().min(1).max(200),
+  header: z.string().max(2000).optional(),
+  question: z.string().max(12000).optional(),
+  multiSelect: z.boolean().optional(),
+  options: z.array(questionOption).max(40).optional(),
+});
+
 export function dialog(value: unknown): WireObject | undefined {
   const d = record(value);
   if (!["select", "confirm", "input", "editor", "question"].includes(String(d.method)) ||
     d.secret === true || d.private === true || d.privateInput) return;
-  return pick(d, ["id", "type", "method", "title", "message", "options", "placeholder", "prefill", "defaultValue",
-    "questions", "requestId", "toolCallId", "parentToolCallId", "deadlineAtMs", "askedAtMs", "remainingMs", "timeout"]);
+  const projected = d.method === "question"
+    ? pick(d, ["id", "type", "method", "requestId", "toolCallId", "deadlineAtMs", "askedAtMs", "remainingMs", "timeout"])
+    : pick(d, ["id", "type", "method", "title", "message", "options", "placeholder", "prefill", "defaultValue",
+      "requestId", "toolCallId", "parentToolCallId", "deadlineAtMs", "askedAtMs", "remainingMs", "timeout"]);
+  if (d.method === "question") {
+    for (const key of ["id", "type", "method", "requestId", "toolCallId"]) {
+      if (typeof projected[key] !== "string") delete projected[key];
+    }
+    projected.questions = array(d.questions).flatMap(raw => {
+      const row = record(raw);
+      if (row.secret === true || row.private === true || row.privateInput) return [];
+      const options = array(row.options).filter(rawOption => {
+        const option = record(rawOption);
+        return option.secret !== true && option.private !== true && !option.privateInput;
+      });
+      const parsed = questionRow.safeParse({ ...row, ...(row.options === undefined ? {} : { options }) });
+      return parsed.success ? [parsed.data] : [];
+    });
+    if (typeof d.waitForAnswer === "boolean") projected.waitForAnswer = d.waitForAnswer;
+    const raisedBy = safeLabel.safeParse(d.raisedBy);
+    if (raisedBy.success) projected.raisedBy = raisedBy.data;
+    for (const key of ["deadlineAtMs", "askedAtMs", "remainingMs", "timeout"]) {
+      if (typeof projected[key] !== "number" || !Number.isFinite(projected[key])) delete projected[key];
+    }
+  }
+  return projected;
 }
 
 export function state(value: unknown): WireObject {
   const s = pick(value, ["thinkingLevel", "fastMode", "isStreaming", "isCompacting", "currentTurnId", "pendingMessageCount",
     "permissionPreset", "effectivePermissionPreset", "autoCompactionEnabled", "contextUsage", "usageTotals", "pendingModelSwitch"]);
   const raw = record(value);
+  const thinkingLevelSource = safeLabel.safeParse(raw.thinkingLevelSource);
+  if (thinkingLevelSource.success) s.thinkingLevelSource = thinkingLevelSource.data;
   return { ...s, model: model(raw.model), pendingDialogs: array(raw.pendingDialogs).flatMap(d => dialog(d) ?? []),
     pendingQuestions: array(raw.pendingQuestions).flatMap(q => dialog(q) ?? []) };
 }
@@ -149,8 +188,17 @@ export function browserEvent(value: WireObject): WireObject | undefined {
     }
     case "extension_ui_request":
       return dialog(value);
-    case "question_updated":
-      return dialog(value) ?? pick(value, ["type", "id", "requestId", "deadlineAtMs", "remainingMs"]);
+    case "question_updated": {
+      if (value.secret === true || value.private === true || value.privateInput) return;
+      const full = dialog(value);
+      if (full) return full;
+      const update = pick(value, ["type", "id", "requestId", "deadlineAtMs", "remainingMs"]);
+      for (const key of ["id", "requestId"]) if (typeof update[key] !== "string") delete update[key];
+      for (const key of ["deadlineAtMs", "remainingMs"]) {
+        if (typeof update[key] !== "number" || !Number.isFinite(update[key])) delete update[key];
+      }
+      return update;
+    }
     case "question_resolved":
     case "extension_ui_resolved":
       return pick(value, ["type", "id", "requestId", "toolCallId", "outcome", "deadlineAtMs", "remainingMs"]);

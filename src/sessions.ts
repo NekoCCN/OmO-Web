@@ -16,6 +16,7 @@ import { projectRuntimeBranch } from "./runtime-branch.ts";
 import { projectSessionMemory } from "./runtime-metrics.ts";
 import { branchBusy, loadBranchSource, loadSavedWebBranch, nativeBranchError, SessionBranches, staleBranch } from "./session-branches.ts";
 import type { BranchOptions, BranchSelection, LoadedBranchSource, PreparedBranch } from "./session-branches.ts";
+import { StreamSpeed } from "./stream-speed.ts";
 import { WorkspaceAccess } from "./workspace-access.ts";
 
 const savedSession = z.strictObject({
@@ -33,6 +34,15 @@ const savedSession = z.strictObject({
   shared: z.boolean().optional(),
 });
 type SavedSession = Readonly<z.infer<typeof savedSession>>;
+const INSTRUCTIONS_FILE = "AGENTS.md";
+const INSTRUCTIONS_MAX_BYTES = 64 * 1024;
+const instructionsReply = z.discriminatedUnion("exists", [
+  z.object({ cwd: z.string(), path: z.string(), exists: z.literal(true), content: z.string() }),
+  z.object({ cwd: z.string(), path: z.string(), exists: z.literal(false), content: z.null() }),
+]);
+type InstructionsResult =
+  | { readonly status: "ok"; readonly file: typeof INSTRUCTIONS_FILE; readonly content: string }
+  | { readonly status: "missing" | "unsupported" | "unavailable" | "refused" | "too_large" };
 export type SessionView = Omit<SavedSession, "nativeId" | "cliBookmark" | "workspaceKey"> & { readonly active: boolean; readonly running: boolean };
 export type CliResumeSource = { readonly cwd: string; readonly nativeSessionId: string; readonly sourcePath: string; readonly workspaceKey?: string };
 
@@ -42,7 +52,8 @@ export type BranchResult = { readonly cancelled: true; readonly session?: never;
 
 export class Sessions {
   readonly #rows = new Map<SessionKey, SavedSession>();
-  readonly #live = new Map<SessionKey, { readonly route: string; readonly runtime?: NativeRuntimeBinding; running: boolean }>();
+  readonly #live = new Map<SessionKey, { readonly route: string; readonly runtime?: NativeRuntimeBinding;
+    readonly speed?: StreamSpeed; running: boolean }>();
   readonly #opening = new Map<SessionKey, Promise<void>>();
   readonly #writes = new Map<SessionKey, Promise<unknown>>();
   readonly #releasing = new Set<SessionKey>();
@@ -291,7 +302,8 @@ export class Sessions {
       route, cwd: row.cwd, sessionFile: opts.nativePlaced === undefined ? sessionPath : initial.sessionFile,
       durableId: bound ?? row.nativeId,
     });
-    this.#live.set(row.id, { route, runtime, running: initial.isStreaming === true });
+    this.#live.set(row.id, { route, runtime, speed: new StreamSpeed(initial.isCompacting === true),
+      running: initial.isStreaming === true });
     if (opts.publishName && initial.sessionName !== row.name) {
       try { await this.engine.requestExisting("set_session_name", { sessionId: route, name: row.name }); }
       catch (error) {
@@ -487,20 +499,29 @@ export class Sessions {
       this.#live.delete(sessionId);
       this.fanout({ type: "sessions" });
     }
+    if (frame.type === "session_replaced") {
+      // A stable route is not proof of a stable native journal.
+      this.#live.set(sessionId, { route: live.route, running: live.running });
+    }
     const event = browserEvent(frame);
     if (event) this.fanout({ ...event, sessionId });
+    if (this.#live.get(sessionId) === live) {
+      const generationSpeed = live.speed?.observe(frame);
+      if (generationSpeed) this.fanout({ type: "generation_speed", generationSpeed, sessionId });
+    }
   }
 
   async snapshot(id: SessionKey) {
-    const route = this.#route(id);
+    const live = this.#binding(id);
     const [rawState, history] = await Promise.all([
-      this.engine.requestExisting("get_state", { sessionId: route }),
-      this.engine.requestExisting("get_messages", { sessionId: route }),
+      this.engine.requestExisting("get_state", { sessionId: live.route }),
+      this.engine.requestExisting("get_messages", { sessionId: live.route }),
     ]);
     const session = this.#view(this.#row(id));
+    const generationSpeed = this.#live.get(id) === live ? live.speed?.latest : undefined;
     return { session, state: { ...state(rawState), isStreaming: session.running || rawState.isStreaming === true },
       messages: array(history.messages).flatMap(m => transcriptMessage(m) ?? []),
-      handoff: this.#handoffEligibility(record(rawState)) };
+      handoff: this.#handoffEligibility(record(rawState)), ...(generationSpeed === undefined ? {} : { generationSpeed }) };
   }
 
   #runtimeRead(id: SessionKey): RuntimeReadScope | RuntimeInactiveReason {
@@ -527,6 +548,52 @@ export class Sessions {
   async nativeRuntime(id: SessionKey) {
     const scope = this.#runtimeRead(id);
     return typeof scope === "string" ? unavailableNativeRuntime(scope) : readNativeRuntime(scope);
+  }
+
+  async instructions(id: SessionKey): Promise<InstructionsResult> {
+    const scope = this.#runtimeRead(id);
+    if (typeof scope === "string") return { status: scope === "unsupported" ? "unsupported" : "unavailable" };
+    const { target, isCurrent, verifyWorkspace } = scope;
+    const checkBinding = () => {
+      if (!isCurrent()) throw new WebError(409, "session_changed", "会话连接已切换。");
+    };
+    const verifyBinding = async () => {
+      checkBinding();
+      const state = await this.engine.requestExisting("get_state", { sessionId: target.route }, 5_000);
+      if (state.cwd !== target.cwd || state.sessionId !== target.sessionId || state.sessionFile !== target.sessionFile ||
+          state.archived === true) throw new WebError(409, "session_changed", "会话连接已切换。");
+      await verifyWorkspace();
+      checkBinding();
+    };
+    try {
+      await verifyWorkspace();
+      await verifyBinding();
+      checkBinding();
+      const raw = await this.engine.requestExisting("read_project_file", { sessionId: target.route, path: INSTRUCTIONS_FILE }, 5_000);
+      await verifyBinding();
+      checkBinding();
+      const reply = instructionsReply.safeParse(raw);
+      if (!reply.success) return { status: "unavailable" };
+      const { cwd, path, exists, content } = reply.data;
+      if (cwd !== target.cwd || path !== INSTRUCTIONS_FILE) return { status: "refused" };
+      if (!exists) return { status: "missing" };
+      if (Buffer.byteLength(content, "utf8") > INSTRUCTIONS_MAX_BYTES) return { status: "too_large" };
+      return { status: "ok", file: INSTRUCTIONS_FILE, content };
+    } catch (error) {
+      if (!isCurrent()) return { status: "refused" };
+      if (!(error instanceof WebError)) throw error;
+      switch (error.code) {
+        case "unknown_command": return { status: "unsupported" };
+        case "project_file_too_large": return { status: "too_large" };
+        case "project_file_not_allowed":
+        case "project_file_permission_denied":
+        case "workspace_refused":
+        case "session_changed":
+        case "session_not_attached":
+        case "unknown_session": return { status: "refused" };
+        default: return { status: "unavailable" };
+      }
+    }
   }
 
   workbenchStatus(id: SessionKey) {
@@ -936,7 +1003,8 @@ export class Sessions {
   }
 
   async details(id: SessionKey) {
-    const params = { sessionId: this.#route(id) };
+    const live = this.#binding(id);
+    const params = { sessionId: live.route };
     // Runtime visibility is read-only: the raw tree feeds both the transcript
     // view and the active-branch Todo/memory projection; state and the
     // per-route list_sessions row feed labeled usage/memory panels. Both are
@@ -949,17 +1017,20 @@ export class Sessions {
       this.engine.requestExisting("list_sessions").catch(() => undefined),
     ]);
     const safeState = rawState && state(rawState);
+    const generationSpeed = this.#live.get(id) === live ? live.speed?.latest : undefined;
     return {
       stats: pick(stats, ["userMessages", "assistantMessages", "toolCalls", "toolResults", "totalMessages", "tokens", "cost", "contextUsage", "failures"]),
       queue: pick(queue, ["lifetimeId", "throughCursor", "inputs", "outcomes"]),
       tree: transcriptTree(rawTree),
       runtime: projectRuntimeBranch(rawTree),
       state: safeState && {
-        ...pick(safeState, ["model", "fastMode", "autoCompactionEnabled", "permissionPreset", "effectivePermissionPreset"]),
+        ...pick(safeState, ["model", "thinkingLevel", "thinkingLevelSource", "fastMode", "autoCompactionEnabled",
+          "permissionPreset", "effectivePermissionPreset"]),
         contextUsage: pick(safeState.contextUsage, ["tokens", "contextWindow", "percent"]),
         usageTotals: pick(safeState.usageTotals, ["input", "output", "cacheRead", "cacheWrite", "latestCacheHitRate"]),
       },
       sessionMemory: projectSessionMemory(listing, params.sessionId),
+      ...(generationSpeed === undefined ? {} : { generationSpeed }),
     };
   }
 
