@@ -13,8 +13,10 @@ import { cliHistory } from "./cli-history.ts";
 import { cliLive } from "./cli-live.ts";
 import { cliFollow } from "./cli-follow.ts";
 import { workspaceBrowser, workspacePaths } from "./workspace-browser.ts";
-import { BUILTIN_COMMANDS, parseBuiltinInput } from "./builtin-commands.ts";
+import { opensReadOnlyView, parseBuiltinInput } from "./builtin-commands.ts";
 import type { BuiltinCommand } from "./builtin-commands.ts";
+import { commandCatalog, commandToken, inlineCommandCompletion } from "./command-completion.ts";
+import { projectCacheRates, projectContextUsage } from "../runtime-metrics.ts";
 
 const box = (id: string) => byId(id, HTMLElement);
 const btn = (id: string) => byId(id, HTMLButtonElement);
@@ -32,6 +34,7 @@ const traceControls = {
 };
 const traceTargets = new Map<HTMLButtonElement, HTMLElement>();
 const prompt = byId("prompt", HTMLTextAreaElement);
+const completion = inlineCommandCompletion(prompt, box("inline-commands"));
 const mode = sel("prompt-mode");
 const modelSelect = sel("model");
 const thinkingSelect = sel("thinking");
@@ -47,7 +50,9 @@ modelSelect.setAttribute("aria-describedby", modelStatus.id);
 thinkingSelect.setAttribute("aria-describedby", modelStatus.id);
 modelSelect.parentElement?.after(applyModel);
 const composeOptions = box("compose-options");
-const composeSelectors = el("div", "row");
+const composeToolbar = composeOptions.parentElement!;
+const composeOptionsButton = btn("compose-options-button");
+const composeSelectors = el("div", "row compose-selectors");
 composeSelectors.append(...composeOptions.children);
 const composeSettings = el("div", "stack stack--tight");
 composeSettings.append(composeSelectors, modelStatus);
@@ -72,7 +77,6 @@ const approvalChoices: ReadonlyArray<readonly [string, string]> = [
   ["auto", approvalLabels.auto],
   ["full-access", approvalLabels["full-access"]],
 ];
-const commandToken = /^(?:\/(?:[A-Za-z0-9_-]{1,64}|skill:[A-Za-z0-9-]{1,64})|\$[A-Za-z0-9-]{1,64})$/;
 type Attachment = Image & { readonly name: string; readonly url: string };
 type Draft = {
   text: string; mode: Mode; images: Attachment[]; reading: number; error: string;
@@ -85,6 +89,7 @@ type View = {
   messages: TranscriptEntry[]; liveKey: string; tools: Map<string, ToolTrace>; requests: Map<string, Wire>;
   options: Wire; optionsError: string; handoff: Wire; queue: number | undefined; revision: number; serial: number;
   sync: number; optionSync: number; running: boolean; compacting: boolean;
+  workbench?: Wire;
   modelSelection?: string;
   modelPreview?: { readonly key: string; result?: Wire };
 };
@@ -123,6 +128,7 @@ let bootSeq = 0;
 let listSeq = 0;
 let mutation = 0;
 let refreshTimer = 0;
+let workbenchRequest: AbortController | undefined;
 let createPending = false;
 let navOpen = false;
 const writes = new Set<string>();
@@ -133,6 +139,7 @@ const mobile = matchMedia("(max-width: 760px)");
 const compactInspector = matchMedia("(max-width: 1000px)");
 const system = matchMedia("(prefers-color-scheme: dark)");
 const countFormat = new Intl.NumberFormat("zh-CN");
+const rateFormat = new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 });
 const focusCliLauncher = (id: string) => btn(mobile.matches ? "open-navigation" : id).focus();
 const showBranch = branchDialog(api, enterBranch);
 const openBranch = (source: BranchSource) => {
@@ -204,6 +211,8 @@ function markInactive(view: View): void {
   view.status = "inactive";
   view.running = false;
   view.compacting = false;
+  view.workbench = undefined;
+  if (view === current) workbenchRequest?.abort();
 }
 
 function enterBranch(session: Session, editorText: string, source: BranchSource): void {
@@ -574,6 +583,7 @@ function openSession(id: string, focusComposer = false, focusConversation = true
   closeDetails(false);
   setComposeOptions(false);
   if (commandDialog.open) { commandRequest?.abort(); commandDialog.close(); }
+  workbenchRequest?.abort();
   if (focusConversation) box("conversation").focus({ preventScroll: true });
   const release = releases.get(id);
   const load = session.active && release?.status !== "released" && release?.status !== "uncertain";
@@ -703,6 +713,7 @@ function renderView(): void {
   btn("cli-follow-button").setAttribute("aria-pressed", String(following));
   box("banner").hidden = following || !box("banner-text").textContent;
   if (following) {
+    completion.reset();
     trace.hidden = true;
     box("composer-shell").hidden = true;
     btn("details-button").hidden = true;
@@ -722,6 +733,7 @@ function renderView(): void {
   box("active-session").hidden = !available;
   trace.hidden = !available || !traceTargets.size;
   if (!available) {
+    completion.reset();
     for (const control of Object.values(traceControls)) setTraceTarget(control);
   }
   box("composer-shell").hidden = !available;
@@ -789,11 +801,14 @@ function renderView(): void {
   const send = btn("send");
   send.hidden = commandInput || (view.running && (chosenMode === "prompt" || blocked));
   send.disabled = !canSend || busy || posting || draft.reading > 0 || (!draft.text.trim() && !draft.images.length);
-  send.textContent = chosenMode === "follow_up" ? "排队" : chosenMode === "steer" ? "发送引导" : "发送";
+  const sendLabel = chosenMode === "follow_up" ? "排队" : chosenMode === "steer" ? "发送引导" : "发送";
+  box("send-label").textContent = send.title = sendLabel;
   const execute = btn("send-command");
   execute.hidden = !commandInput;
-  execute.disabled = !canSend || view.running || Boolean(view.queue) || busy || posting ||
-    !(commandMode ? draft.commandText : draft.text).trim();
+  const commandText = commandMode ? draft.commandText : draft.text;
+  const readOnlyCommand = opensReadOnlyView(commandText);
+  execute.disabled = !online || !view.session.active || busy || (blocked && !readOnlyCommand) ||
+    (!readOnlyCommand && (view.running || view.compacting || Boolean(view.queue) || posting)) || !commandText.trim();
   btn("command-mode").setAttribute("aria-pressed", String(commandMode));
   btn("command-picker").hidden = !commandMode;
   btn("command-picker").disabled = !online || blocked;
@@ -812,28 +827,41 @@ function renderView(): void {
     ? "无审批：默认允许工具操作；原生权限规则仍有效。用户问题仍需回答。"
     : preset === "auto" ? "Auto：原生确认安全的项目内操作自动放行，其余询问。"
       : "询问：未被原生权限规则处理的工具操作需要批准。恢复会话后回到此模式。";
-  const usage = object(view.state.contextUsage);
-  const percent = num(usage.percent);
-  const tokens = num(usage.tokens);
-  const limit = num(usage.contextWindow);
-  notice(box("context-usage"), percent !== undefined ? `上下文 ${countFormat.format(percent)}%` : tokens !== undefined && limit ? `上下文 ${countFormat.format(tokens)} / ${countFormat.format(limit)}` : "");
+  const usage = projectContextUsage(view.state.contextUsage);
+  notice(box("context-usage"), usage.status !== "ok" ? "" : usage.percent !== undefined ? `上下文 ${countFormat.format(usage.percent)}%`
+    : usage.tokens !== undefined && usage.window ? `上下文 ${countFormat.format(usage.tokens)} / ${countFormat.format(usage.window)}` : "");
+  const cache = projectCacheRates(view.state.usageTotals);
+  const latestCache = cache.status === "ok" && cache.latest !== undefined ? rateFormat.format(cache.latest * 100) : "";
+  notice(box("cache-usage"), online && latestCache ? `最新缓存 ${latestCache}%` : "");
   const hint = pending ? "正在交接，草稿不会发送。" : !online ? "离线：可继续编辑草稿，恢复连接后再发送。" : blocked
     ? "此会话已归档；可在会话管理中取消归档。"
-    : draft.commandStatus || (commandInput ? view.running || view.compacting || view.queue ? "会话忙：请等待当前运行和队列结束再执行命令。"
+    : draft.commandStatus || (commandInput ? !readOnlyCommand && (view.running || view.compacting || view.queue) ? "会话忙：请等待当前运行和队列结束再执行命令。"
       : "Ctrl / ⌘ + Enter 执行命令；命令前加空格可按文字发送。"
     : view.compacting ? "上下文压缩完成后可发送。" : draft.reading ? "正在读取图片…"
       : view.running && chosenMode === "prompt" ? "可停止当前轮，或切换发送方式以引导或排队。"
         : !view.running && chosenMode !== "prompt" ? "当前没有运行中的轮次；此输入将在下一轮处理。" : "Ctrl / ⌘ + Enter 发送");
   box("composer-hint").textContent = hint;
-  const activity = [view.running ? "正在生成" : "", view.compacting ? "正在压缩上下文" : "", view.queue ? `${view.queue} 条输入待处理` : "",
-    view.requests.size ? `${view.requests.size} 项等待你的决定` : ""].filter(Boolean).join(" · ");
+  box("composer-hint").classList.toggle("sr-only", !draft.commandStatus && online && !pending && !blocked &&
+    !draft.reading && !view.compacting && !commandInput && (chosenMode === "prompt" || view.running));
+  const activity = [view.requests.size ? `待答 ${view.requests.size}` : "", view.running ? "生成中" : "",
+    view.compacting ? "压缩中" : "", view.queue ? `排队 ${view.queue}` : ""].filter(Boolean).join(" · ");
   box("activity-row").hidden = !activity;
   box("activity-row").dataset.pending = String(view.requests.size > 0);
   if (box("activity").textContent !== activity) box("activity").textContent = activity;
+  const todo = btn("current-todo");
+  const signal = view.workbench;
+  const currentTodo = signal?.status === "ok" ? str(signal.currentTodo) : "";
+  const pendingTodo = signal?.status === "ok" ? num(signal.pendingTodo) : undefined;
+  const task = currentTodo ? `待办 · ${currentTodo}` : pendingTodo ? `待办 ${pendingTodo}` : "";
+  todo.hidden = !online || !task;
+  const label = box("current-todo-label");
+  if (label.textContent !== task) label.textContent = task;
+  todo.title = currentTodo && pendingTodo ? `${task}；另有 ${pendingTodo} 项待处理` : task;
   notice(box("compose-error"), (commandMode ? draft.commandError : draft.error) || view.optionsError ||
     (!manager.open && release?.status === "failed" ? release.error : ""));
   interactions.render(view.requests, online && !pending, (id, answer) => answerRequest(view, id, answer));
   setTraceTarget(traceControls.request, interactions.first);
+  completion.render(view.options.commands, online && !blocked && !pending);
 }
 
 function renderHeading(name: string, cwd: string): void {
@@ -921,10 +949,12 @@ async function snapshot(view: View, bottom = false): Promise<void> {
       }
     }
     refreshModelOptions(view, previousModel);
+    const becameReady = view.status !== "ready";
     view.status = "ready";
     view.error = "";
     renderView();
     renderMessages(view, bottom);
+    if (becameReady || !view.workbench) void loadWorkbenchStatus(view);
   } catch (error) {
     if (current !== view || ticket !== view.sync) return;
     if (releases.get(view.session.id)?.status === "pending") return;
@@ -936,6 +966,27 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     }
     renderView();
   }
+}
+
+async function loadWorkbenchStatus(view: View): Promise<void> {
+  if (view !== current || view.status !== "ready" || !view.session.active ||
+      view.session.archived || connection !== "online" || follow.active ||
+      releases.get(view.session.id)?.status === "pending") return;
+  workbenchRequest?.abort();
+  const request = workbenchRequest = new AbortController();
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
+  try {
+    const data = await api.request(`${sessionPath(view.session.id)}/workbench-status`, undefined, signal);
+    if (request.signal.aborted || workbenchRequest !== request || view !== current || view.status !== "ready") return;
+    view.workbench = data;
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    if (request.signal.aborted || workbenchRequest !== request || view !== current) return;
+    view.workbench = { status: "unavailable" };
+  } finally {
+    if (workbenchRequest === request) workbenchRequest = undefined;
+  }
+  renderView();
 }
 
 async function loadOptions(view: View): Promise<void> {
@@ -1057,6 +1108,7 @@ function onEvent(event: Wire): void {
       view.liveKey = "";
       view.state = { ...view.state, currentTurnId: undefined };
       scheduleSnapshot(view);
+      void loadWorkbenchStatus(view);
       break;
     case "agent_idle":
       scheduleSnapshot(view);
@@ -1077,6 +1129,9 @@ function onEvent(event: Wire): void {
         id, name: str(event.toolName) || old?.name || "", args: event.args ?? old?.args, output: result.content ?? old?.output,
         stage: event.isError === true ? "error" : type === "tool_execution_end" ? "done" : "running",
       });
+      if (type === "tool_execution_end" && event.isError !== true && /^(?:todo|todowrite)$/u.test(str(event.toolName) || old?.name || "")) {
+        void loadWorkbenchStatus(view);
+      }
       break;
     }
     case "extension_ui_request":
@@ -1132,7 +1187,11 @@ function onEvent(event: Wire): void {
       view.running = true;
       break;
     case "auto_retry_end":
+      scheduleSnapshot(view);
+      break;
     case "session_replaced":
+      workbenchRequest?.abort();
+      view.workbench = undefined;
       scheduleSnapshot(view);
       break;
     case "transcript_write_failed":
@@ -1353,9 +1412,42 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
       manager.querySelector<HTMLInputElement>('[data-key="name"]')?.focus();
       return manager.open;
     case "session":
-    case "tree":
       openDetails();
       return inspector.open;
+    case "tree":
+      openDetails("overview", prompt, "tree");
+      return inspector.open;
+    case "todo":
+      openDetails("todo", prompt, "todo");
+      return inspector.open;
+    case "tasks":
+      openDetails("subagents", prompt);
+      return inspector.open;
+    case "dag":
+      openDetails("dag", prompt);
+      return inspector.open;
+    case "help":
+    case "hotkeys":
+      await openCommandPicker(view, true);
+      return commandDialog.open;
+    case "reasoning":
+    case "efforts": {
+      const model = object(view.state.model);
+      const level = str(view.state.thinkingLevel);
+      if (!modelKey(model)) { fail("当前没有已确认的模型。"); return false; }
+      if (!level || !Object.hasOwn(settingLabels, level)) { fail("原生宿主暂未报告当前思考档位。"); return false; }
+      if (command.name === "reasoning") {
+        draftFor(id).commandStatus = level === "off" ? "当前模型推理：关闭。" : `当前模型推理：开启（${level}）。`;
+        return true;
+      }
+      const reported = list(view.options.levels).map(str).filter(value => Object.hasOwn(settingLabels, value));
+      const levels = reported.filter(value => value !== "off");
+      if (!reported.length) { fail("原生宿主暂未报告可用档位。"); return false; }
+      if (model.reasoning === false || !levels.length) { fail("当前模型不支持推理。"); return false; }
+      if (reported.includes("off") && levels.length === 1) { fail("当前模型只支持开关，没有独立推理档位。"); return false; }
+      draftFor(id).commandStatus = `当前档位：${level}。可用推理档：${levels.join("、")}。`;
+      return true;
+    }
     case "fork":
       btn("web-branch-button").click();
       return dialog("branch-dialog").open;
@@ -1363,7 +1455,7 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
       return action({ action: "compact", ...(command.instructions ? { instructions: command.instructions } : {}) }, "压缩上下文");
     case "model": {
       if (!command.reference) {
-        if (mobile.matches && !sel("model").disabled) setComposeOptions(true);
+        if (usesComposeOptionsPopover() && !sel("model").disabled) setComposeOptions(true);
         sel("model").focus();
         if (document.activeElement === sel("model")) {
           try { sel("model").showPicker?.(); } catch (error) { if (!(error instanceof DOMException)) throw error; }
@@ -1380,7 +1472,7 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
     }
     case "thinking": {
       if (!command.level) {
-        if (mobile.matches && !sel("thinking").disabled) setComposeOptions(true);
+        if (usesComposeOptionsPopover() && !sel("thinking").disabled) setComposeOptions(true);
         sel("thinking").focus();
         if (document.activeElement === sel("thinking")) {
           try { sel("thinking").showPicker?.(); } catch (error) { if (!(error instanceof DOMException)) throw error; }
@@ -1449,6 +1541,8 @@ async function runAction(view: View, action: Action, label: string, onError: (te
       view.messages = [];
       view.liveKey = "";
       view.tools.clear();
+      workbenchRequest?.abort();
+      view.workbench = undefined;
       stream.reset();
       const editor = str(object(data.result).editorText);
       if (editor) {
@@ -1689,24 +1783,26 @@ function renderCommandOptions(view: View): void {
   notice(box("command-status"), nodes.length ? "" : query ? "没有匹配的命令。" : "此会话未列出可用命令。");
 }
 
-async function openCommandPicker(view: View): Promise<void> {
+async function openCommandPicker(view: View, help = false): Promise<void> {
   if (commandDialog.open || btn("command-picker").disabled) return;
   commandRequest?.abort();
   const request = commandRequest = new AbortController();
   commandOptions = [];
   const filter = inp("command-search");
+  const shortcuts = byId("command-shortcuts", HTMLDetailsElement);
+  shortcuts.open = help;
   filter.value = "";
   box("command-list").replaceChildren();
   box("command-list").hidden = true;
   notice(box("command-error"));
   notice(box("command-status"), "正在读取当前会话的命令…");
   commandDialog.showModal();
+  if (help) shortcuts.querySelector("summary")?.focus();
   const live = () => !request.signal.aborted && commandDialog.open && view === current;
   try {
     const data = await api.request(`${sessionPath(view.session.id)}/options`, undefined, request.signal);
     if (!live()) return;
-    commandOptions = [...BUILTIN_COMMANDS.map(command => ({ ...command, source: "builtin" })),
-      ...list(data.commands).map(object).filter(command => parseBuiltinInput(str(command.invocation)).kind === "plain")];
+    commandOptions = commandCatalog(data.commands);
     renderCommandOptions(view);
   } catch (error) {
     if (!live()) return;
@@ -1718,6 +1814,10 @@ async function openCommandPicker(view: View): Promise<void> {
 }
 
 let detailsRequest: AbortController | undefined;
+let dagRequest: AbortController | undefined;
+let detailsOpener: HTMLElement | undefined;
+type DetailReveal = "tree" | "todo";
+let detailReveal: DetailReveal | undefined;
 let capabilitiesRequest: AbortController | undefined;
 let capabilitiesAttempted = false;
 const detailsTabs = () => [...inspector.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
@@ -1785,15 +1885,30 @@ function selectDetailsView(tab: HTMLButtonElement): void {
     if (target) box(target).hidden = !selected;
   }
   box("details-scroll").scrollTop = 0;
+  detailReveal = undefined;
   if (capabilitiesSelected() && inspector.open && current?.status === "ready" && !capabilitiesAttempted) {
     loadCapabilities(current);
   } else syncDetailsRefresh();
 }
 
-function openDetails(): void {
+function revealDetailsTarget(): void {
+  if (!detailReveal) return;
+  const root = detailReveal === "todo" ? "#runtime-todo [data-runtime-branch]" : "#runtime-tree";
+  const fold = inspector.querySelector<HTMLDetailsElement>(`${root} details`);
+  if (!fold) return;
+  detailReveal = undefined;
+  fold.open = true;
+  const title = fold.querySelector("summary");
+  title?.focus({ preventScroll: true });
+  title?.scrollIntoView({ block: "start" });
+}
+
+function openDetails(tab = "overview", opener: HTMLElement = btn("details-button"), reveal?: DetailReveal): void {
   if (current?.status !== "ready") return;
-  const overview = btn("runtime-open-overview");
-  selectDetailsView(overview);
+  const target = btn(`runtime-open-${tab}`);
+  selectDetailsView(target);
+  detailsOpener = opener;
+  detailReveal = reveal;
   if (!inspector.open) {
     for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities)')) panel.replaceChildren();
     if (compactInspector.matches) inspector.showModal();
@@ -1802,17 +1917,22 @@ function openDetails(): void {
     box("details-scroll").scrollTop = 0;
     loadDetails(current);
   }
-  overview.focus({ preventScroll: true });
+  target.focus({ preventScroll: true });
+  revealDetailsTarget();
 }
 
 function closeDetails(restoreFocus = true): void {
   if (!inspector.open) return;
   inspector.close();
   detailsRequest?.abort();
+  dagRequest?.abort();
+  detailReveal = undefined;
   clearCapabilities();
   const trigger = btn("details-button");
   trigger.setAttribute("aria-expanded", "false");
-  if (restoreFocus) (trigger.hidden ? box("conversation") : trigger).focus({ preventScroll: true });
+  const opener = detailsOpener ?? trigger;
+  detailsOpener = undefined;
+  if (restoreFocus) (opener.getClientRects().length ? opener : trigger.hidden ? box("conversation") : trigger).focus({ preventScroll: true });
 }
 
 function syncDetailsPresentation(): void {
@@ -1831,12 +1951,34 @@ function syncDetailsPresentation(): void {
 }
 
 function setComposeOptions(open: boolean): void {
-  btn("compose-options-button").setAttribute("aria-expanded", String(open));
+  composeOptionsButton.setAttribute("aria-expanded", String(open));
+}
+
+function usesComposeOptionsPopover(): boolean {
+  return getComputedStyle(composeToolbar).getPropertyValue("--compact-options").trim() === "1";
+}
+
+function syncComposeOptionsLayout(): void {
+  const compact = usesComposeOptionsPopover();
+  if (compact === composeToolbar.hasAttribute("data-compact")) return;
+  const active = document.activeElement;
+  if (!compact) setComposeOptions(false);
+  composeToolbar.toggleAttribute("data-compact", compact);
+  if (compact && composeOptions.contains(active) && composeOptionsButton.getAttribute("aria-expanded") !== "true") {
+    composeOptionsButton.focus({ preventScroll: true });
+  } else if (!compact && active === composeOptionsButton) {
+    (composeOptions.querySelector<HTMLElement>("select:enabled:not([hidden] *)") ?? prompt).focus({ preventScroll: true });
+  }
 }
 
 function loadDetails(view: View): void {
   detailsRequest?.abort();
   const request = detailsRequest = new AbortController();
+  dagRequest?.abort();
+  const dag = box("runtime-dag");
+  const selectedRun = dag.querySelector<HTMLDetailsElement>(".dag-run[open]")?.dataset.dagKey;
+  const focusedRun = document.activeElement?.closest<HTMLElement>(".dag-run")?.dataset.dagKey;
+  const treeRequest = dagRequest = new AbortController();
   const live = () => !request.signal.aborted && inspector.open && view === current;
   const path = sessionPath(view.session.id);
   const overview = box("runtime-metrics");
@@ -1851,10 +1993,20 @@ function loadDetails(view: View): void {
   };
   const setActivity = (tasks?: Wire, dag?: Wire, snapshot?: "waiting" | Wire) => {
     box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", tasks, snapshot));
-    box("runtime-dag").replaceChildren(...renderRuntimePane("dag", dag, snapshot));
+    const runs = box("runtime-dag");
+    runs.replaceChildren(...renderRuntimePane("dag", dag, snapshot, async key => {
+      const signal = AbortSignal.any([treeRequest.signal, AbortSignal.timeout(28_000)]);
+      return api.request(`${path}/native-runtime/dag/${key}`, undefined, signal);
+    }));
+    for (const detail of runs.querySelectorAll<HTMLDetailsElement>(".dag-run")) {
+      if (detail.dataset.dagKey === selectedRun) detail.open = true;
+      if (focusedRun && detail.dataset.dagKey === focusedRun && document.activeElement === document.body) {
+        detail.querySelector("summary")?.focus({ preventScroll: true });
+      }
+    }
   };
   setJournal();
-  setActivity();
+  if (!dag.childElementCount) setActivity();
   fail("");
   const stats = api.request(`${path}/details`, undefined, request.signal).then(data => {
     if (!live()) return;
@@ -1878,6 +2030,7 @@ function loadDetails(view: View): void {
       },
       insertCommand: command => insertCommand(view, command),
     });
+    revealDetailsTarget();
   }).catch(error => {
     if (!live()) return;
     if (!overview.querySelector("section")) overview.replaceChildren();
@@ -1947,18 +2100,20 @@ function listen(): void {
   btn("open-navigation").addEventListener("click", () => toggleNav(true));
   btn("close-navigation").addEventListener("click", () => toggleNav(false, true));
   btn("nav-scrim").addEventListener("click", () => toggleNav(false, true));
-  mobile.addEventListener("change", () => { toggleNav(false); setComposeOptions(false); });
+  mobile.addEventListener("change", () => toggleNav(false));
   compactInspector.addEventListener("change", syncDetailsPresentation);
   document.addEventListener("close", event => {
     if (event.target !== inspector) syncDetailsPresentation();
   }, true);
-  const composeOptionsButton = btn("compose-options-button");
+  new ResizeObserver(syncComposeOptionsLayout).observe(form("composer"));
   const optionsOpen = () => composeOptionsButton.getAttribute("aria-expanded") === "true";
   composeOptionsButton.addEventListener("click", () => setComposeOptions(!optionsOpen()));
-  document.addEventListener("click", event => {
+  const dismissOptionsOutside = (event: Event) => {
     if (optionsOpen() && event.target instanceof Node && !composeOptionsButton.contains(event.target)
-      && !box("compose-options").contains(event.target)) setComposeOptions(false);
-  });
+      && !composeOptions.contains(event.target)) setComposeOptions(false);
+  };
+  document.addEventListener("click", dismissOptionsOutside);
+  document.addEventListener("focusin", dismissOptionsOutside);
   document.addEventListener("keydown", event => {
     if (event.key !== "Escape" || event.defaultPrevented || event.isComposing || document.querySelector("dialog:modal")) return;
     if (navOpen) toggleNav(false, true);
@@ -1977,6 +2132,7 @@ function listen(): void {
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     void fetchSessions();
+    if (current) void loadWorkbenchStatus(current);
     if (current && inspector.open) loadDetails(current);
   });
   window.setInterval(() => {
@@ -2011,6 +2167,7 @@ function listen(): void {
     if (current?.session.id === view.session.id && releases.get(view.session.id) === receipt) renderView();
   });
   btn("details-button").addEventListener("click", () => { if (inspector.open) closeDetails(); else openDetails(); });
+  btn("current-todo").addEventListener("click", () => openDetails("todo", btn("current-todo"), "todo"));
   for (const tab of detailsTabs()) tab.addEventListener("click", () => selectDetailsView(tab));
   box("runtime-shortcuts").addEventListener("keydown", event => {
     const tabs = detailsTabs();
@@ -2088,11 +2245,13 @@ function listen(): void {
     renderView();
   });
   prompt.addEventListener("keydown", event => {
-    if (event.key === "Enter" && !event.isComposing && (event.ctrlKey || event.metaKey)) {
+    if (completion.key(event)) return;
+    if (event.key === "Enter" && !event.isComposing && !completion.composing && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       submitComposer();
     }
   });
+  prompt.addEventListener("focus", renderView);
   prompt.maxLength = 200_000;
   prompt.addEventListener("paste", event => {
     const images = [...(event.clipboardData?.files ?? [])].filter(file => file.type.startsWith("image/"));

@@ -185,3 +185,49 @@ browserTest("Loading older calls moves the open tool back into source order with
     console.info(`Tool history: one open, focused tool at the original call; anchor Δ${history.topDelta}px`);
   });
 });
+
+browserTest("The tool trace focuses a visible group summary, and Tab reaches each original call after opening", async () => {
+  await withWorkbench(1440, [
+    { role: "user", content: "检查源文件和测试。" },
+    assistant(call("source", "read", { path: "src/web/transcript.ts" }), call("tests", "find", { path: "test" })),
+    result("source", "read", false, "源文件输出"),
+    result("tests", "find", false, "测试文件输出"),
+  ], async browser => {
+    await browser.click("#trace-jump-tool");
+    const groupFocused = await browser.evaluate(`document.activeElement.matches(".tool-group-summary")`);
+    expect(groupFocused).toBe(true);
+    await browser.press("Enter");
+    await waitFor(browser, `!!document.querySelector(".tool-group[open]")`);
+    await browser.press("Tab");
+    const first = await browser.evaluate(`document.activeElement.querySelector(".tool-target")?.textContent`);
+    await browser.press("Enter");
+    const opened = await browser.evaluate(`document.activeElement.parentElement.open`);
+    await browser.press("Enter");
+    await browser.press("Tab");
+    const second = await browser.evaluate(`document.activeElement.querySelector(".tool-target")?.textContent`);
+    expect([first, second]).toEqual(["src/web/transcript.ts", "test"]);
+    expect(opened).toBe(true);
+  });
+});
+
+browserTest("Narrative before a read allows grouping, but narrative between reads keeps both separate", async () => {
+  await withWorkbench(1440, [
+    { role: "user", content: "检查清单和工作区。" },
+    { ...assistant(text("先核对检查清单。"), call("checklist", "read", { path: "release-checklist.md" })), stopReason: "toolUse" },
+    result("checklist", "read", false, "检查清单输出"),
+    { ...assistant(call("scope", "read", { path: "workspace-notes.md" })), id: "scope", stopReason: "toolUse" },
+    result("scope", "read", false, "工作区输出"),
+    { role: "user", content: "检查另外两个文件。" },
+    { ...assistant(call("first", "read", { path: "first.md" }), text("第一份已核对。")), id: "first", stopReason: "toolUse" },
+    result("first", "read", false, "第一份输出"),
+    { ...assistant(call("next", "read", { path: "next.md" })), id: "next", stopReason: "toolUse" },
+    result("next", "read", false, "下一份输出"),
+  ], async browser => {
+    const standalone = await browser.evaluate(`Array.from(document.querySelectorAll("#messages .tool-target"))
+      .filter(target => !target.closest(".tool-group")).map(target => target.textContent)`);
+    expect(standalone).toEqual(["first.md", "next.md"]);
+    const groups = await browser.evaluate(`Array.from(document.querySelectorAll("#messages .tool-group"), group =>
+      Array.from(group.querySelectorAll(".tool-summary .tool-target"), target => target.textContent))`);
+    expect(groups).toEqual([["release-checklist.md", "workspace-notes.md"]]);
+  });
+});

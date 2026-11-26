@@ -1,6 +1,8 @@
 # OmO Web 内部接口
 
-除静态资源外，以下接口仅供本机同源浏览器使用。成功返回 JSON（SSE 除外），错误为非 2xx `{error: string, code: string}`。POST 要求 `Content-Type: application/json`、同源 `Origin` 和 `X-OmO-Token`（从 `/api/bootstrap` 获取）。不支持跨域。
+默认仅接受本机回环请求；显式启用全接口时，`Host` 和可选 `Origin` 必须匹配配置的 HTTPS 访问地址。不接受跨站或不同源的同站请求，也不信任代理转发头。配置密码后，静态资源、API 和 SSE 都先校验 HTTP Basic 凭据，缺少或凭据不正确时返回空正文的 `401` 和 `WWW-Authenticate`。
+
+API 成功返回 JSON（SSE 除外），其余错误为非 2xx `{error: string, code: string}`。POST 还要求 `Content-Type: application/json`、同源 `Origin` 和 `X-OmO-Token`（从 `/api/bootstrap` 获取）。密码鉴权不替代同源校验或 POST token。部署见 [README](../README.md#密码与全接口-https可选)。
 
 ## 读取
 
@@ -12,7 +14,11 @@
 - `GET /api/sessions/:id/details` → `{stats, queue, tree, runtime, state?, sessionMemory}`。`runtime` 是活动分支的 Todo 与长期记忆召回状态投影，不返回原始扩展数据、记忆提示或路径；`state` 只提供详情需要的模型、运行模式与用量。`usageTotals.latestCacheHitRate` 是原生百分比；累计命中率按 `cacheRead / (input + cacheWrite + cacheRead)` 计算。`sessionMemory` 只匹配当前路由，区分 OmO 宿主主堆与该会话的内核统计。
 - `GET /api/sessions/:id/model-preview?provider=…&modelId=…` → `{status:"ok", level, source, availableLevels}` 或 `{status:"unavailable"}`。必须恰好带 `provider` 与 `modelId` 各一个，只读预览当前会话目标模型的生效档位与来源，不切换、不写入、不缓存。模型不在当前可用列表时返回 `404`；模型待切换、Web 正在更改模型设置，或读取期间会话绑定或模型状态变化时返回 `409`。写入仍走 `actions` 的 `model`（`set_model scope:session`）与 `thinking`（`set_thinking_level scope:turn`），要求会话空闲且未归档。
 - `GET /api/sessions/:id/capabilities` → `{extensions, mcpServers, commands}`，三组独立 `ok / unavailable`。`ok` 为 `{rows, incomplete}`，每组至多取原生顺序前 128 条；`incomplete:true` 表示有过滤或截断，不作“无条目”。扩展含名称、启用与可选来源（`package/top-level`，缺省不推断）；MCP 为原生报告的状态与工具数，不代表可调用；命令沿用 `options` 的名称、来源与调用形式。只读清单，不提供安装、启用与连接管理。
-- `GET /api/sessions/:id/native-runtime` → `{tasks, dag, memory}`。每区可为 `ok / unavailable / malformed / ownership_changed`，`tasks` 与 `dag` 另有 `empty`。未知 Web 会话 `404`；已知会话按区用 HTTP `200` 表达结果，不读查询与请求体、不支持 POST、不打开或恢复会话。`tasks/dag` 非空时投影原生顺序最多 256 行的状态和时间，DAG 另含节点数；`memory` 仅返回当前会话原生日志的两项步数计数。合法空列表不拿旧快照补位；不返回原生路由、持久身份、任务与运行标识、路径、文本与错误细节。任务消息、取消与 DAG 控制均未开放。
+- `GET /api/sessions/:id/workbench-status` → `{status:"ok", currentTodo?, pendingTodo}`、`{status:"empty"}` 或 `{status:"unavailable", reason}`。从当前分支最新的完整待办投影首个「进行中」的文本和待开始数量；无记录、截断、身份变化和明确零项分开。不会打开或恢复会话。
+- `GET /api/sessions/:id/native-runtime` → `{tasks, dag, memory}`。每区可为 `ok / unavailable / malformed / ownership_changed`，`tasks` 与 `dag` 另有 `empty`。非空时投影原生顺序最多 256 行的状态和时间，任务可含允许展示的内建角色、类别和执行模式，DAG 另含节点数、可用状态计数和不透明 `key`；`memory` 仅返回本会话原生日志的两项步数计数。合法空列表不拿旧快照补位；不返回自由文本标题、原生路由、持久身份、任务与运行标识、路径、提示、输出或错误细节。
+- `GET /api/sessions/:id/native-runtime/dag/:key` → 成功 `{status:"ok",runStatus,waves:[{index,nodes}],nodes:[{id,state,attempt,upstream,agent?,category?}]}`；波次、节点及依赖均用从 `0` 开始的本地编号。`key` 只能由同一 Web 会话、当前宿主绑定与当前列表取得；对于未知、过期或不属于当前绑定的键，返回 `not_found` 状态，不请求任意原生运行。最多 64 节点；不完整或无效拓扑返回 `malformed`，不回传部分图。读取中归属变化返回 `ownership_changed`。
+
+这三条读取只用于已授权且已有原生绑定的会话；未知 Web 会话返回 `404`，已替换或不再授权的目录被拒绝。读取不接纳用户提供的原生标识或方法，不开新会话、无 POST；任务写入和 DAG 控制均未开放。
 - `GET /api/sessions/:id/activity` → `Activity`。只接受已加载的 Web 会话 ID；服务端用内部 durable session ID 和该会话已授权的工作目录查找原生快照。没有加载的 Web 会话不会由该接口打开。
 - `GET /api/cli-history` → `{available, sessions: CliSession[]}`。`CliSession = {id, name, cwd, updatedAt, adopted}`；`cwd` 为服务器授权的工作目录，`updatedAt` 为毫秒。`adopted:true` 表示该原生会话已有 Web 别名（按原生 ID 与工作目录合并），普通侧栏不再重复列出；进入仍走 `resume` 并受持有者接纳。`available:false` 表示读取已关闭或找不到可读的本地历史目录；`available:true` 且 `sessions:[]` 表示没有可显示的记录。
 - `GET /api/cli-history/:id` → `{session: CliSession, messages}`。ID 是本进程最近一次 CLI 列表返回的选择键，不是原生 ID、Web ID 或路径；过期需重新读取列表。仅返回最新分支上可显示的对话投影，不返回原始 journal。
@@ -46,7 +52,7 @@ Bun 1.4.5 的 `opendir().read()` 可在首次读取时将整个目录的条目�
 | --- | --- |
 | `resume` | — |
 | `prompt` | `message`, `mode?: "prompt" \| "steer" \| "follow_up"`, `clientMessageId?`, `expectedTurnId?`, `images?: {type:"image",data:string,mimeType:string}[]` |
-| `command` | `invocation`, `arguments?`（单行文本）, `clientMessageId?`；在当前 Web 会话重新校验命令注册表和空闲状态。未知命令不降级为模型提示，忙碌时不排队。 |
+| `command` | `invocation`, `arguments?`（单行文本）, `clientMessageId?`；在当前 Web 会话重新校验命令注册表和空闲状态。未知命令不降级为模型提示，忙碌时不排队。`/todo`、`/tasks`、`/dag`、`/task-kill`、`/reasoning`、`/efforts`、`/scoped-models`、`/favorite-models` 不走原生转发，直接作为 `prompt` 命令开头提交也会被拒绝。 |
 | `abort` | — |
 | `rename` | `name` |
 | `archive`, `settle`, `fast`, `autoCompaction` | `enabled: boolean` |

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { ToolTrace, Transcript, TranscriptEntry } from "../src/web/transcript.ts";
 
 // Browser checks require a Bun with WebView support and an installed Chromium.
-const chromium = process.env.BUN_CHROME_PATH ?? Bun.which("chromium") ?? Bun.which("google-chrome") ??
+const chromium = process.env.BUN_CHROME_PATH ?? Bun.which("chromium") ?? Bun.which("google-chrome-stable") ?? Bun.which("google-chrome") ??
   (await Bun.file("/opt/google/chrome/chrome").exists() ? "/opt/google/chrome/chrome" : undefined);
 const browserTest = test.skipIf(!chromium || typeof Bun.WebView !== "function");
 type Evaluate = <T>(run: (ctor: typeof Transcript) => T) => Promise<Awaited<T>>;
@@ -179,4 +179,83 @@ browserTest("Chromium keeps tool order, ignores traces for hidden results, and r
       throw new Error("Settled tool lost its position, fold, escaped text, or allowed image");
     }
   }));
+});
+
+browserTest("Chromium keeps only adjacent, proven reads in one disclosure and removes pure-tool headers", async () => {
+  await withTranscript(async evaluate => {
+    const actual = await evaluate(async Transcript => {
+      const root = document.getElementById("messages");
+      const scroller = document.getElementById("transcript");
+      const empty = document.getElementById("no-messages");
+      if (!root || !scroller || !empty) throw new Error("Missing transcript markup");
+      const call = (id: string, name = "read") => ({ type: "toolCall", id, name, arguments: { path: `${id}.ts` } });
+      const assistant = (key: string, ...content: object[]) => ({ key, message: { role: "assistant", timestamp: 1, content } });
+      const result = (id: string, isError: boolean | undefined = false, truncated = false) => ({
+        key: `result:${id}`, message: { role: "toolResult", toolCallId: id, isError, truncated, content: `Output ${id}` },
+      });
+      const user = (key: string) => ({ key, message: { role: "user", content: key } });
+      const transcript = new Transcript(root, scroller, empty);
+      transcript.render([
+        assistant("no-user", call("prior-a"), call("prior-b")), result("prior-a"), result("prior-b"),
+        user("first"), assistant("reads", call("a"), call("b", "grep")), result("a"), result("b"),
+        assistant("lists", call("c", "ls")), result("c"),
+        assistant("notice", { type: "thinking", thinking: "Reasoning" }, call("d")), result("d"),
+        assistant("blocked", call("e"), call("write", "write"), call("f"), call("failed"), call("g"),
+          call("clipped"), call("h"), call("unknown"), call("i"), call("running"), call("j")),
+        result("e"), result("write"), result("f"), result("failed", true), result("g"), result("clipped", false, true),
+        result("h"), { ...result("unknown"), message: { ...result("unknown").message, isError: undefined } },
+        result("i"), result("j"),
+        user("second"), assistant("single", call("k")), result("k"),
+        { key: "approval", message: { role: "custom", content: "Approval required" } },
+        assistant("after-approval", call("l")), result("l"),
+      ], "", new Map([["running", { id: "running", name: "read", stage: "running" }]]));
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      return {
+        groups: [...root.querySelectorAll(".tool-group")].map(group =>
+          [...group.querySelectorAll(".tool-target")].map(target => target.textContent)),
+        calls: [...root.querySelectorAll(".tool-target")].map(target => target.textContent),
+        headers: [...root.querySelectorAll("article > header .speaker")].map(header => header.textContent),
+        times: root.querySelectorAll("time").length,
+      };
+    });
+    expect(actual.groups).toEqual([["a.ts", "b.ts", "c.ts"], ["d.ts", "e.ts"]]);
+    expect(actual.calls).toEqual([
+      "prior-a", "prior-b", "a", "b", "c", "d", "e", "write", "f", "failed", "g", "clipped", "h", "unknown", "i", "running", "j", "k", "l",
+    ].map(id => `${id}.ts`));
+    expect(actual.headers).toEqual(["你", "助手", "你", "会话记录"]);
+    expect(actual.times).toBe(1);
+  });
+});
+
+browserTest("Loading a clipped user turn groups its calls without hiding the open, focused call", async () => {
+  await withTranscript(async evaluate => {
+    const outcome = await evaluate(async Transcript => {
+      const root = document.getElementById("messages");
+      const scroller = document.getElementById("transcript");
+      const empty = document.getElementById("no-messages");
+      const section = document.getElementById("active-session");
+      if (!root || !scroller || !empty || !section) throw new Error("Missing transcript markup");
+      section.hidden = false;
+      const ids = ["a", "b"];
+      new Transcript(root, scroller, empty).render([
+        { key: "user", message: { role: "user", content: "Read both files" } },
+        { key: "read", message: { role: "assistant", content: ids.map(id => ({ type: "toolCall", id, name: "read" })) } },
+        ...ids.map(id => ({ key: `result:${id}`, message: { role: "toolResult", toolCallId: id, isError: false, content: id } })),
+        ...Array.from({ length: 77 }, (_, index) => ({ key: `tail:${index}`, message: { role: "user", content: String(index) } })),
+      ], "", new Map());
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      const summary = root.querySelector<HTMLElement>(".tool-summary");
+      const details = summary?.closest("details");
+      const older = root.querySelector("button");
+      if (!summary || !details || !older || older.hidden || root.querySelector(".tool-group")) throw new Error("Missing clipped-turn setup");
+      details.open = true;
+      scroller.scrollTop = 0;
+      summary.focus({ preventScroll: true });
+      const top = summary.getBoundingClientRect().top;
+      older.click();
+      return { open: details.open, visible: !!summary.closest(".tool-group[open]"), focused: document.activeElement === summary,
+        reading: Math.abs(summary.getBoundingClientRect().top - top) <= 1 };
+    });
+    expect(outcome).toEqual({ open: true, visible: true, focused: true, reading: true });
+  });
 });

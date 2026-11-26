@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z, ZodError } from "zod";
@@ -14,6 +14,7 @@ import { branchSelection } from "./session-branches.ts";
 import { Sessions } from "./sessions.ts";
 import { TerminalSessions } from "./terminal-sessions.ts";
 import { terminalInput } from "./terminal-view.ts";
+import { headers, loadWebAccess } from "./web-access.ts";
 import { WorkspaceAccess, workspacePlatform } from "./workspace-access.ts";
 
 export type AppSettings = {
@@ -22,17 +23,8 @@ export type AppSettings = {
   readonly engineCommand: readonly [string, ...string[]];
   readonly port: number;
   readonly cliAgentDir?: string;
+  readonly webEnv?: Readonly<NodeJS.ProcessEnv>;
 };
-
-const headers = {
-  "Cache-Control": "no-store",
-  "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
-  "Cross-Origin-Resource-Policy": "same-origin",
-  "Referrer-Policy": "no-referrer",
-  "X-Content-Type-Options": "nosniff",
-  "X-Frame-Options": "DENY",
-  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
-} as const;
 
 const assets: Readonly<Record<string, string>> = {
   "/": "../public/index.html",
@@ -75,6 +67,7 @@ async function payload(request: Request): Promise<unknown> {
 }
 
 export async function startApp(settings: AppSettings) {
+  const access = await loadWebAccess(settings.webEnv ?? {}, settings.port);
   const workspaces = await WorkspaceAccess.fromConfig(settings.workspaces);
   const [root] = await workspaces.paths();
   if (!root) throw new WebError(400, "invalid_workspace", "至少需要一个允许的工作目录。");
@@ -111,10 +104,11 @@ export async function startApp(settings: AppSettings) {
   // are not offered: a discoverable endpoint lets another stock TUI attach to
   // the Web host instead of being refused by the native holder guard.
   const cliProfileDir = profile === undefined ? undefined : resolve(profile);
+  const { OMO_WEB_PASSWORD_FILE: _passwordFile, ...engineEnv } = process.env;
   const engine = new Engine(settings.engineCommand, root, event => sessions.event(event), status => {
     if (!status.online) sessions.disconnected();
     fanout({ type: "engine", engine: status });
-  }, undefined, cliProfileDir === undefined ? undefined : { privateHost: true, env: { ...process.env,
+  }, undefined, cliProfileDir === undefined ? { env: engineEnv } : { privateHost: true, env: { ...engineEnv,
     OMO_CODING_AGENT_DIR: cliProfileDir, SENPI_CODING_AGENT_DIR: cliProfileDir, PI_CODING_AGENT_DIR: cliProfileDir,
     // Controlled client capability, not user config: private in-process stdio
     // ignores `question` from set_client_info, so native ask_user_question
@@ -139,22 +133,13 @@ export async function startApp(settings: AppSettings) {
     return { ...await history.branchSource(nativeSessionId, cwd), leafId };
   }
 
-  const fetch = async (request: Request): Promise<Response> => {
-    const { pathname, searchParams } = new URL(request.url);
+  const fetch = async (request: Request, listener?: Bun.Server<undefined>): Promise<Response> => {
     try {
-      const origin = request.headers.get("Origin");
-      if (request.headers.get("Host") !== server.url.host || (origin !== null && origin !== server.url.origin) ||
-          ["cross-site", "same-site"].includes(request.headers.get("Sec-Fetch-Site") ?? "")) {
-        throw new WebError(403, "origin_refused", "只接受本机同源请求。");
-      }
-      if (request.method === "POST") {
-        const provided = Buffer.from(request.headers.get("X-OmO-Token") ?? "");
-        if (origin !== server.url.origin || provided.length !== tokenBytes.length || !timingSafeEqual(provided, tokenBytes)) {
-          throw new WebError(403, "token_refused", "请刷新页面后重试。");
-        }
-      } else if (request.method !== "GET") {
-        throw new WebError(405, "method_refused", "该 HTTP 方法不可用。");
-      }
+      const challenge = access.authorize(request, url, tokenBytes);
+      if (challenge) return challenge;
+      // Native compact can take up to 180 s. Rejected requests keep the short listener default.
+      listener?.timeout(request, 240);
+      const { pathname, searchParams } = new URL(request.url);
 
       if (request.method === "GET") {
         const asset = Object.hasOwn(assets, pathname) ? assets[pathname] : undefined;
@@ -209,7 +194,9 @@ export async function startApp(settings: AppSettings) {
             cancel() { if (controller) clients.delete(controller); },
           }, { highWaterMark: 1024 * 1024, size: chunk => chunk?.byteLength ?? 0 });
           request.signal.addEventListener("abort", () => { if (controller) disconnect(controller); }, { once: true });
-          return new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream; charset=utf-8", "X-Accel-Buffering": "no" } });
+          listener?.timeout(request, 0);
+          return new Response(stream, { headers: { ...headers, Connection: "close",
+            "Content-Type": "text/event-stream; charset=utf-8", "X-Accel-Buffering": "no" } });
         }
       } else if (pathname === "/api/sessions") {
         const { cwd, name } = openInput.parse(await payload(request));
@@ -273,7 +260,9 @@ export async function startApp(settings: AppSettings) {
           return json(result, result.cancelled ? 200 : 201);
         }
       }
-      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|capabilities|activity|native-runtime|actions|branch-options|branches|handoff|last-assistant))?$/i.exec(pathname);
+      const dag = /^\/api\/sessions\/([a-z0-9-]+)\/native-runtime\/dag\/([a-f0-9]{64})$/u.exec(pathname);
+      if (request.method === "GET" && dag?.[2]) return json(await sessions.nativeDag(sessionKey.parse(dag[1]), dag[2]));
+      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|capabilities|activity|native-runtime|workbench-status|actions|branch-options|branches|handoff|last-assistant))?$/i.exec(pathname);
       if (route) {
         const id = sessionKey.parse(route[1]);
         if (request.method === "POST" && route[2] === "actions") return json(await sessions.action(id, actions.parse(await payload(request))));
@@ -300,6 +289,7 @@ export async function startApp(settings: AppSettings) {
           if (route[2] === "details") return json(await sessions.details(id));
           if (route[2] === "capabilities") return json(await sessions.capabilities(id));
           if (route[2] === "native-runtime") return json(await sessions.nativeRuntime(id));
+          if (route[2] === "workbench-status") return json(await sessions.workbenchStatus(id));
           if (route[2] === "last-assistant") return json(await sessions.lastAssistant(id));
           if (route[2] === "activity") {
             const row = (await sessions.scopedList()).find(session => session.id === id);
@@ -325,18 +315,18 @@ export async function startApp(settings: AppSettings) {
   };
 
   const server = Bun.serve({
-    hostname: "127.0.0.1",
+    hostname: access.hostname,
     port: settings.port,
+    ...(access.tls === undefined ? {} : { tls: access.tls }),
+    idleTimeout: 10,
     maxRequestBodySize: MAX_REQUEST_BYTES,
-    fetch(request, listener) {
-      listener.timeout(request, 0);
-      return fetch(request);
-    },
+    fetch,
   });
+  const url = access.origin === undefined ? server.url : new URL(access.origin);
   const heartbeat = setInterval(() => publish(encoder.encode(": keepalive\n\n")), 15_000);
   let closing: Promise<void> | undefined;
   return {
-    url: server.url,
+    url: new URL(url),
     fetch,
     stop() {
       closing ??= (async () => {

@@ -20,6 +20,9 @@ const registry = [
   { name: "fix-tests", description: "Fix failing tests", source: "prompt" },
   { name: "skill:pdf-tools", description: "PDF tools", source: "skill" },
   { name: "hang-start", description: "Hanging command for busy tests", source: "extension" },
+  ...(process.argv.includes("--restricted-catalog") ? ["reasoning", "efforts", "todo", "tasks", "dag", "task-kill"].map(name => ({
+    name, description: "Native command not routed from this workbench", source: "extension",
+  })) : []),
   { name: "secret", description: "Must never surface", source: "internal",
     sourceInfo: { path: "/etc/secret", source: "local", scope: "user", origin: "top-level" } },
 ];

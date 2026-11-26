@@ -1,6 +1,6 @@
 import { button, codeBlock, el, fold, isImageType, list, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
-import { ToolDisplay } from "./tool-display.ts";
+import { groupToolCalls, ToolDisplay, visibleToolTarget } from "./tool-display.ts";
 import type { ToolTrace } from "./tool-display.ts";
 export type { ToolTrace } from "./tool-display.ts";
 
@@ -151,7 +151,7 @@ function timeLabel(timestamp: unknown): HTMLElement | undefined {
 
 type PartView = { readonly part: Wire; readonly node?: HTMLElement };
 type MessageView = {
-  readonly node: HTMLElement; readonly body: HTMLElement; readonly speaker: HTMLElement;
+  readonly node: HTMLElement; readonly body: HTMLElement; readonly header: HTMLElement; readonly speaker: HTMLElement;
   readonly time?: HTMLElement; readonly timestamp: unknown; readonly role: string;
   readonly parts: readonly PartView[]; readonly notices: readonly HTMLElement[]; readonly metadata: string;
 };
@@ -165,11 +165,8 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
   if (speaker.textContent !== label) speaker.textContent = label;
   const body = before?.body ?? el("div", "message-body");
   const time = before?.timestamp === message.timestamp ? before?.time : timeLabel(message.timestamp);
-  if (!before) {
-    const header = el("header");
-    header.append(speaker);
-    node.append(header, body);
-  }
+  const header = before?.header ?? el("header");
+  if (!before) { header.append(speaker); node.append(body); }
   if (before?.time !== time) {
     before?.time?.remove();
     if (time) speaker.after(time);
@@ -197,15 +194,21 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
     ...(stop === "aborted" ? [el("p", "muted small", "已停止生成")] : []),
     ...(stop === "length" ? [el("p", "muted small", "已达到输出长度限制")] : []),
   ];
-  const kept = new Set(rendered.map(part => part.node));
+  const toolOnly = role === "assistant" && !notices.length && rendered.some(({ part }) => part.type === "toolCall")
+    && rendered.every(({ part, node }) => part.type === "toolCall" || !node || (part.type === "text" && !str(part.text).trim()));
+  node.classList.toggle("message--tool-only", toolOnly);
+  if (toolOnly) header.remove();
+  else if (header.parentNode !== node) node.prepend(header);
+  const content = (toolOnly ? rendered.filter(({ part }) => part.type === "toolCall") : rendered).flatMap(part => part.node ?? []);
+  const kept = new Set(content);
   for (const old of before?.parts ?? []) if (old.node?.parentNode === body && !kept.has(old.node)) old.node.remove();
   if (before && before.notices !== notices) for (const old of before.notices) old.remove();
   let next = body.firstElementChild;
-  for (const current of [...rendered.flatMap(part => part.node ?? []), ...notices]) {
+  for (const current of [...content, ...notices]) {
     if (current !== next) body.insertBefore(current, next);
     next = current.nextElementSibling;
   }
-  return { node, body, speaker, time, timestamp: message.timestamp, role, parts: rendered, notices, metadata };
+  return { node, body, header, speaker, time, timestamp: message.timestamp, role, parts: rendered, notices, metadata };
 }
 
 type Row = { readonly key: string; readonly message?: Wire; readonly tool?: ToolTrace; readonly live?: boolean; readonly hasCalls?: boolean };
@@ -297,12 +300,17 @@ export class Transcript {
     const { scrollTop, scrollHeight, clientHeight } = this.scroller;
     const active = document.activeElement;
     const rowFocus = active instanceof HTMLElement && this.root.contains(active)
-      && (active.closest(".tool-details") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
+      && (active.closest(".tool-details, .tool-group") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
+    const toolFocus = rowFocus?.matches(".tool-group-summary")
+      ? rowFocus.parentElement?.querySelector<HTMLElement>(".tool-summary")
+      : rowFocus?.querySelector<HTMLElement>(".tool-summary");
     const nearEnd = scrollHeight - clientHeight - scrollTop < 72;
     const follow = this.forceBottom || (nearEnd && !rowFocus);
     this.forceBottom = false;
     const boundary = expand && this.older.nextElementSibling instanceof HTMLElement ? this.older.nextElementSibling : undefined;
-    const previousTop = boundary?.getBoundingClientRect().top;
+    const toolBoundary = boundary?.querySelector<HTMLElement>(".tool-summary") ?? undefined;
+    const readingAnchor = expand && rowFocus?.closest(".tool-details, .tool-group") && boundary?.contains(rowFocus) ? rowFocus : boundary;
+    const previousTop = readingAnchor?.getBoundingClientRect().top;
     const moveFocus = expand && document.activeElement === this.older;
     this.indexResults(entries);
     const dangling: Row[] = [];
@@ -326,7 +334,7 @@ export class Transcript {
     this.displayed = entries;
     this.first = entries[this.start]?.key;
     const rows: Row[] = [];
-    const visibleCalls = new Set<string>();
+    const visibleCalls = new Map<string, number>();
     for (let index = this.start; index < entries.length; index++) {
       const entry = entries[index];
       if (!entry) continue;
@@ -341,15 +349,16 @@ export class Transcript {
           if (part.type !== "toolCall") continue;
           hasCalls = true;
           const id = str(part.id);
-          if (id) visibleCalls.add(id);
+          if (id) visibleCalls.set(id, (visibleCalls.get(id) ?? 0) + 1);
         }
         rows.push({ ...entry, live: entry.key === liveKey, hasCalls });
       }
     }
     for (let index = Math.max(0, this.start - entries.length); index < dangling.length; index++) rows.push(dangling[index]);
+    const groups = groupToolCalls({ entries, start: this.start, liveKey, tools, calls: visibleCalls, results: this.results });
     const keys = new Set(rows.filter(row => row.message && row.message.role !== "toolResult").map(row => row.key));
     for (const [key, entry] of this.cache) if (!keys.has(key)) {
-      const open = [...entry.view.body.querySelectorAll<HTMLDetailsElement>("details:not(.tool-details)")].flatMap((fold, index) => fold.open ? [index] : []);
+      const open = [...entry.view.body.querySelectorAll<HTMLDetailsElement>(":scope > details:not(.tool-group)")].flatMap((fold, index) => fold.open ? [index] : []);
       if (open.length) this.openFolds.set(key, open);
       entry.view.node.remove();
       this.cache.delete(key);
@@ -375,11 +384,15 @@ export class Transcript {
     this.older.hidden = !this.start;
     const label = `加载更早消息（${this.start} 条）`;
     if (this.older.textContent !== label) this.older.textContent = label;
-    let next = this.older.nextElementSibling;
+    const renderCall = (key: string, part: Wire): HTMLElement | undefined => {
+      const id = str(part.id);
+      const result = this.results.get(id);
+      return renderTool(id ? `id:${id}` : key, part, tools.get(id), result === undefined ? undefined : entries[result]?.message);
+    };
+    let last: Element = this.older;
     let latestUser: HTMLElement | undefined;
     let latestAssistant: HTMLElement | undefined;
     for (const row of rows) {
-      const after = next?.nextElementSibling ?? null;
       const { message } = row;
       let node: HTMLElement | undefined;
       if (!message || message.role === "toolResult") {
@@ -387,11 +400,20 @@ export class Transcript {
         if (id && visibleCalls.has(id)) continue;
         node = renderTool(id ? `id:${id}` : `row:${row.key}`, undefined, row.tool, message);
       } else {
+        let groupedElsewhere = false;
         node = this.updateMessage(row, message, (part, index) => {
           const id = str(part.id);
-          const result = this.results.get(id);
-          return renderTool(id ? `id:${id}` : `part:${row.key}:${index}`, part, tools.get(id), result === undefined ? undefined : entries[result]?.message);
+          const group = groups.get(id);
+          const key = `part:${row.key}:${index}`;
+          if (!group) return renderCall(key, part);
+          if (group[0] !== part) { groupedElsewhere = true; return; }
+          const members = group.flatMap(call => renderCall(key, call) ?? []);
+          return this.toolViews.get(`id:${id}`)?.groupWith(members);
         });
+        if (groupedElsewhere && node.classList.contains("message--tool-only") && !this.cache.get(row.key)?.view.body.childElementCount) {
+          node.remove();
+          continue;
+        }
         if (this.trace && (message.role === "user" || message.role === "assistant")) {
           const rendered = this.cache.get(row.key)?.view.parts;
           if (rendered?.some(({ part, node }) => node && part.type !== "toolCall" && part.type !== "thinking"
@@ -402,26 +424,32 @@ export class Transcript {
         }
       }
       if (!node) continue;
-      if (next && next.parentNode !== this.root) next = after;
+      const next = last.nextElementSibling;
       if (node !== next) this.root.insertBefore(node, next);
-      next = node.nextElementSibling;
+      last = node;
     }
     for (const [key, view] of this.toolViews) if (!usedTools.has(key)) {
       if (view.open) this.openTools.add(key);
       view.node.remove();
       this.toolViews.delete(key);
     }
-    if (rowFocus && document.activeElement === document.body && this.root.contains(rowFocus)) rowFocus.focus({ preventScroll: true });
+    if (rowFocus && document.activeElement === document.body) {
+      const target = this.root.contains(rowFocus) ? rowFocus : toolFocus;
+      if (target && this.root.contains(target)) visibleToolTarget(target)?.focus({ preventScroll: true });
+    }
     this.empty.hidden = total > 0;
-    this.trace?.({ user: latestUser, assistant: latestAssistant, tool: latestTool?.querySelector("summary") ?? undefined });
+    const tool = latestTool?.closest(".tool-group") ?? latestTool;
+    this.trace?.({ user: latestUser, assistant: latestAssistant, tool: tool?.querySelector("summary") ?? undefined });
     if (expand) {
       if (loaded) this.status.textContent = `已加载 ${loaded} 条更早消息。`;
-      if (boundary && this.root.contains(boundary) && previousTop !== undefined) {
+      const anchor = readingAnchor && this.root.contains(readingAnchor)
+        ? visibleToolTarget(readingAnchor) : visibleToolTarget(toolBoundary);
+      if (anchor && this.root.contains(anchor) && previousTop !== undefined) {
         if (moveFocus) {
-          boundary.tabIndex = -1;
-          boundary.focus({ preventScroll: true });
+          if (anchor.tagName !== "SUMMARY") anchor.tabIndex = -1;
+          anchor.focus({ preventScroll: true });
         }
-        this.scroller.scrollTop += boundary.getBoundingClientRect().top - previousTop;
+        this.scroller.scrollTop += anchor.getBoundingClientRect().top - previousTop;
       } else if (moveFocus) this.scroller.focus({ preventScroll: true });
     } else if (follow) this.scroller.scrollTop = this.scroller.scrollHeight;
   }
@@ -436,7 +464,7 @@ export class Transcript {
     if (!previous) {
       const open = this.openFolds.get(key);
       if (open) {
-        const folds = view.body.querySelectorAll<HTMLDetailsElement>("details:not(.tool-details)");
+        const folds = view.body.querySelectorAll<HTMLDetailsElement>(":scope > details:not(.tool-group)");
         for (const index of open) if (folds[index]) folds[index].open = true;
         this.openFolds.delete(key);
       }

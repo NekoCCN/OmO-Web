@@ -17,11 +17,18 @@ export const BUILTIN_COMMANDS: readonly BuiltinEntry[] = [
   { name: "name", invocation: "/name", label: "重命名（别名）", description: "与 /rename 相同：设置会话显示名。" },
   { name: "session", invocation: "/session", label: "会话信息", description: "查看当前会话的信息与统计。" },
   { name: "tree", invocation: "/tree", label: "会话树", description: "查看会话分支树并跳到任意点继续。" },
+  { name: "todo", invocation: "/todo", label: "本会话待办", description: "查看当前分支的待办。" },
+  { name: "tasks", invocation: "/tasks", label: "本会话任务", description: "查看当前会话的原生子代理任务。" },
+  { name: "dag", invocation: "/dag", label: "本会话 DAG", description: "查看本会话的运行，展开读取波次和依赖。" },
+  { name: "help", invocation: "/help", label: "命令帮助", description: "查看 Web 可用的命令和快捷键。" },
+  { name: "hotkeys", invocation: "/hotkeys", label: "快捷键", description: "查看此工作台的键盘操作。" },
   { name: "fork", invocation: "/fork", label: "分支", description: "选择一条用户消息，从该消息之前创建分支。" },
   { name: "clone", invocation: "/clone", label: "副本", description: "复制当前会话为新会话并切换过去。" },
   { name: "compact", invocation: "/compact", label: "压缩上下文", description: "手动压缩上下文（指示可选，最长 6000 字）。" },
   { name: "model", invocation: "/model", label: "模型", description: "切换本会话的模型（只对当前会话有效）。" },
   { name: "thinking", invocation: "/thinking", label: "思考档位", description: "设置思考档位（可选；档位按实际可选值校验）。" },
+  { name: "reasoning", invocation: "/reasoning", label: "推理状态", description: "查看当前模型是否启用推理。持久设置在本机修改。" },
+  { name: "efforts", invocation: "/efforts", label: "原生推理档位", description: "查看当前档和原生可用档位。持久设置在本机修改。" },
   { name: "fast", invocation: "/fast", label: "极速模式", description: "切换极速模式（开、关或不带参数切换；只影响当前模型）。" },
   { name: "copy", invocation: "/copy", label: "复制", description: "复制上一条助手消息。" },
 ] as const;
@@ -31,8 +38,8 @@ export const BUILTIN_COMMAND_NAMES: readonly BuiltinCommandName[] = BUILTIN_COMM
 const TUI_ONLY_NAMES = [
   "settings",
   "scoped-models",
-  "reasoning",
-  "efforts",
+  "favorite-models",
+  "task-kill",
   "login",
   "logout",
   "trust",
@@ -40,8 +47,6 @@ const TUI_ONLY_NAMES = [
   "import",
   "share",
   "reload",
-  "hotkeys",
-  "help",
   "keybindings",
   "changelog",
   "quit",
@@ -58,6 +63,7 @@ export type BuiltinCommand =
   | { readonly name: "sessions" }
   | { readonly name: "session" }
   | { readonly name: "tree" }
+  | { readonly name: "todo" | "tasks" | "dag" | "help" | "hotkeys" | "reasoning" | "efforts" }
   | { readonly name: "fork" }
   | { readonly name: "clone" }
   | { readonly name: "copy" }
@@ -76,7 +82,13 @@ export type BuiltinParseResult =
   /** 受支持的内置命令：参数已校验。 */
   | { readonly kind: "builtin"; readonly command: BuiltinCommand }
   /** 已知但浏览器不支持：按 name 提示，不转发。 */
-  | { readonly kind: "tui-only"; readonly name: TuiOnlyName };
+  | { readonly kind: "tui-only"; readonly name: TuiOnlyName | "reasoning" | "efforts" };
+
+export function opensReadOnlyView(text: string): boolean {
+  const parsed = parseBuiltinInput(text);
+  return parsed.kind === "builtin" &&
+    ["session", "tree", "todo", "tasks", "dag", "help", "hotkeys", "reasoning", "efforts"].includes(parsed.command.name);
+}
 
 const MAX_RENAME = 120;
 const MAX_COMPACT = 6000;
@@ -111,11 +123,19 @@ export function parseBuiltinInput(text: string): BuiltinParseResult {
     case "sessions":
     case "session":
     case "tree":
+    case "todo":
+    case "tasks":
+    case "dag":
+    case "help":
+    case "hotkeys":
     case "fork":
     case "clone":
     case "copy":
       if (args !== "") return malformed(`“/${name}”不带参数。`);
       return { kind: "builtin", command: { name } };
+    case "reasoning":
+    case "efforts":
+      return args === "" ? { kind: "builtin", command: { name } } : { kind: "tui-only", name };
     case "rename":
     case "name":
       if (args.length > MAX_RENAME) return malformed("会话名称不能超过 120 字。");

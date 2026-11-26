@@ -16,6 +16,17 @@ export type NativeCommand = {
 const SHORT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const SKILL_NAME = /^skill:[A-Za-z0-9-]{1,64}$/;
 const SKILL_SHORT = /^[A-Za-z0-9-]{1,64}$/;
+const localRuntimeCommands = new Set([
+  "/dag", "/tasks", "/task-kill", "/todo", "/reasoning", "/efforts", "/scoped-models", "/favorite-models",
+]);
+
+/** These native names belong to local views or device-level actions, not the command relay. */
+export function refuseRuntimeCommandRelay(text: string): void {
+  const head = text.split(/\s/u, 1)[0];
+  if (head && localRuntimeCommands.has(head)) {
+    throw new WebError(400, "runtime_command_local", "该命令由 Web 本地查看入口处理；原生修改请在本机 OmO 终端操作。");
+  }
+}
 
 export function isCommandSource(value: unknown): value is CommandSource {
   return value === "extension" || value === "prompt" || value === "skill";

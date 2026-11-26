@@ -14,12 +14,12 @@ afterEach(async () => {
   await Promise.all(cleanups.splice(0).map(cleanup => cleanup()));
 });
 
-async function launch() {
+async function launch(restrictedCatalog = false) {
   const directory = await mkdtemp(join(tmpdir(), "omo-web-commands-test-"));
   const settings = {
     dataDir: join(directory, "data"),
     workspaces: [directory],
-    engineCommand: [process.execPath, fixture] as const,
+    engineCommand: [process.execPath, fixture, ...(restrictedCatalog ? ["--restricted-catalog"] : [])] as const,
     port: 0,
   };
   const app = await startApp(settings);
@@ -100,6 +100,22 @@ describe("native command contracts", () => {
       expect(response.status).toBeGreaterThanOrEqual(400);
     }
     expect(await assistantTexts(client, id)).toEqual([]);
+  });
+
+  test("registered runtime-view names cannot relay native task, DAG or persistent reasoning commands", async () => {
+    const client = await launch(true);
+    const id = await create(client);
+    for (const [invocation, args] of [
+      ["/reasoning", "off"], ["/efforts", "high"], ["/todo", "rm"], ["/tasks", "--all"], ["/dag", "any"], ["/task-kill", ""],
+    ]) {
+      const command = await client.post(`/api/sessions/${id}/actions`, { action: "command", invocation, arguments: args });
+      const direct = await client.post(`/api/sessions/${id}/actions`, { action: "prompt", message: `${invocation} ${args}` });
+      expect([command.status, direct.status]).toEqual([400, 400]);
+    }
+    expect(await assistantTexts(client, id)).toEqual([]);
+    const escaped = await client.post(`/api/sessions/${id}/actions`, { action: "prompt", message: " /reasoning off" });
+    expect(escaped.status).toBe(200);
+    expect(await assistantTexts(client, id)).toEqual([expect.stringContaining("Echo:  /reasoning off")]);
   });
 
   test("dedicated command is refused while busy instead of being queued", async () => {

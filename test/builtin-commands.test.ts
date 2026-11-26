@@ -6,8 +6,8 @@ import {
 } from "../src/web/builtin-commands.ts";
 
 describe("builtin command allowlist", () => {
-  test("allowlist holds fourteen names", () => {
-    expect(BUILTIN_COMMAND_NAMES).toHaveLength(14);
+  test("allowlist holds twenty-one names", () => {
+    expect(BUILTIN_COMMAND_NAMES).toHaveLength(21);
   });
 
   test("every picker entry invokes its own parse path", () => {
@@ -54,6 +54,13 @@ describe("no-argument builtins", () => {
     ["/sessions"],
     ["/session"],
     ["/tree"],
+    ["/todo"],
+    ["/tasks"],
+    ["/dag"],
+    ["/help"],
+    ["/hotkeys"],
+    ["/reasoning"],
+    ["/efforts"],
     ["/fork"],
     ["/clone"],
     ["/copy"],
@@ -75,6 +82,9 @@ describe("no-argument builtins", () => {
     ["/sessions all"],
     ["/session verbose"],
     ["/tree abc123"],
+    ["/todo done one"],
+    ["/tasks --all"],
+    ["/dag dag_native_id"],
     ["/fork entry-1"],
     ["/clone here"],
     ["/copy all"],
@@ -195,8 +205,10 @@ describe("known TUI-only commands never reach the model", () => {
   test.each([
     ["/settings"],
     ["/scoped-models"],
-    ["/reasoning"],
-    ["/efforts"],
+    ["/reasoning off"],
+    ["/efforts high"],
+    ["/favorite-models"],
+    ["/task-kill"],
     ["/login"],
     ["/logout"],
     ["/trust"],
@@ -204,8 +216,6 @@ describe("known TUI-only commands never reach the model", () => {
     ["/import"],
     ["/share"],
     ["/reload"],
-    ["/hotkeys"],
-    ["/help"],
     ["/keybindings"],
     ["/changelog"],
     ["/quit"],

@@ -13,6 +13,7 @@ const cliProfile = process.env.OMO_WEB_CLI_AGENT_DIR ?? (process.env.OMO_CODING_
   || process.env.SENPI_CODING_AGENT_DIR || process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omo", "agent"));
 const app = await startApp({
   port,
+  webEnv: process.env,
   dataDir: resolve(process.env.OMO_WEB_DATA ?? join(homedir(), ".omo-web")),
   workspaces,
   ...(cliProfile.trim() ? { cliAgentDir: resolve(cliProfile) } : {}),

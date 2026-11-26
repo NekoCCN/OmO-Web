@@ -17,6 +17,7 @@ const detector = detectorPath ? await import(pathToFileURL(resolve(detectorPath)
 const phase = process.argv.includes("--baseline") ? "before" : "after";
 const assertTrace = phase === "after" && !process.argv.includes("--measure-ledger-baseline");
 const assertSignal = process.argv.includes("--verify-prism-motion");
+const assertInspectorMotion = process.argv.includes("--verify-inspector-motion");
 const assertColorRoles = process.argv.includes("--verify-color-roles");
 const mobileNarrow = { width: 320, height: 740, deviceScaleFactor: 1, mobile: true, hasTouch: true };
 const root = await mkdtemp(join(tmpdir(), "omo-tonal-workspace-"));
@@ -270,6 +271,41 @@ try {
       await media("no-preference");
       console.log("PRISM_TRACE_MOTION_OK finite-replay reduced-static-focus");
     }
+  }
+  if (assertInspectorMotion) {
+    const motion = {};
+    for (const [mode, preference, forced] of [
+      ["normal", "no-preference", "none"], ["reduced", "reduce", "none"], ["forced", "no-preference", "active"],
+    ]) {
+      await page.cdp.send("Emulation.setEmulatedMedia", { features: [
+        { name: "prefers-reduced-motion", value: preference }, { name: "forced-colors", value: forced },
+      ] }, await page.resolveSessionId());
+      motion[mode] = await page.evaluate(() => {
+        const panel = document.querySelector("#details-dialog");
+        document.querySelector("#details-button").click();
+        const cssAnimations = panel.getAnimations({ subtree: true }).filter(animation => animation instanceof CSSAnimation);
+        return {
+          opened: panel.open,
+          durations: cssAnimations.map(animation => {
+            const end = animation.effect.getComputedTiming().endTime;
+            return Number.isFinite(end) ? end : "infinite";
+          }),
+          contentMotion: cssAnimations.some(animation => animation.effect.target instanceof Element &&
+            animation.effect.target.closest(".details-scroll")),
+        };
+      });
+      assert(motion[mode].opened && !motion[mode].contentMotion, `Inspector opens without moving scroll content: ${mode}`);
+      const { durations } = motion[mode];
+      if (mode === "normal") {
+        assert(durations.length > 0 && durations.every(ms => ms >= 160 && ms <= 220),
+          `Inspector needs short, one-shot opening feedback (160–220ms); got ${JSON.stringify(durations)}`);
+      } else {
+        assert.deepEqual(durations, [], `Inspector must not animate in ${mode} mode`);
+      }
+      await close();
+    }
+    await page.cdp.send("Emulation.setEmulatedMedia", { features: [] }, await page.resolveSessionId());
+    console.log("INSPECTOR_MOTION_OK", JSON.stringify(motion));
   }
   await open();
   await capture("desktop-inspector");

@@ -330,11 +330,9 @@ async function verify() {
     };
     const assertCounts = async (total, reflected) => assert.deepEqual(await page.evaluate(journal =>
       [...document.querySelectorAll(`${journal} dd`)].map(node => node.textContent), journal), [total, reflected]);
-    const checkDisabled = async (panel, count) => {
-      const actions = await page.evaluate(panel => [...document.querySelectorAll(`${panel} button`)].map(button => ({
-        disabled: button.disabled, described: Boolean(document.getElementById(button.getAttribute("aria-describedby"))?.getClientRects().length),
-      })), panel);
-      assert.deepEqual(actions, Array.from({ length: count }, () => ({ disabled: true, described: true })));
+    const checkReadOnly = async panel => {
+      assert.equal(await page.evaluate(panel => document.querySelector(panel).querySelectorAll(
+        "button, input, textarea, select, [role=button], [contenteditable=true]").length, panel), 0);
     };
     const assertEmpty = async () => {
       await tabClick("subagents");
@@ -380,10 +378,10 @@ async function verify() {
       assert(await focus(tab("subagents")));
       await visible(tasks, "实时宿主");
       await visible(tasks, "出错");
-      await checkDisabled(tasks, 2);
+      await checkReadOnly(tasks);
       await tabClick("dag");
       await visible(dag, "3 个节点");
-      await checkDisabled(dag, 1);
+      await checkReadOnly(dag);
       await tabClick("todo");
       await visible(`${journal} dd`, "^8$");
       await assertCounts("8", "5");

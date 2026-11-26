@@ -1,11 +1,11 @@
 import { link, lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
-import { composeMessage, projectCommands, resolveCommand } from "./commands.ts";
+import { composeMessage, projectCommands, refuseRuntimeCommandRelay, resolveCommand } from "./commands.ts";
 import { modelProfile, registeredModel } from "./model-options.ts";
 import type { ModelTarget } from "./model-options.ts";
-import { bindNativeRuntime, readNativeRuntime, unavailableNativeRuntime } from "./native-runtime.ts";
-import type { NativeRuntimeBinding, NativeRuntimeSummary } from "./native-runtime.ts";
+import { bindNativeRuntime, readNativeDag, readNativeRuntime, readWorkbenchStatus, unavailableNativeRuntime } from "./native-runtime.ts";
+import type { NativeRuntimeBinding, RuntimeInactiveReason, RuntimeReadScope } from "./native-runtime.ts";
 import { readNativeSurfaces } from "./native-surfaces.ts";
 import { WebError, array, browserEvent, model, pick, record, sessionKey, state, transcriptMessage, transcriptTree } from "./protocol.ts";
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
@@ -287,7 +287,7 @@ export class Sessions {
         throw error;
       }
     }
-    const runtime = bindNativeRuntime(initial, {
+    const runtime = result.attached === true ? undefined : bindNativeRuntime(initial, {
       route, cwd: row.cwd, sessionFile: opts.nativePlaced === undefined ? sessionPath : initial.sessionFile,
       durableId: bound ?? row.nativeId,
     });
@@ -503,20 +503,38 @@ export class Sessions {
       handoff: this.#handoffEligibility(record(rawState)) };
   }
 
-  async nativeRuntime(id: SessionKey): Promise<NativeRuntimeSummary> {
+  #runtimeRead(id: SessionKey): RuntimeReadScope | RuntimeInactiveReason {
     const row = this.#row(id);
     const live = this.#live.get(id);
     if (row.archived || !live || this.#opening.has(id) || this.#releasing.has(id)) {
-      return unavailableNativeRuntime("inactive");
+      return "inactive";
     }
-    if (this.engine.usesListeningTransport) return unavailableNativeRuntime("unsupported");
-    if (!live.runtime) return unavailableNativeRuntime("binding_unverified");
+    if (this.engine.usesListeningTransport) return "unsupported";
+    if (!live.runtime) return "binding_unverified";
     const host = this.engine.status;
-    return readNativeRuntime(this.engine, live.runtime, () =>
-      this.engine.status === host && this.#live.get(id) === live &&
-      this.#rows.get(id)?.archived === false &&
-      !this.#opening.has(id) && !this.#releasing.has(id) &&
-      ![...this.#live].some(([other, current]) => other !== id && current.route === live.route));
+    return {
+      engine: this.engine, target: live.runtime, verifyWorkspace: () => this.#requireRowWorkspace(row),
+      isCurrent: () => {
+        const current = this.#rows.get(id);
+        return this.engine.status === host && this.#live.get(id) === live &&
+          current?.archived === false && current.cwd === row.cwd && current.nativeId === row.nativeId &&
+          current.workspaceKey === row.workspaceKey && !this.#opening.has(id) && !this.#releasing.has(id) &&
+          ![...this.#live].some(([other, current]) => other !== id && current.route === live.route);
+      },
+    };
+  }
+
+  async nativeRuntime(id: SessionKey) {
+    const scope = this.#runtimeRead(id);
+    return typeof scope === "string" ? unavailableNativeRuntime(scope) : readNativeRuntime(scope);
+  }
+
+  workbenchStatus(id: SessionKey) {
+    return readWorkbenchStatus(this.#runtimeRead(id));
+  }
+
+  nativeDag(id: SessionKey, key: string) {
+    return readNativeDag(this.#runtimeRead(id), key);
   }
 
   /** Web alias for a known durable native session in this workspace, if any.
@@ -733,7 +751,7 @@ export class Sessions {
     await this.#authorizeBranchSource(cwd, await this.#requireRowWorkspace(row));
     let sourcePath = join(this.#directory, `${id}.jsonl`);
     let bookmarked: string | undefined;
-    if (row.cliBookmark) {
+    if (row.cliBookmark || row.shared === true) {
       if (!row.nativeId || !this.resolveCli) throw staleBranch();
       bookmarked = row.nativeId;
       sourcePath = (await this.resolveCli(row.nativeId, cwd)).sourcePath;
@@ -963,6 +981,7 @@ export class Sessions {
     switch (action.action) {
       case "prompt": {
         if (!action.message.trim() && !action.images?.length) throw new WebError(400, "empty_prompt", "请输入内容或添加图片。");
+        refuseRuntimeCommandRelay(action.message);
         result = pick(await request(action.mode, { message: action.message, images: action.images,
           clientMessageId: action.clientMessageId, expectedTurnId: action.expectedTurnId }, 90_000),
         ["disposition", "turnId", "clientMessageId", "duplicate"]);
@@ -970,6 +989,7 @@ export class Sessions {
         break;
       }
       case "command": {
+        refuseRuntimeCommandRelay(action.invocation);
         const catalog = projectCommands((await request("get_commands")).commands);
         const target = resolveCommand(catalog, action.invocation);
         if (!target) throw new WebError(400, "unknown_command", "该命令不存在或在此会话不可用，不会发送给模型。");

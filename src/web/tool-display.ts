@@ -1,5 +1,6 @@
 import { codeBlock, el, list, object, pretty, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import type { TranscriptEntry } from "./transcript.ts";
 
 export type ToolTrace = {
   readonly id: string; readonly name: string; readonly args?: unknown; readonly output?: unknown;
@@ -60,6 +61,7 @@ export class ToolDisplay {
   private readonly empty = el("p", "muted small");
   private lastArgs?: unknown;
   private lastOutput?: unknown;
+  private group?: { readonly node: HTMLDetailsElement; readonly summary: HTMLElement; readonly body: HTMLElement };
 
   constructor(private readonly renderOutputPart: RenderOutputPart) {
     const summary = el("summary", "tool-summary");
@@ -96,6 +98,33 @@ export class ToolDisplay {
 
   get open(): boolean { return this.details.open; }
   set open(value: boolean) { this.details.open = value; }
+
+  groupWith(members: readonly HTMLElement[]): HTMLDetailsElement {
+    if (!this.group) {
+      const node = el("details", "tool-group");
+      const summary = el("summary", "tool-group-summary");
+      const body = el("div", "tool-group-body");
+      node.append(summary, body);
+      this.group = { node, summary, body };
+    }
+    const { node, summary, body } = this.group;
+    const label = `探查工具 · ${members.length} 项成功`;
+    if (summary.textContent !== label) summary.textContent = label;
+    let next = body.firstElementChild;
+    for (const member of members) {
+      if (member.parentElement !== body && (member.contains(document.activeElement) || member.querySelector(".tool-details[open]"))) {
+        node.open = true;
+      }
+      if (member !== next) body.insertBefore(member, next);
+      next = member.nextElementSibling;
+    }
+    while (next) {
+      const remaining = next.nextElementSibling;
+      next.remove();
+      next = remaining;
+    }
+    return node;
+  }
 
   update(call?: Wire, trace?: ToolTrace, result?: Wire): void {
     const name = str(call?.name) || trace?.name || str(result?.toolName);
@@ -138,4 +167,64 @@ export class ToolDisplay {
     const placeholder = state === "running" ? "等待工具输出…" : state === "unknown" && !result ? "没有可见的工具结果。" : "无可显示的输出。";
     if (this.empty.textContent !== placeholder) this.empty.textContent = placeholder;
   }
+}
+
+const inspectionTools = new Set(["read", "read_file", "grep", "find", "glob", "ls", "list", "list_dir", "list_directory", "list_files"]);
+const clipped = (message: Wire): boolean => message.truncated === true || message.partial === true;
+
+type GroupSource = {
+  readonly entries: readonly TranscriptEntry[]; readonly start: number; readonly liveKey: string;
+  readonly tools: ReadonlyMap<string, ToolTrace>; readonly calls: ReadonlyMap<string, number>;
+  readonly results: ReadonlyMap<string, number>;
+};
+
+export function groupToolCalls({ entries, start, liveKey, tools, calls, results }: GroupSource): ReadonlyMap<string, readonly Wire[]> {
+  const groups = new Map<string, readonly Wire[]>();
+  let visibleTurn = false;
+  let run: Wire[] = [];
+  const endRun = () => {
+    if (run.length > 1) for (const call of run) groups.set(str(call.id), run);
+    run = [];
+  };
+  for (let index = start; index < entries.length; index++) {
+    const entry = entries[index];
+    const message = entry?.message;
+    if (!entry || !message || message.role !== "assistant" || !visibleTurn || entry.key === liveKey || message.streaming === true ||
+      clipped(message) || str(message.errorMessage) || (message.stopReason !== undefined && message.stopReason !== "toolUse" && message.stopReason !== "stop")) {
+      endRun();
+      if (message?.role === "user") visibleTurn = !clipped(message);
+      continue;
+    }
+    const content = list(message.content).map(object);
+    if (!content.length) { endRun(); continue; }
+    const callIds = new Set(content.flatMap(part => part.type === "toolCall" ? str(part.id) || [] : []));
+    const settled = new Map<string, Wire>();
+    // Only results contiguous with their originating assistant can bridge to the next message.
+    for (let next = entries[index + 1]?.message; next?.role === "toolResult"; next = entries[index + 1]?.message) {
+      const id = str(next.toolCallId);
+      if (!callIds.has(id) || settled.has(id) || results.get(id) !== index + 1) break;
+      settled.set(id, next);
+      index++;
+    }
+    // A non-tool part breaks the run at its own position, not at the message boundary.
+    for (const call of content) {
+      const id = str(call.id);
+      const name = str(call.name).toLowerCase();
+      const result = settled.get(id);
+      const stage = tools.get(id)?.stage;
+      if (call.type === "toolCall" && calls.get(id) === 1 && inspectionTools.has(name) && !clipped(call) &&
+        result?.isError === false && !clipped(result) && !str(result.errorMessage) &&
+        (!str(result.toolName) || str(result.toolName).toLowerCase() === name) && (stage === undefined || stage === "done")) {
+        run.push(call);
+      } else endRun();
+    }
+  }
+  endRun();
+  return groups;
+}
+
+export function visibleToolTarget(node?: HTMLElement): HTMLElement | undefined {
+  if (!node) return;
+  const group = node.closest(".tool-group:not([open])");
+  return group?.querySelector<HTMLElement>(":scope > summary") ?? node;
 }

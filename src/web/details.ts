@@ -80,6 +80,11 @@ function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
   const cache = projectCacheRates(object(state.usageTotals));
   const latest = cache.status === "ok" ? cache.latest : undefined;
   const cumulative = cache.status === "ok" ? cache.cumulative : undefined;
+  const input = num(tokens.input);
+  const cacheRead = num(tokens.cacheRead);
+  const cacheWrite = num(tokens.cacheWrite);
+  const nonNegative = (n: number | undefined): n is number => n !== undefined && n >= 0;
+  const splitInput = nonNegative(input) && nonNegative(cacheRead) && nonNegative(cacheWrite);
   const cost = num(stats.cost);
   const failures = object(stats.failures);
   const mainHeap = num(memory.mainHeapBytes);
@@ -104,7 +109,8 @@ function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
       ["用户消息", format(stats.userMessages)],
       ["助手消息", format(stats.assistantMessages)],
       ["工具调用", format(stats.toolCalls)],
-      ["输入 token", format(tokens.input)],
+      ["输入 token（含缓存）", splitInput ? format(input + cacheRead + cacheWrite) : NO_SIGNAL],
+      ["未缓存输入 token", splitInput ? format(input + cacheWrite) : format(input)],
       ["输出 token", format(tokens.output)],
       ["缓存读取 token", format(tokens.cacheRead)],
       ["缓存写入 token", format(tokens.cacheWrite)],
@@ -224,7 +230,9 @@ function treePanel(data: Wire, controls: Controls): HTMLElement {
   actionBar.append(clear);
   const body = table.childElementCount ? fold("查看会话节点", el("p", "small muted", "选择历史用户消息可将其载入输入框；不会自动发送。"), table, actionBar)
     : el("p", "small muted", "没有可导航的会话节点。");
-  return part("会话树", body);
+  const section = part("会话树", body);
+  section.id = "runtime-tree";
+  return section;
 }
 
 const todoStatusText: Readonly<Record<string, string>> = {
@@ -320,7 +328,7 @@ export function renderDetails(data: Wire, state: Wire, options: Wire, controls: 
   const oldBranch = todo.querySelector("[data-runtime-branch]");
   branch.dataset.runtimeBranch = "";
   if (oldBranch) oldBranch.replaceWith(branch);
-  else todo.append(branch);
+  else todo.prepend(branch);
   [...metrics.querySelectorAll("details"), ...todo.querySelectorAll("details")].forEach((node, i) => {
     node.open = opened[i] ?? false;
   });
