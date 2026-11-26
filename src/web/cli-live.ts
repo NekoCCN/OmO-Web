@@ -11,7 +11,7 @@ const btn = (id: string) => byId(id, HTMLButtonElement);
 const hint = "仅普通文字。命令、权限审批及私密交互请回到 CLI 处理。";
 const missing = new Set(["terminal_not_attached", "terminal_not_found", "terminal_offline"]);
 
-export function cliLive(api: Api, onClose: () => void, openBranch: (source: BranchSource) => void) {
+export function cliLive(api: Api, onClose: () => void, openBranch: (source: BranchSource) => void, inWorkspace: (cwd: string) => boolean) {
   const modal = byId("cli-live-dialog", HTMLDialogElement);
   const select = byId("cli-live-session", HTMLSelectElement);
   const input = byId("cli-live-input", HTMLTextAreaElement);
@@ -19,6 +19,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
   const tools = new Map<string, ToolTrace>();
   const drafts = new Map<string, string>();
   const uncertain = new Map<string, string>();
+  let discovered: readonly Candidate[] = [];
   let items: readonly Candidate[] = [];
   let available: boolean | undefined;
   let attached = "";
@@ -84,6 +85,17 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
     render();
   }
 
+  function scopeCandidates(): void {
+    const previous = select.value;
+    // Changing the filter must not invalidate an existing connection or one
+    // whose explicit connect request is already in flight.
+    const keep = attached || (pending === "connect" ? previous : "");
+    items = discovered.filter(row => row.id === keep || inWorkspace(row.cwd));
+    select.replaceChildren(option("选择可用会话", ""), ...items.map(row => option(row.name, row.id)));
+    select.value = items.some(item => item.id === previous) ? previous : items.length === 1 ? items[0]?.id ?? "" : "";
+    if (select.value !== previous) clearSelection();
+  }
+
   async function discover(): Promise<void> {
     if (attached || listing || !modal.open) return;
     const request = listing = new AbortController();
@@ -93,14 +105,11 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
       const data = await api.request("/api/cli-live", undefined, request.signal);
       if (!modal.open || request.signal.aborted) return;
       available = data.available === true;
-      items = list(data.sessions).map(object).flatMap(row => {
+      discovered = list(data.sessions).map(object).flatMap(row => {
         const id = str(row.id);
         return id ? [{ id, name: str(row.name) || "未命名 CLI 会话", cwd: str(row.cwd) }] : [];
       });
-      const previous = select.value;
-      select.replaceChildren(option("选择可用会话", ""), ...items.map(row => option(row.name, row.id)));
-      select.value = items.some(item => item.id === previous) ? previous : items.length === 1 ? items[0]?.id ?? "" : "";
-      if (select.value !== previous) clearSelection();
+      scopeCandidates();
     } catch (error) {
       if (!request.signal.aborted && modal.open) {
         available = false;
@@ -226,6 +235,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
       notice(alert, errorText(error));
     } finally {
       pending = undefined;
+      if (!attached && (action.action === "disconnect" || action.action === "connect")) scopeCandidates();
       render();
       if (modal.open) focus?.focus({ preventScroll: true });
       if (attached) queueRead(0);
@@ -270,6 +280,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
       render();
       if (!attached) void discover();
     },
+    scopeChanged() { scopeCandidates(); render(); },
     closeAfterBranch() { restoreOnClose = false; modal.close(); },
     invalidate(id: string) { if (attached && attached === id) queueRead(); },
     setTransport(next: typeof transport) {

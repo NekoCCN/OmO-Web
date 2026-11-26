@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { record } from "../src/protocol.ts";
@@ -40,8 +40,113 @@ async function setup(enabled = true) {
     if (!Array.isArray(sessions)) throw new Error("Missing fixture discovery");
     return String(record(sessions[0]).id);
   }
-  return { ...terminal, get, post, data, discover };
+  async function follow() {
+    const response = await get("/api/cli-follow");
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    return data(response);
+  }
+  return { ...terminal, app, get, post, data, discover, follow };
 }
+
+test("CLI follow shares a short observer read and returns only projected messages and session metadata", async () => {
+  const f = await setup();
+  f.state.running = true;
+  f.state.messages = [
+    { role: "user", content: "\u001b[32mvisible\u001b[0m", sessionId: f.state.durable },
+    { role: "assistant", content: [{ type: "thinking", thinking: "fixture-private" }, { type: "text", text: "reply" }] },
+    { role: "toolResult", content: "fixture-private" },
+  ];
+  const expected = { status: "ok", session: { id: expect.stringMatching(/^[a-f0-9]{64}$/),
+    name: "Fixture TUI", cwd: f.cwd, running: true },
+    messages: [{ role: "user", content: "visible" }, { role: "assistant", content: "reply" }] };
+  const results = await Promise.all([f.follow(), f.follow(), f.follow()]);
+  expect(results).toEqual([expected, expected, expected]);
+  expect(f.state.acceptedSecrets).toBe(1);
+  expect(f.trace.filter(request => request.type === "get_messages")).toHaveLength(1);
+  for (const request of f.trace) {
+    expect(["get_protocol_info", "list_sessions", "get_state", "get_messages"]).toContain(String(request.type));
+    expect(request.observe).toBe(true);
+  }
+  expect(f.delivered).toEqual([]);
+});
+
+test("CLI follow distinguishes an empty registry from a disabled profile", async () => {
+  const f = await setup();
+  await rename(f.endpoint, join(f.registry, "retired"));
+  expect(await f.follow()).toEqual({ status: "none" });
+  expect(await (await setup(false)).follow()).toEqual({ status: "unavailable" });
+});
+
+type CliFixture = Awaited<ReturnType<typeof setup>>;
+const extraRegistration = (f: CliFixture) =>
+  mkdir(join(f.registry, "0123456789abcdef"), { mode: 0o700 });
+
+test("CLI follow refuses multiple registration names before authenticating or reading any socket", async () => {
+  const f = await setup();
+  f.state.cwd = `${f.cwd}/not-authorized`;
+  await extraRegistration(f); // Second name has no authenticatable endpoint.
+  expect(await f.follow()).toEqual({ status: "ambiguous" });
+  expect(f.state.acceptedSecrets).toBe(0);
+  expect(f.trace).toEqual([]);
+});
+
+test("CLI follow rejects a real child directory outside the exact authorized roots before reading messages", async () => {
+  const f = await setup();
+  f.state.cwd = join(f.cwd, "child");
+  await mkdir(f.state.cwd);
+  f.state.messages = [{ role: "user", content: "not authorized" }];
+  expect(await f.follow()).toEqual({ status: "unavailable" });
+  expect(f.trace.map(request => request.type)).not.toContain("get_messages");
+});
+
+test.each([
+  ["session changes", async f => { f.state.durable = "new-native-session"; }, "unavailable"],
+  ["cwd changes", async f => { f.state.cwd = dirname(f.cwd); }, "unavailable"],
+  ["cwd becomes a symlink", async f => {
+    const moved = `${f.cwd}-moved`;
+    await rename(f.cwd, moved);
+    await symlink(moved, f.cwd);
+  }, "unavailable"],
+  ["registration stamp changes", async f => {
+    await writeFile(f.manifest, JSON.stringify({ ...f.registration, created_at: "2026-11-26T00:00:00.000Z" }));
+  }, "unavailable"],
+  ["another registration appears", extraRegistration, "ambiguous"],
+] satisfies readonly [string, (f: CliFixture) => Promise<void>, "unavailable" | "ambiguous"][])(
+  "CLI follow discards in-flight messages when %s", async (_reason, change, status) => {
+    const f = await setup();
+    f.state.messages = [{ role: "user", content: "stale transcript" }];
+    f.state.beforeMessagesReply = () => change(f);
+    expect(await f.follow()).toEqual({ status });
+    expect(f.trace.filter(request => request.type === "get_messages")).toHaveLength(1);
+  },
+);
+
+test("CLI follow withholds a reply that misses the observer deadline", async () => {
+  const f = await setup();
+  const reply = Promise.withResolvers<void>();
+  f.state.messages = [{ role: "user", content: "late transcript" }];
+  f.state.beforeMessagesReply = () => reply.promise;
+  try {
+    expect(await f.follow()).toEqual({ status: "unavailable" });
+    expect(f.trace.filter(request => request.type === "get_messages")).toHaveLength(1);
+  } finally {
+    reply.resolve();
+  }
+});
+
+test("CLI follow withholds a pending snapshot when the server stops", async () => {
+  const f = await setup();
+  f.state.messages = [{ role: "user", content: "pending transcript" }];
+  f.state.beforeMessagesReply = () => f.app.stop();
+  // Keep the handler response inspectable after stop destroys HTTP sockets.
+  const response = await f.app.fetch(new Request(new URL("/api/cli-follow", f.app.url), {
+    headers: { Host: f.app.url.host },
+  }));
+  expect(response.status).toBe(200);
+  expect(await f.data(response)).toEqual({ status: "unavailable" });
+  expect(f.trace.filter(request => request.type === "get_messages")).toHaveLength(1);
+});
 
 const input = { action: "input", mode: "prompt", message: "Web fixture prompt", clientMessageId: "web-1" } as const;
 

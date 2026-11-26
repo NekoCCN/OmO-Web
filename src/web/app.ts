@@ -11,6 +11,7 @@ import { renderCapabilities, renderLocalCompatibility } from "./capabilities.ts"
 import { canShowSnapshot, renderJournal, renderRuntimePane } from "./runtime-summary.ts";
 import { cliHistory } from "./cli-history.ts";
 import { cliLive } from "./cli-live.ts";
+import { cliFollow } from "./cli-follow.ts";
 import { BUILTIN_COMMANDS, parseBuiltinInput } from "./builtin-commands.ts";
 import type { BuiltinCommand } from "./builtin-commands.ts";
 
@@ -54,6 +55,7 @@ const chooser = dialog("new-dialog");
 const manager = dialog("manage-dialog");
 const inspector = dialog("details-dialog");
 const commandDialog = dialog("command-dialog");
+const branchModal = dialog("branch-dialog");
 const settingLabels: Readonly<Record<string, string>> = { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" };
 const thinkingSources: Readonly<Record<string, string>> = {
   explicit: "显式指定", session: "会话内记录", global: "设备记忆", "model-default": "模型默认",
@@ -107,6 +109,11 @@ let cliSeq = 0;
 const CLI_REFRESH_MS = 30_000;
 const cliTime = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" });
 let workspaces: readonly string[] = [];
+const workspaceKey = "omo-web-workspace";
+let workspace = "";
+const workspaceSessions = new Map<string, string>();
+const displayedWorkspace = () => follow.workspace || workspace;
+const inWorkspace = (cwd: string) => workspaces.includes(cwd) && (!displayedWorkspace() || cwd === displayedWorkspace());
 let archived = false;
 let source: EventSource | undefined;
 let bootSeq = 0;
@@ -124,8 +131,19 @@ const compactInspector = matchMedia("(max-width: 1000px)");
 const system = matchMedia("(prefers-color-scheme: dark)");
 const countFormat = new Intl.NumberFormat("zh-CN");
 const focusCliLauncher = (id: string) => btn(mobile.matches ? "open-navigation" : id).focus();
-const openBranch = branchDialog(api, enterBranch);
-const live = cliLive(api, () => focusCliLauncher("cli-live-button"), openBranch);
+const showBranch = branchDialog(api, enterBranch);
+const openBranch = (source: BranchSource) => {
+  if (branchModal.open) return;
+  branchModal.dataset.sourceKind = source.kind;
+  showBranch(source);
+};
+const follow = cliFollow(api, cwd => workspaces.includes(cwd), () => {
+  renderWorkspace();
+  renderSessions();
+  renderCliSessions();
+  renderView();
+});
+const live = cliLive(api, () => focusCliLauncher("cli-live-button"), openBranch, inWorkspace);
 let leavingHistory = false;
 const history = cliHistory(api, () => {
   if (!leavingHistory && !document.querySelector("dialog:modal")) focusCliLauncher("cli-history-button");
@@ -141,7 +159,7 @@ const history = cliHistory(api, () => {
   releases.delete(session.id);
   remember(session);
   openSession(session.id, true);
-});
+}, inWorkspace);
 
 function handoffReason(reason: unknown): string {
   switch (reason) {
@@ -181,6 +199,7 @@ function markInactive(view: View): void {
 }
 
 function enterBranch(session: Session, editorText: string, source: BranchSource): void {
+  if (!workspaces.includes(session.cwd)) return;
   if (source.kind === "live") live.closeAfterBranch();
   if (source.kind === "history") {
     leavingHistory = true;
@@ -298,13 +317,13 @@ function renderCliSessions(): void {
     ? document.activeElement.dataset.cliSession : undefined;
   const query = inp("search").value.trim().toLocaleLowerCase();
   const matches = archived ? [] : cliRows
-    .filter(row => !query || `${row.name} ${row.cwd}`.toLocaleLowerCase().includes(query))
+    .filter(row => inWorkspace(row.cwd) && (!query || `${row.name} ${row.cwd}`.toLocaleLowerCase().includes(query)))
     .sort((a, b) => b.updatedAt - a.updatedAt);
   section.hidden = matches.length === 0 && !cliError;
   host.replaceChildren();
   for (const row of matches) {
     const item = el("li");
-    const open = button("", () => history.open(row.id), "button--quiet session-link");
+    const open = button("", () => openCliHistory(row.id), "button--quiet session-link");
     open.dataset.cliSession = row.id;
     const stamp = Number.isFinite(new Date(row.updatedAt).getTime()) ? cliTime.format(row.updatedAt) : "";
     open.append(el("span", "", row.name), el("span", "small muted path", row.cwd), el("small", "", stamp));
@@ -320,7 +339,8 @@ function applySessions(items: readonly Session[]): void {
   sessions = new Map(items.map(session => [session.id, session]));
   if (current) {
     current.session = sessions.get(current.session.id) ?? current.session;
-    if (!current.session.active && current.status === "ready" && releases.get(current.session.id)?.status !== "pending") {
+    if (!workspaces.includes(current.session.cwd)) clearCurrentView();
+    else if (!current.session.active && current.status === "ready" && releases.get(current.session.id)?.status !== "pending") {
       markInactive(current);
       if (manager.open) manager.close();
     }
@@ -350,6 +370,68 @@ async function fetchSessions(): Promise<void> {
   updateConnection();
 }
 
+function storeWorkspace(cwd: string): void {
+  workspace = cwd;
+  try { localStorage.setItem(workspaceKey, cwd); }
+  catch { /* The current page can still scope navigation without storage. */ }
+}
+
+function workspaceLabel(cwd: string): string {
+  const parts = cwd.split("/").filter(Boolean);
+  for (let depth = 1; depth <= parts.length; depth++) {
+    const suffix = parts.slice(-depth).join("/");
+    if (!workspaces.some(root => root !== cwd && root.endsWith(`/${suffix}`))) return suffix;
+  }
+  return cwd;
+}
+
+function renderWorkspace(): void {
+  const picker = sel("workspace-select");
+  const cwd = displayedWorkspace();
+  syncSelect(picker, workspaces.map(root => [root, workspaceLabel(root)]), cwd, "所有工作区");
+  picker.title = cwd || "所有工作区";
+  box("workspace-field").hidden = workspaces.length < 2;
+}
+
+function clearCurrentView(): void {
+  current = undefined;
+  clearTimeout(refreshTimer);
+  stream.reset();
+  interactions.reset();
+  prompt.value = "";
+  renderAttachments();
+  if (manager.open) manager.close();
+  closeDetails(false);
+  setComposeOptions(false);
+  if (commandDialog.open) { commandRequest?.abort(); commandDialog.close(); }
+  if (branchModal.open && branchModal.dataset.sourceKind === "web") branchModal.close();
+}
+
+function selectWorkspace(cwd: string): void {
+  if (cwd && !workspaces.includes(cwd)) return;
+  const wasFollowing = follow.active;
+  follow.stop();
+  if (cwd === workspace) {
+    if (wasFollowing) toggleNav(false, true);
+    return;
+  }
+  storeWorkspace(cwd);
+  renderWorkspace();
+  const saved = workspaceSessions.get(workspace);
+  const session = saved ? sessions.get(saved) : undefined;
+  if (session && inWorkspace(session.cwd)) {
+    archived = session.archived;
+    openSession(session.id, false, false);
+  } else if (current && inWorkspace(current.session.cwd)) {
+    workspaceSessions.set(workspace, current.session.id);
+  } else clearCurrentView();
+  live.scopeChanged();
+  toggleNav(false, true);
+  renderSessions();
+  renderCliSessions();
+  renderView();
+}
+
 async function bootstrap(reconcile = false): Promise<void> {
   const ticket = ++bootSeq;
   const version = mutation;
@@ -359,7 +441,16 @@ async function bootstrap(reconcile = false): Promise<void> {
     api.token = str(data.token);
     engine = object(data.engine);
     handoffSupport = object(data.handoff);
-    workspaces = list(data.workspaces).filter((cwd): cwd is string => typeof cwd === "string" && Boolean(cwd));
+    workspaces = [...new Set(list(data.workspaces).filter((cwd): cwd is string => typeof cwd === "string" && Boolean(cwd)))];
+    if (!bootstrapped) {
+      try { workspace = localStorage.getItem(workspaceKey) ?? ""; }
+      catch { /* The default is all workspaces. */ }
+    }
+    if (workspace && (workspaces.length < 2 || !workspaces.includes(workspace))) storeWorkspace("");
+    if (current && !workspaces.includes(current.session.cwd)) clearCurrentView();
+    follow.recheckWorkspace();
+    renderWorkspace();
+    live.scopeChanged();
     bootstrapped = true;
     bootError = "";
     listError = "";
@@ -387,7 +478,7 @@ function renderSessions(): void {
   const query = inp("search").value.trim().toLocaleLowerCase();
   const host = box("session-list");
   const focused = document.activeElement instanceof HTMLElement && host.contains(document.activeElement) ? document.activeElement.dataset.session : undefined;
-  const items = [...sessions.values()].filter(item => item.archived === archived && (!query || `${item.name} ${item.cwd}`.toLocaleLowerCase().includes(query)))
+  const items = [...sessions.values()].filter(item => inWorkspace(item.cwd) && item.archived === archived && (!query || `${item.name} ${item.cwd}`.toLocaleLowerCase().includes(query)))
     .sort((a, b) => b.updatedAt - a.updatedAt);
   const existing = new Map([...host.children].flatMap(node => node instanceof HTMLLIElement && node.dataset.session ? [[node.dataset.session, node] as const] : []));
   let next = host.firstElementChild;
@@ -409,7 +500,7 @@ function renderSessions(): void {
       const stamp = row.lastElementChild;
       if (stamp) stamp.textContent = releases.get(session.id)?.status === "released" ? "已释放"
         : session.running ? "运行中" : session.settled ? "已结清" : session.active ? "已打开" : "待恢复";
-      if (session.id === current?.session.id) row.setAttribute("aria-current", "true");
+      if (!follow.active && session.id === current?.session.id) row.setAttribute("aria-current", "true");
       else row.removeAttribute("aria-current");
     }
     if (li !== next) host.insertBefore(li, next);
@@ -423,11 +514,22 @@ function renderSessions(): void {
   btn("archived").setAttribute("aria-pressed", String(archived));
 }
 
-function openSession(id: string, focusComposer = false): void {
+function openSession(id: string, focusComposer = false, focusConversation = true): void {
   const session = sessions.get(id);
-  if (!session) return;
-  toggleNav(false);
-  box("conversation").focus();
+  if (!session || !workspaces.includes(session.cwd)) return;
+  follow.stop();
+  if (!inWorkspace(session.cwd)) {
+    // Explicitly entering a new or adopted session may choose another authorized root.
+    storeWorkspace(session.cwd);
+    renderWorkspace();
+    renderCliSessions();
+    live.scopeChanged();
+  }
+  workspaceSessions.set(workspace, id);
+  if (focusConversation) {
+    toggleNav(false);
+    box("conversation").focus();
+  }
   if (id === current?.session.id) {
     if (!focusComposer) return;
     if (current.status === "ready") { prompt.focus(); return; }
@@ -436,7 +538,7 @@ function openSession(id: string, focusComposer = false): void {
   closeDetails(false);
   setComposeOptions(false);
   if (commandDialog.open) { commandRequest?.abort(); commandDialog.close(); }
-  box("conversation").focus({ preventScroll: true });
+  if (focusConversation) box("conversation").focus({ preventScroll: true });
   const release = releases.get(id);
   const load = session.active && release?.status !== "released" && release?.status !== "uncertain";
   const view: View = {
@@ -458,7 +560,7 @@ function openSession(id: string, focusComposer = false): void {
       if (focusComposer && view === current && view.status === "ready" && document.activeElement === box("conversation")) prompt.focus();
     });
     void loadOptions(view);
-  } else if (release?.status === "released" && !document.querySelector("dialog:modal")) box("handoff-title").focus();
+  } else if (focusConversation && release?.status === "released" && !document.querySelector("dialog:modal")) box("handoff-title").focus();
 }
 
 function modelKey(value: Wire): string {
@@ -558,6 +660,21 @@ function setTraceTarget(control: HTMLButtonElement, target?: HTMLElement): void 
 }
 
 function renderView(): void {
+  const following = follow.active;
+  box("cli-follow-view").hidden = !following;
+  box("transcript").hidden = following;
+  btn("cli-follow-stop").hidden = !following;
+  btn("cli-follow-button").setAttribute("aria-pressed", String(following));
+  box("banner").hidden = following || !box("banner-text").textContent;
+  if (following) {
+    trace.hidden = true;
+    box("composer-shell").hidden = true;
+    btn("details-button").hidden = true;
+    btn("web-branch-button").hidden = true;
+    btn("manage-button").hidden = true;
+    renderHeading(follow.target?.name ?? "跟随 CLI", follow.target?.cwd ?? "");
+    return;
+  }
   const view = current;
   const session = view?.session;
   const release = session && releases.get(session.id);
@@ -567,19 +684,13 @@ function renderView(): void {
   box("welcome").hidden = Boolean(view);
   box("inactive-session").hidden = !view || available;
   box("active-session").hidden = !available;
+  trace.hidden = !available || !traceTargets.size;
   if (!available) {
-    trace.hidden = true;
     for (const control of Object.values(traceControls)) setTraceTarget(control);
   }
   box("composer-shell").hidden = !available;
   prompt.disabled = !available || session?.active !== true;
-  const title = box("session-title");
-  title.textContent = session?.name ?? "会话工作台";
-  title.title = title.textContent;
-  const cwd = session?.cwd ?? "";
-  const path = box("session-path");
-  notice(path, cwd);
-  path.title = cwd;
+  renderHeading(session?.name ?? "会话工作台", session?.cwd ?? workspace);
   btn("details-button").hidden = !available;
   if (!available) closeDetails(false);
   btn("web-branch-button").hidden = !session;
@@ -687,6 +798,17 @@ function renderView(): void {
     (!manager.open && release?.status === "failed" ? release.error : ""));
   interactions.render(view.requests, online && !pending, (id, answer) => answerRequest(view, id, answer));
   setTraceTarget(traceControls.request, interactions.first);
+}
+
+function renderHeading(name: string, cwd: string): void {
+  const title = box("session-title");
+  if (title.textContent !== name) title.textContent = name;
+  title.title = name;
+  const path = box("session-path");
+  notice(path, cwd);
+  path.title = cwd;
+  if (follow.active && cwd) path.dataset.workspaceLabel = workspaceLabel(cwd);
+  else delete path.dataset.workspaceLabel;
 }
 
 function requestsFrom(state: Wire): Map<string, Wire> {
@@ -1182,7 +1304,7 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
   switch (command.name) {
     case "new":
       openChooser();
-      if (chooser.open && workspaces.includes(view.session.cwd)) sel("new-cwd").value = view.session.cwd;
+      if (!workspace && chooser.open && workspaces.includes(view.session.cwd)) sel("new-cwd").value = view.session.cwd;
       return chooser.open;
     case "resume":
     case "sessions":
@@ -1302,6 +1424,7 @@ async function runAction(view: View, action: Action, label: string, onError: (te
     if (action.action === "resume") view.status = "loading";
     if (action.action === "model" || action.action === "thinking") view.modelPreview = undefined;
     await snapshot(view, action.action === "resume" || action.action === "navigate");
+    if (view !== current) return true;
     if (action.action === "resume") void loadOptions(view);
     if (manager.open) renderManager(view);
     if (inspector.open && action.action !== "abort") void loadDetails(view);
@@ -1319,10 +1442,18 @@ async function runAction(view: View, action: Action, label: string, onError: (te
 
 function openChooser(): void {
   if (connection !== "online" || !workspaces.length || chooser.open) return;
-  sel("new-cwd").replaceChildren(...workspaces.map(cwd => option(cwd, cwd)));
+  follow.stop();
+  const cwd = sel("new-cwd");
+  cwd.replaceChildren(...workspaces.map(root => option(root, root)));
+  cwd.value = workspace || workspaces[0] || "";
+  const chooseDirectory = workspaces.length > 1;
+  box("new-cwd-field").hidden = !chooseDirectory;
+  box("new-cwd-fixed").hidden = chooseDirectory;
+  box("new-cwd-path").textContent = cwd.value;
   inp("new-name").value = "";
   notice(box("new-error"));
   chooser.showModal();
+  if (!chooseDirectory) inp("new-name").focus();
 }
 
 async function createSession(): Promise<void> {
@@ -1339,9 +1470,11 @@ async function createSession(): Promise<void> {
     const session = parseSession(data.session);
     if (!session) throw new Error("本机服务没有返回会话。");
     remember(session);
-    archived = session.archived;
-    if (chooser.open) chooser.close();
-    openSession(session.id);
+    if (!follow.active) {
+      archived = session.archived;
+      if (chooser.open) chooser.close();
+      openSession(session.id);
+    }
   } catch (error) {
     notice(box("new-error"), `创建失败：${errorText(error)}`);
     if (error instanceof RequestError && (error.status === 401 || error.status === 403)) void bootstrap(true);
@@ -1745,9 +1878,31 @@ function loadDetails(view: View): void {
   });
 }
 
+function openCliHistory(id?: string): void {
+  // A sidebar record may belong to the followed root rather than the manual scope.
+  if (id && follow.workspace && workspace && follow.workspace !== workspace) selectWorkspace(follow.workspace);
+  else follow.stop();
+  toggleNav(false);
+  history.open(id);
+}
+
 function listen(): void {
-  btn("cli-history-button").addEventListener("click", () => { toggleNav(false); history.open(); });
-  btn("cli-live-button").addEventListener("click", () => { toggleNav(false); live.open(); });
+  const stopFollowing = () => {
+    follow.stop();
+    toggleNav(false);
+    focusCliLauncher("cli-follow-button");
+  };
+  btn("cli-follow-button").addEventListener("click", () => {
+    if (follow.active) { stopFollowing(); return; }
+    toggleNav(false);
+    closeDetails(false);
+    setComposeOptions(false);
+    follow.start();
+    btn("cli-follow-stop").focus({ preventScroll: true });
+  });
+  btn("cli-follow-stop").addEventListener("click", stopFollowing);
+  btn("cli-history-button").addEventListener("click", () => openCliHistory());
+  btn("cli-live-button").addEventListener("click", () => { follow.stop(); toggleNav(false); live.open(); });
   btn("web-branch-button").addEventListener("click", () => {
     if (current && releases.get(current.session.id)?.status !== "pending") {
       openBranch({ kind: "web", id: current.session.id, name: current.session.name });
@@ -1777,6 +1932,7 @@ function listen(): void {
     } else if (inspector.open) closeDetails();
   });
   inp("search").addEventListener("input", () => { renderSessions(); renderCliSessions(); });
+  sel("workspace-select").addEventListener("change", () => selectWorkspace(sel("workspace-select").value));
   btn("recent").addEventListener("click", () => { archived = false; renderSessions(); renderCliSessions(); });
   btn("archived").addEventListener("click", () => { archived = true; renderSessions(); renderCliSessions(); });
   // CLI journals appear outside the engine event stream; re-check when the

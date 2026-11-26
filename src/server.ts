@@ -167,6 +167,7 @@ export async function startApp(settings: AppSettings) {
             handoff: sessions.handoffSupport() });
         }
         if (pathname === "/api/sessions") return json({ sessions: sessions.list() });
+        if (pathname === "/api/cli-follow") return json(await terminals.follow());
         if (pathname === "/api/cli-live") return json(await terminals.list());
         if (pathname === "/api/cli-history") {
           const { available, sessions: rows } = await history.listWithIds();

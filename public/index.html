@@ -30,14 +30,16 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
           新会话
         </button>
+        <label class="field" id="workspace-field" hidden><span class="sr-only">工作区</span><select id="workspace-select"></select></label>
         <label class="field"><span class="sr-only">搜索会话</span><input id="search" type="search" placeholder="搜索会话或目录" autocomplete="off"></label>
         <div class="filters" role="group" aria-label="会话筛选">
           <button type="button" class="button button--quiet" id="recent" aria-pressed="true">最近</button>
           <button type="button" class="button button--quiet" id="archived" aria-pressed="false">已归档</button>
         </div>
-        <div class="row" role="group" aria-label="CLI 会话">
+        <div class="cli-launchers" role="group" aria-label="CLI 会话">
           <button type="button" class="button button--quiet" id="cli-live-button" aria-haspopup="dialog">CLI 实时</button>
           <button type="button" class="button button--quiet" id="cli-history-button" aria-haspopup="dialog">CLI 历史</button>
+          <button type="button" class="button button--quiet" id="cli-follow-button" aria-controls="cli-follow-view" aria-pressed="false">跟随 CLI</button>
         </div>
       </div>
       <div class="session-rail">
@@ -63,6 +65,7 @@
           <p id="session-path" class="path small muted" hidden></p>
         </div>
         <div class="row workspace-actions">
+          <button type="button" class="button" id="cli-follow-stop" hidden>退出跟随</button>
           <button type="button" class="button button--quiet" id="details-button" aria-haspopup="dialog" aria-controls="details-dialog" aria-expanded="false" title="运行详情" hidden>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M14 5v14m3-10h2m-2 4h2"/></svg><span class="action-label">运行详情</span>
           </button>
@@ -119,6 +122,15 @@
           </section>
         </div>
       </div>
+      <section class="transcript" id="cli-follow-view" tabindex="0" aria-label="CLI 只读跟随" hidden>
+        <div class="conversation">
+          <div class="cli-follow-ledger">
+            <p id="cli-follow-status" class="small" role="status"></p>
+            <p id="cli-follow-empty" class="muted" hidden>暂没有可显示的文字消息。</p>
+            <div id="cli-follow-messages" class="messages"></div>
+          </div>
+        </div>
+      </section>
       <section class="composer-shell" id="composer-shell" aria-label="消息输入" hidden>
         <form id="composer" class="composer stack stack--tight">
           <p id="compose-error" class="notice error small" role="alert" hidden></p>
@@ -196,7 +208,8 @@
   <dialog id="new-dialog" aria-labelledby="new-title">
     <form id="new-form" class="stack">
       <h2 id="new-title">新会话</h2>
-      <label class="field"><span>工作目录</span><select id="new-cwd" required autofocus></select></label>
+      <label class="field" id="new-cwd-field"><span>工作目录</span><select id="new-cwd" required autofocus></select></label>
+      <div class="stack stack--tight" id="new-cwd-fixed" hidden><p class="small muted">工作目录</p><p class="path" id="new-cwd-path"></p></div>
       <label class="field"><span>会话名称（选填）</span><input id="new-name" type="text" maxlength="120" autocomplete="off"></label>
       <p id="new-error" class="notice error small" role="alert" hidden></p>
       <footer class="row">

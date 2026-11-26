@@ -40,11 +40,17 @@ type Receipt = {
 type Reading = Awaited<ReturnType<typeof readTerminalIdentity>>;
 type State = Awaited<ReturnType<typeof readTerminalState>>;
 type Listing = { readonly available: boolean; readonly sessions: readonly TerminalSession[] };
+type Follow = {
+  readonly status: "ok";
+  readonly session: Pick<TerminalSession, "id" | "name" | "cwd" | "running">;
+  readonly messages: readonly TerminalMessage[];
+} | { readonly status: "none" | "ambiguous" | "unavailable" };
 
 const MAX_ATTACHED = 8;
 const MAX_PENDING = 8;
 const MAX_RECEIPTS = 4096;
 const PROBE_LANES = 6;
+const PROBE_MS = 5_000;
 const EVENTS = new Set([
   "agent_start", "agent_end", "turn_start", "turn_end", "message_start", "message_update", "message_end",
   "compaction_start", "compaction_end", "auto_retry_start", "auto_retry_end", "session_abort",
@@ -65,6 +71,7 @@ export class TerminalSessions {
   readonly #receipts = new Map<string, Receipt>();
   #candidates = new Map<string, Candidate>();
   #listing?: Promise<Listing>;
+  #following?: Promise<Follow>;
   #stopped = false;
 
   constructor(agentDir: string | undefined, authorizedCwds: readonly string[], onChange: (opaqueId: string) => void) {
@@ -76,6 +83,11 @@ export class TerminalSessions {
   list(): Promise<Listing> {
     this.#listing ??= this.#discover().finally(() => { this.#listing = undefined; });
     return this.#listing;
+  }
+
+  follow(): Promise<Follow> {
+    this.#following ??= this.#follow().finally(() => { this.#following = undefined; });
+    return this.#following;
   }
 
   snapshot(id: string): Promise<TerminalSnapshot> {
@@ -227,13 +239,62 @@ export class TerminalSessions {
     for (const peer of this.#peers) peer.close();
   }
 
+  async #follow(): Promise<Follow> {
+    if (this.#stopped) return { status: "unavailable" };
+    const expires = AbortSignal.timeout(PROBE_MS);
+    const registry = await discoverTerminalRegistry(this.#agentDir);
+    const active = () => !this.#stopped && !expires.aborted;
+    if (!registry || !active()) return { status: "unavailable" };
+    // Count names before trusting or filtering any registered endpoint.
+    if (registry.names.length > 1) return { status: "ambiguous" };
+    const [name] = registry.names;
+    if (name === undefined) return { status: "none" };
+
+    const selection = async () => {
+      if (!active()) return "unavailable";
+      const current = await discoverTerminalRegistry(this.#agentDir);
+      if (!current || !active()) return "unavailable";
+      if (current.names.length > 1) return "ambiguous";
+      return current.names[0] === name ? "ok" : "unavailable";
+    };
+    let peer: TerminalPeer | undefined;
+    try {
+      const registered = await registeredTerminal(registry, name);
+      if (!registered) throw terminalMissing();
+      const { endpoint } = registered;
+      peer = await this.#connect(registry, endpoint, active, undefined, expires);
+      const initial = await selection();
+      if (initial !== "ok") return { status: initial };
+      const { row: { sessionId, cwd, name: label } } = await readTerminalIdentity(peer, endpoint.instance, this.#authorized);
+      const identity = { registry, endpoint, sessionId, cwd };
+      await this.#verifyRegistration(identity);
+      const before = await selection();
+      if (before !== "ok") return { status: before };
+      const messages = projectMessages(await peer.request({ type: "get_messages", observe: true }));
+      const state = await readTerminalState(peer, identity);
+      await this.#verifyRegistration(identity);
+      const after = await selection();
+      if (after !== "ok") return { status: after };
+      if (peer.closed) return { status: "unavailable" };
+      const id = createHmac("sha256", this.#key)
+        .update(JSON.stringify(["follow", endpoint.instance, endpoint.stamp, sessionId, cwd])).digest("hex");
+      return { status: "ok", session: { id, cwd, name: displayText(label ?? "", 200).trim() || "OmO CLI",
+        running: projectState(state).running }, messages };
+    } catch (error) {
+      if (!(error instanceof WebError)) throw error;
+      return { status: await selection() === "ambiguous" ? "ambiguous" : "unavailable" };
+    } finally {
+      peer?.close();
+    }
+  }
+
   async #discover(): Promise<Listing> {
     const registry = this.#stopped || this.#authorized.size === 0 ? undefined : await discoverTerminalRegistry(this.#agentDir);
     if (this.#stopped || !registry) {
       this.#candidates.clear();
       return { available: false, sessions: [] };
     }
-    const expires = AbortSignal.timeout(5_000);
+    const expires = AbortSignal.timeout(PROBE_MS);
     const found: { readonly candidate: Candidate; readonly reading: Reading }[] = [];
     const probes = async (lane: number) => {
       for (let i = lane; i < registry.names.length && !expires.aborted && !this.#stopped; i += PROBE_LANES) {
@@ -378,7 +439,7 @@ export class TerminalSessions {
     return reading;
   }
 
-  async #verifyRegistration(candidate: Candidate): Promise<void> {
+  async #verifyRegistration(candidate: Pick<Candidate, "registry" | "endpoint" | "cwd">): Promise<void> {
     const current = await registeredTerminal(candidate.registry, candidate.endpoint.name);
     if (current?.endpoint.stamp !== candidate.endpoint.stamp || !await canonicalDirectory(candidate.cwd)) throw terminalMissing();
   }

@@ -32,6 +32,15 @@
 #brand-prism stop:last-child { stop-color: var(--runtime-violet); }
 
 #cli-history-list .session-link { justify-content: stretch; }
+#workspace-select { inline-size: 100%; font-size: var(--small); text-overflow: ellipsis; }
+.cli-launchers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s1); }
+.cli-launchers .button { padding-inline: var(--s1); font-size: var(--small); white-space: nowrap; }
+#cli-follow-button[aria-pressed="true"] { background: var(--tint); color: var(--accent); }
+.workspace-actions #cli-follow-stop { inline-size: auto; padding-inline: var(--s2); white-space: nowrap; }
+#cli-follow-view { padding-block-start: 0; }
+#cli-follow-status { padding-block: var(--s3); color: var(--muted); }
+#cli-follow-status[data-state="ok"] { color: var(--info); }
+#cli-follow-empty { padding-block: var(--s4); border-block-start: var(--stroke) solid var(--line); }
 
 .main {
   --ledger-gutter: calc(var(--s8) * 2);
@@ -74,15 +83,15 @@
 .trace-node:focus-visible { outline-offset: calc(-1 * var(--focus)); }
 
 #transcript { padding-block-start: var(--s4); }
-#messages { gap: 0; }
-#messages > .message {
+:is(#messages, #cli-follow-messages) { gap: 0; }
+:is(#messages, #cli-follow-messages) > .message {
   display: grid;
   grid-template-columns: var(--ledger-gutter) minmax(0, 1fr);
   column-gap: var(--ledger-gap);
   padding-block: var(--s4);
   border-block-start: var(--stroke) solid var(--line);
 }
-#messages > .message--user {
+:is(#messages, #cli-follow-messages) > .message--user {
   --trace-arrival: color-mix(in srgb, var(--user-tint), var(--user-ink) 16%);
   margin-inline: calc(-1 * var(--s2));
   padding-inline: var(--s2);
@@ -90,10 +99,10 @@
   color: var(--ink);
   border-radius: 0;
 }
-#messages > .message > header { align-items: start; align-content: start; }
-#messages > .message > header time { line-height: 1.5; }
-#messages > .message--user .speaker { color: var(--user-ink); }
-#messages > .message--user time { color: var(--muted); }
+:is(#messages, #cli-follow-messages) > .message > header { align-items: start; align-content: start; }
+:is(#messages, #cli-follow-messages) > .message > header time { line-height: 1.5; }
+:is(#messages, #cli-follow-messages) > .message--user .speaker { color: var(--user-ink); }
+:is(#messages, #cli-follow-messages) > .message--user time { color: var(--muted); }
 #messages > .message--tool > details { grid-column: 2; }
 #messages .tool-details {
   border: 0;
@@ -117,7 +126,7 @@
   outline-offset: calc(-1 * var(--focus));
 }
 #messages > [id^="trace-entry-"]:focus { outline-offset: var(--focus); }
-#messages .message-body > :is(.plain, .prose) { max-inline-size: 72ch; }
+:is(#messages, #cli-follow-messages) .message-body > :is(.plain, .prose) { max-inline-size: 72ch; }
 
 #interactions:not(:empty) { margin-block-start: var(--s2); gap: var(--s2); }
 .request-form {
@@ -332,7 +341,7 @@
   #session-list .session-link { grid-template-columns: minmax(0, 1fr) auto; gap: 0 var(--s2); }
   #session-list .session-link > :first-child { grid-column: 1 / -1; }
   #session-list .session-link > small { grid-area: 2 / 2; }
-  #messages > .message > header { flex-direction: column; gap: var(--s1); }
+  :is(#messages, #cli-follow-messages) > .message > header { flex-direction: column; gap: var(--s1); }
   .request-controls--choice { display: flex; flex-wrap: wrap; align-items: end; }
   .request-controls--choice .request-fields { flex: 1 1 calc(var(--s8) * 8); }
   .compose-box #prompt {
@@ -348,6 +357,12 @@
   #details-dialog:not(:modal) .runtime-metrics { gap: var(--s3); }
   #details-dialog:not(:modal) .runtime-panel .subpanel { padding-block-start: var(--s3); }
   #details-dialog:not(:modal) .runtime-panel > .subpanel:first-child { padding-block-start: 0; }
+}
+
+@media (width > 760px) and (height <= 36rem) {
+  .sidebar-head:has(#workspace-field:not([hidden])) { grid-template-columns: max-content minmax(0, 1fr); }
+  .sidebar-head:has(#workspace-field:not([hidden])) > :not(#new-sidebar, #workspace-field) { grid-column: 1 / -1; }
+  #workspace-select { padding-inline: var(--s2); }
 }
 
 @media (760px < width < 1200px) {
@@ -372,9 +387,14 @@
   .trace-inner { grid-template-columns: max-content minmax(0, 1fr); gap: var(--s2); }
   .trace-node { min-inline-size: var(--touch); }
   #transcript { padding-block-start: var(--s3); }
-  #messages > .message, .request-form { grid-template-columns: minmax(0, 1fr); row-gap: var(--s2); }
-  #messages > .message { padding-block: var(--s3); }
-  #messages > .message > header { align-items: baseline; }
+  :is(#messages, #cli-follow-messages) > .message, .request-form { grid-template-columns: minmax(0, 1fr); row-gap: var(--s2); }
+  :is(#messages, #cli-follow-messages) > .message { padding-block: var(--s3); }
+  :is(#messages, #cli-follow-messages) > .message > header { align-items: baseline; }
+  .main:has(#cli-follow-view:not([hidden])) #session-path {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+    white-space: normal; overflow-wrap: anywhere;
+  }
+  #session-path[data-workspace-label]::before { content: attr(data-workspace-label) " · "; font-weight: 650; }
   #messages > .message--tool > details { grid-column: 1; }
   .request-form :is(h2.request-kind, .request-title) { font-size: var(--h3); line-height: 1.25; }
   .workspace:has(#details-dialog[open]:not(:modal)) {

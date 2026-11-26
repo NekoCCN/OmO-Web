@@ -52,6 +52,7 @@ export async function terminalFixture(options: { readonly fallback?: boolean } =
     leafId: "active-leaf" as string | null,
     unstableLeaf: false,
     messages: [] as unknown[],
+    beforeMessagesReply: undefined as (() => Promise<void>) | undefined,
     acceptedSecrets: 0,
     interrupted: 0,
   };
@@ -108,10 +109,14 @@ export async function terminalFixture(options: { readonly fallback?: boolean } =
               turn_epoch: state.turn, editor_has_draft: true, blocking_question: { id: "fixture-private" },
               pendingDialogs: [{ title: "fixture-private" }], model: { apiKey: "fixture-private" } });
             break;
-          case "get_messages":
+          case "get_messages": {
+            const messages = state.messages;
             if (state.oversized) peer.write(Buffer.alloc(2_200_000, 65));
-            else ok({ messages: state.messages });
+            else if (state.beforeMessagesReply) {
+              void state.beforeMessagesReply().then(() => ok({ messages }), () => peer.destroy());
+            } else ok({ messages });
             break;
+          }
           case "get_entries":
             if (!attached.has(peer) || request.tail !== 1 || request.maxBytes !== 2_097_152) refuse("invalid_argument");
             else {

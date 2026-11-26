@@ -13,7 +13,7 @@ const date = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: 
 const time = (updatedAt: number) => Number.isFinite(new Date(updatedAt).getTime()) ? date.format(updatedAt) : "";
 
 export function cliHistory(api: Api, onClose: () => void, openBranch: (source: BranchSource) => void,
-  resumeUnavailable: () => string, onResumed: (session: Session, show: boolean) => void) {
+  resumeUnavailable: () => string, onResumed: (session: Session, show: boolean) => void, inWorkspace: (cwd: string) => boolean) {
   const modal = byId("cli-history-dialog", HTMLDialogElement);
   const filter = byId("cli-history-search", HTMLInputElement);
   const rows = box("cli-history-list");
@@ -46,7 +46,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
 
   function renderList(): void {
     const query = filter.value.trim().toLocaleLowerCase();
-    const matches = items.filter(row => `${row.name} ${row.cwd}`.toLocaleLowerCase().includes(query));
+    const matches = items.filter(row => inWorkspace(row.cwd) && `${row.name} ${row.cwd}`.toLocaleLowerCase().includes(query));
     rows.replaceChildren();
     for (const row of matches) {
       const li = el("li");
@@ -165,6 +165,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
   }
 
   function openRecord(row: HistoryRow): void {
+    if (!inWorkspace(row.cwd)) return;
     stopRecord();
     selected = row;
     index.hidden = true;
