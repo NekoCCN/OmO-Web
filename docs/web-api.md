@@ -10,6 +10,9 @@
 - `GET /api/sessions/:id/last-assistant` → `{text: string | null}`，只读取当前已加载会话的原生最后一条可复制助手文本。
 - `GET /api/sessions/:id/options` → `{models, levels, commands}`，模型按上面的投影，命令含 `{name,description,source,invocation}`，其中 `source` 是 `extension`、`prompt` 或 `skill`，`invocation` 是规范的 `/命令` 或 `$技能`。不返回原生 `sourceInfo`。
 - `GET /api/sessions/:id/details` → `{stats, queue, tree, runtime, state?, sessionMemory}`。`runtime` 是活动分支的 Todo 与长期记忆召回状态投影，不返回原始扩展数据、记忆提示或路径；`state` 只提供详情需要的模型、运行模式与用量。`usageTotals.latestCacheHitRate` 是原生百分比；累计命中率按 `cacheRead / (input + cacheWrite + cacheRead)` 计算。`sessionMemory` 只匹配当前路由，区分 OmO 宿主主堆与该会话的内核统计。
+- `GET /api/sessions/:id/model-preview?provider=…&modelId=…` → `{status:"ok", level, source, availableLevels}` 或 `{status:"unavailable"}`。必须恰好带 `provider` 与 `modelId` 各一个，只读预览当前会话目标模型的生效档位与来源，不切换、不写入、不缓存。模型不在当前可用列表时返回 `404`；模型待切换、Web 正在更改模型设置，或读取期间会话绑定或模型状态变化时返回 `409`。写入仍走 `actions` 的 `model`（`set_model scope:session`）与 `thinking`（`set_thinking_level scope:turn`），要求会话空闲且未归档。
+- `GET /api/sessions/:id/capabilities` → `{extensions, mcpServers, commands}`，三组独立 `ok / unavailable`。`ok` 为 `{rows, incomplete}`，每组至多取原生顺序前 128 条；`incomplete:true` 表示有过滤或截断，不作“无条目”。扩展含名称、启用与可选来源（`package/top-level`，缺省不推断）；MCP 为原生报告的状态与工具数，不代表可调用；命令沿用 `options` 的名称、来源与调用形式。只读清单，不提供安装、启用与连接管理。
+- `GET /api/sessions/:id/native-runtime` → `{tasks, dag, memory}`。每区可为 `ok / unavailable / malformed / ownership_changed`，`tasks` 与 `dag` 另有 `empty`。未知 Web 会话 `404`；已知会话按区用 HTTP `200` 表达结果，不读查询与请求体、不支持 POST、不打开或恢复会话。`tasks/dag` 非空时投影原生顺序最多 256 行的状态和时间，DAG 另含节点数；`memory` 仅返回当前会话原生日志的两项步数计数。合法空列表不拿旧快照补位；不返回原生路由、持久身份、任务与运行标识、路径、文本与错误细节。任务消息、取消与 DAG 控制均未开放。
 - `GET /api/sessions/:id/activity` → `Activity`。只接受已加载的 Web 会话 ID；服务端用内部 durable session ID 和该会话已授权的工作目录查找原生快照。没有加载的 Web 会话不会由该接口打开。
 - `GET /api/cli-history` → `{available, sessions: CliSession[]}`。`CliSession = {id, name, cwd, updatedAt, adopted}`；`cwd` 为服务器授权的工作目录，`updatedAt` 为毫秒。`adopted:true` 表示该原生会话已有 Web 别名（按原生 ID 与工作目录合并），普通侧栏不再重复列出；进入仍走 `resume` 并受持有者接纳。`available:false` 表示读取已关闭或找不到可读的本地历史目录；`available:true` 且 `sessions:[]` 表示没有可显示的记录。
 - `GET /api/cli-history/:id` → `{session: CliSession, messages}`。ID 是本进程最近一次 CLI 列表返回的选择键，不是原生 ID、Web ID 或路径；过期需重新读取列表。仅返回最新分支上可显示的对话投影，不返回原始 journal。
@@ -21,7 +24,7 @@
 
 CLI 实时的事件仅为 `{type:"cli-live", id}`；客户端只刷新当前已连接且 ID 匹配的实时快照。连接成功及 SSE 重连读取基线，可重试快照读取，不自动重做任何动作。
 
-`Activity` 是 `{status:"ok", updatedAt, connected?, language?, runs, tasks}` 或 `{status:"unavailable", reason}`。`updatedAt` 是快照时间（毫秒），`connected` 若有值，是快照写入时的状态；两者不代表当前活动。运行包括 DAG 节点、状态、尝试次数和依赖，任务包括子代理的摘要元数据；不返回 durable session ID、原始日志或快照文件路径。
+`Activity` 是 `{status:"ok", updatedAt, connected?, language?, runs, tasks}` 或 `{status:"unavailable", reason}`。`updatedAt` 是快照时间（毫秒），`connected` 若有值，是快照写入时的状态；两者不代表当前活动。运行包括 DAG 节点、状态、尝试次数和依赖，任务包括子代理的摘要元数据；不返回 durable session ID、原始日志或快照文件路径。运行详情仅在原生明确返回 `unsupported` 时才回退读旧快照；普通 `500`、归属变化、超时与 HTTP 拒绝均不触发对 `/activity` 的读取，不把不可用当作空。
 
 ## 写入
 

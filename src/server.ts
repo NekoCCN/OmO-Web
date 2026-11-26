@@ -6,6 +6,7 @@ import { z, ZodError } from "zod";
 import { CliHistory } from "./cli-history.ts";
 import type { CliSessionSummary } from "./cli-history.ts";
 import { Engine } from "./engine.ts";
+import { modelTarget } from "./model-options.ts";
 import { NativeActivity } from "./native-activity.ts";
 import type { NativeActivityView } from "./native-activity.ts";
 import { actions, emptyBody, openInput, sessionKey, WebError } from "./protocol.ts";
@@ -135,7 +136,7 @@ export async function startApp(settings: AppSettings) {
   }
 
   const fetch = async (request: Request): Promise<Response> => {
-    const pathname = new URL(request.url).pathname;
+    const { pathname, searchParams } = new URL(request.url);
     try {
       const origin = request.headers.get("Origin");
       if (request.headers.get("Host") !== server.url.host || (origin !== null && origin !== server.url.origin) ||
@@ -258,7 +259,7 @@ export async function startApp(settings: AppSettings) {
           return json(result, result.cancelled ? 200 : 201);
         }
       }
-      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|details|activity|actions|branch-options|branches|handoff|last-assistant))?$/i.exec(pathname);
+      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|capabilities|activity|native-runtime|actions|branch-options|branches|handoff|last-assistant))?$/i.exec(pathname);
       if (route) {
         const id = sessionKey.parse(route[1]);
         if (request.method === "POST" && route[2] === "actions") return json(await sessions.action(id, actions.parse(await payload(request))));
@@ -273,8 +274,18 @@ export async function startApp(settings: AppSettings) {
         }
         if (request.method === "GET") {
           if (route[2] === "options") return json(await sessions.options(id));
+          if (route[2] === "model-preview") {
+            if (searchParams.size !== 2 || searchParams.getAll("provider").length !== 1 || searchParams.getAll("modelId").length !== 1) {
+              throw new WebError(400, "invalid_request", "请求参数不正确。");
+            }
+            return json(await sessions.modelPreview(id, modelTarget.parse({
+              provider: searchParams.get("provider"), modelId: searchParams.get("modelId"),
+            })));
+          }
           if (route[2] === "branch-options") return json(await sessions.webBranchOptions(id));
           if (route[2] === "details") return json(await sessions.details(id));
+          if (route[2] === "capabilities") return json(await sessions.capabilities(id));
+          if (route[2] === "native-runtime") return json(await sessions.nativeRuntime(id));
           if (route[2] === "last-assistant") return json(await sessions.lastAssistant(id));
           if (route[2] === "activity") {
             const row = sessions.list().find(session => session.id === id);

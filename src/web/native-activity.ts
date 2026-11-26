@@ -19,9 +19,10 @@ const states: Readonly<Record<string, string>> = {
   lost: "已失联",
 };
 
-const stateText = (value: string): string => states[value] ?? value;
+export const knownActivityState = (value: string): string | undefined => Object.hasOwn(states, value) ? states[value] : undefined;
+const stateText = (value: string): string => knownActivityState(value) ?? value;
 
-function timeText(value: unknown): string {
+export function timeText(value: unknown): string {
   const timestamp = num(value);
   if (timestamp === undefined) return "未知时间";
   const date = new Date(timestamp);

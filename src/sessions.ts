@@ -2,6 +2,11 @@ import { link, lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeF
 import { dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import { composeMessage, projectCommands, resolveCommand } from "./commands.ts";
+import { modelProfile, registeredModel } from "./model-options.ts";
+import type { ModelTarget } from "./model-options.ts";
+import { bindNativeRuntime, readNativeRuntime, unavailableNativeRuntime } from "./native-runtime.ts";
+import type { NativeRuntimeBinding, NativeRuntimeSummary } from "./native-runtime.ts";
+import { readNativeSurfaces } from "./native-surfaces.ts";
 import { WebError, array, browserEvent, model, pick, record, sessionKey, state, transcriptMessage, transcriptTree } from "./protocol.ts";
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
 import type { Engine } from "./engine.ts";
@@ -43,10 +48,11 @@ export async function authorizedRoots(roots: readonly string[]): Promise<readonl
 
 export class Sessions {
   readonly #rows = new Map<SessionKey, SavedSession>();
-  readonly #live = new Map<SessionKey, { route: string; running: boolean }>();
+  readonly #live = new Map<SessionKey, { readonly route: string; readonly runtime?: NativeRuntimeBinding; running: boolean }>();
   readonly #opening = new Map<SessionKey, Promise<void>>();
   readonly #writes = new Map<SessionKey, Promise<unknown>>();
   readonly #releasing = new Set<SessionKey>();
+  readonly #modelWrites = new Set<SessionKey>();
   readonly #cliOpening = new Map<string, Promise<SessionView>>();
   readonly #directory: string;
   readonly #branches: SessionBranches;
@@ -90,10 +96,14 @@ export class Sessions {
   }
 
   #route(id: SessionKey): string {
+    return this.#binding(id).route;
+  }
+
+  #binding(id: SessionKey) {
     this.#row(id);
     const live = this.#live.get(id);
     if (!live) throw new WebError(409, "session_not_open", "会话未接入引擎，请先恢复会话。");
-    return live.route;
+    return live;
   }
 
   async #persist(id: SessionKey, update: (previous: SavedSession | undefined) => SavedSession, exclusive = false) {
@@ -251,7 +261,11 @@ export class Sessions {
         throw error;
       }
     }
-    this.#live.set(row.id, { route, running: initial.isStreaming === true });
+    const runtime = bindNativeRuntime(initial, {
+      route, cwd: row.cwd, sessionFile: opts.nativePlaced === undefined ? sessionPath : initial.sessionFile,
+      durableId: bound ?? row.nativeId,
+    });
+    this.#live.set(row.id, { route, runtime, running: initial.isStreaming === true });
     if (opts.publishName && initial.sessionName !== row.name) {
       try { await this.engine.requestExisting("set_session_name", { sessionId: route, name: row.name }); }
       catch (error) {
@@ -461,6 +475,22 @@ export class Sessions {
     return { session, state: { ...state(rawState), isStreaming: session.running || rawState.isStreaming === true },
       messages: array(history.messages).flatMap(m => transcriptMessage(m) ?? []),
       handoff: this.#handoffEligibility(record(rawState)) };
+  }
+
+  async nativeRuntime(id: SessionKey): Promise<NativeRuntimeSummary> {
+    const row = this.#row(id);
+    const live = this.#live.get(id);
+    if (row.archived || !live || this.#opening.has(id) || this.#releasing.has(id)) {
+      return unavailableNativeRuntime("inactive");
+    }
+    if (this.engine.usesListeningTransport) return unavailableNativeRuntime("unsupported");
+    if (!live.runtime) return unavailableNativeRuntime("binding_unverified");
+    const host = this.engine.status;
+    return readNativeRuntime(this.engine, live.runtime, () =>
+      this.engine.status === host && this.#live.get(id) === live &&
+      this.#rows.get(id)?.archived === false &&
+      !this.#opening.has(id) && !this.#releasing.has(id) &&
+      ![...this.#live].some(([other, current]) => other !== id && current.route === live.route));
   }
 
   /** Web alias for a known durable native session in this workspace, if any.
@@ -751,6 +781,15 @@ export class Sessions {
     return { session: this.#view(row), ...(branch.editorText !== undefined ? { editorText: branch.editorText } : {}) };
   }
 
+  async capabilities(id: SessionKey) {
+    const live = this.#binding(id);
+    const inventory = await readNativeSurfaces(this.engine, live.route);
+    if (this.#binding(id) !== live) {
+      throw new WebError(409, "session_changed", "会话连接已切换，请重新读取。");
+    }
+    return inventory;
+  }
+
   async options(id: SessionKey) {
     const params = { sessionId: this.#route(id) };
     const [models, levels, commands] = await Promise.all([
@@ -763,6 +802,88 @@ export class Sessions {
       levels: array(levels.levels),
       commands: projectCommands(commands.commands),
     };
+  }
+
+  #modelControl(id: SessionKey) {
+    const live = this.#binding(id);
+    const checkBinding = () => {
+      if (this.#live.get(id) !== live || this.#releasing.has(id)) {
+        throw new WebError(409, "session_changed", "会话连接已切换，请重新读取。");
+      }
+    };
+    const request = (method: string, fields: WireObject = {}) => {
+      checkBinding();
+      return this.engine.requestExisting(method, { ...fields, sessionId: live.route }, 5_000);
+    };
+    const readState = async (writing: boolean) => {
+      const current = await request("get_state");
+      checkBinding();
+      if ((typeof current.cwd === "string" && current.cwd !== this.#row(id).cwd) ||
+          (live.runtime && (current.sessionId !== live.runtime.sessionId || current.sessionFile !== live.runtime.sessionFile)) ||
+          (this.#row(id).nativeId !== undefined && current.sessionId !== this.#row(id).nativeId)) {
+        throw new WebError(409, "session_changed", "会话连接已切换，请重新读取。");
+      }
+      if (current.pendingModelSwitch != null || (!writing && this.#modelWrites.has(id))) {
+        throw new WebError(409, "model_switch_pending", "模型设置正在变更，请稍后再试。");
+      }
+      if (writing && (live.running || this.#row(id).archived || current.archived === true ||
+          current.isStreaming === true || current.isCompacting === true)) {
+        throw new WebError(409, "session_busy", "请在会话空闲且未归档时更改模型设置。");
+      }
+      return current;
+    };
+    const assertStable = async (before: WireObject, writing: boolean) => {
+      const after = await readState(writing);
+      const a = record(before.model), b = record(after.model);
+      if (before.sessionId !== after.sessionId || before.sessionFile !== after.sessionFile || before.cwd !== after.cwd || a.provider !== b.provider ||
+          a.id !== b.id || before.thinkingLevel !== after.thinkingLevel || before.thinkingLevelSource !== after.thinkingLevelSource) {
+        throw new WebError(409, "session_changed", "会话或模型设置已变化，请重新读取。");
+      }
+    };
+    const requireModel = async (target: ModelTarget) => {
+      if (!registeredModel((await request("get_available_models")).models, target)) {
+        throw new WebError(404, "model_not_found", "该模型不在当前会话的可用列表中。");
+      }
+    };
+    return { request, checkBinding, readState, assertStable, requireModel };
+  }
+
+  async modelPreview(id: SessionKey, target: ModelTarget) {
+    const control = this.#modelControl(id);
+    const before = await control.readState(false);
+    await control.requireModel(target);
+    const profile = await control.request("get_model_thinking_level", target).catch(error => {
+      if (!(error instanceof WebError)) throw error;
+      return undefined;
+    });
+    await control.assertStable(before, false);
+    return modelProfile(profile);
+  }
+
+  async #changeModelOptions(id: SessionKey, action: Extract<Action, { action: "model" | "thinking" }>) {
+    if (this.#modelWrites.has(id)) throw new WebError(409, "model_switch_pending", "模型设置正在变更，请稍后再试。");
+    const control = this.#modelControl(id);
+    this.#modelWrites.add(id);
+    try {
+      const before = await control.readState(true);
+      if (action.action === "model") {
+        if (!this.engine.capabilities.has("session_model_scope")) throw new WebError(409, "unsupported", "此 OmO 版本不支持仅切换当前会话模型。");
+        const target = { provider: action.provider, modelId: action.modelId };
+        await control.requireModel(target);
+        await control.assertStable(before, true);
+        await control.request("set_model", { ...target, scope: "session" });
+      } else {
+        const { levels } = await control.request("get_available_thinking_levels");
+        if (!array(levels).includes(action.level)) {
+          throw new WebError(400, "unsupported_thinking_level", "当前模型不支持该思考档。");
+        }
+        await control.assertStable(before, true);
+        await control.request("set_thinking_level", { level: action.level, scope: "turn" });
+      }
+      control.checkBinding();
+    } finally {
+      this.#modelWrites.delete(id);
+    }
   }
 
   async details(id: SessionKey) {
@@ -841,10 +962,7 @@ export class Sessions {
         await this.#persist(id, previous => ({ ...(previous ?? row), settled: action.enabled }));
         break;
       case "model":
-        if (!this.engine.capabilities.has("session_model_scope")) throw new WebError(409, "unsupported", "此 OmO 版本不支持仅切换当前会话模型。");
-        await request("set_model", { provider: action.provider, modelId: action.modelId, scope: "session" });
-        break;
-      case "thinking": await request("set_thinking_level", { level: action.level, scope: "turn" }); break;
+      case "thinking": await this.#changeModelOptions(id, action); break;
       case "preset": {
         // Per-session preset only: open_session always pins ask, so every
         // reopen/ownership change reverts to ask until the user explicitly

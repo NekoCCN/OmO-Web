@@ -275,8 +275,15 @@ test.skipIf(!chromium)("fresh page discovers unadopted CLI sessions in the sideb
     await p.visible("#cli-history-activity section h3");
     expect(await view.evaluate(`Array.from(document.querySelectorAll("#runtime-shortcuts [role=tab]"), tab => {
       const id = tab.getAttribute("aria-controls");
-      return Array.from(document.querySelectorAll("#" + CSS.escape(id))).map(panel => panel.getAttribute("role"));
-    })`)).toEqual([["tabpanel"], ["tabpanel"], ["tabpanel"], ["tabpanel"]]);
+      const panels = Array.from(document.querySelectorAll("#" + CSS.escape(id)));
+      return [id, panels.map(panel => [panel.getAttribute("role"), panel.getAttribute("aria-labelledby")])];
+    })`)).toEqual([
+      ["runtime-metrics", [["tabpanel", "runtime-open-overview"]]],
+      ["runtime-subagent", [["tabpanel", "runtime-open-subagents"]]],
+      ["runtime-dag", [["tabpanel", "runtime-open-dag"]]],
+      ["runtime-todo", [["tabpanel", "runtime-open-todo"]]],
+      ["runtime-capabilities", [["tabpanel", "runtime-open-capabilities"]]],
+    ]);
     expect(f.posted).toEqual([]);
   } finally { f.close(); }
 }, 25000);

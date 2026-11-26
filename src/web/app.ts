@@ -6,7 +6,9 @@ import { Interactions, isRequest, requestId } from "./interactions.ts";
 import type { Answer } from "./interactions.ts";
 import { Transcript, messageKey, roleOf } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
-import { branchDialog, renderDetails, showNativeActivity } from "./details.ts";
+import { branchDialog, renderDetails } from "./details.ts";
+import { renderCapabilities, renderLocalCompatibility } from "./capabilities.ts";
+import { canShowSnapshot, renderJournal, renderRuntimePane } from "./runtime-summary.ts";
 import { cliHistory } from "./cli-history.ts";
 import { cliLive } from "./cli-live.ts";
 import { BUILTIN_COMMANDS, parseBuiltinInput } from "./builtin-commands.ts";
@@ -29,11 +31,34 @@ const traceControls = {
 const traceTargets = new Map<HTMLButtonElement, HTMLElement>();
 const prompt = byId("prompt", HTMLTextAreaElement);
 const mode = sel("prompt-mode");
+const modelSelect = sel("model");
+const thinkingSelect = sel("thinking");
+const applyModel = el("button", "button button--quiet", "应用模型");
+applyModel.id = "apply-model";
+applyModel.type = "button";
+applyModel.hidden = true;
+const modelStatus = el("p", "small muted sr-only");
+modelStatus.id = "model-preview";
+modelStatus.setAttribute("role", "status");
+modelStatus.hidden = true;
+modelSelect.setAttribute("aria-describedby", modelStatus.id);
+thinkingSelect.setAttribute("aria-describedby", modelStatus.id);
+modelSelect.parentElement?.after(applyModel);
+const composeOptions = box("compose-options");
+const composeSelectors = el("div", "row");
+composeSelectors.append(...composeOptions.children);
+const composeSettings = el("div", "stack stack--tight");
+composeSettings.append(composeSelectors, modelStatus);
+composeOptions.append(composeSettings);
 const chooser = dialog("new-dialog");
 const manager = dialog("manage-dialog");
 const inspector = dialog("details-dialog");
 const commandDialog = dialog("command-dialog");
 const settingLabels: Readonly<Record<string, string>> = { off: "关闭", minimal: "极低", low: "低", medium: "中", high: "高", xhigh: "极高", max: "最高" };
+const thinkingSources: Readonly<Record<string, string>> = {
+  explicit: "显式指定", session: "会话内记录", global: "设备记忆", "model-default": "模型默认",
+  default: "默认设置", fallback: "回退档位", clamped: "按模型能力调整",
+};
 const approvalLabels: Readonly<Record<string, string>> = {
   ask: "审批：询问",
   auto: "审批：Auto",
@@ -57,6 +82,8 @@ type View = {
   messages: TranscriptEntry[]; liveKey: string; tools: Map<string, ToolTrace>; requests: Map<string, Wire>;
   options: Wire; optionsError: string; handoff: Wire; queue: number | undefined; revision: number; serial: number;
   sync: number; optionSync: number; running: boolean; compacting: boolean;
+  modelSelection?: string;
+  modelPreview?: { readonly key: string; result?: Wire };
 };
 type Release = { status: "pending" } | { status: "released"; command: string; copyStatus?: string }
   | { status: "failed" | "uncertain"; error: string };
@@ -453,6 +480,70 @@ function syncSelect(node: HTMLSelectElement, choices: readonly (readonly [string
   if (node.selectedIndex < 0) node.value = "";
 }
 
+function renderModelOptions(view: View, disabled: boolean, canPreview: boolean): void {
+  const selected = object(view.state.model);
+  const activeKey = modelKey(selected);
+  const models = list(view.options.models).map(object).filter(model => Boolean(modelKey(model)));
+  const pending = view.state.pendingModelSwitch != null;
+  if (!canPreview || pending || view.modelSelection === activeKey) view.modelSelection = undefined;
+  const staged = models.find(model => modelKey(model) === view.modelSelection);
+  const target = staged ?? models.find(model => modelKey(model) === activeKey);
+  if (activeKey && !models.some(model => modelKey(model) === activeKey)) models.unshift(selected);
+  syncSelect(modelSelect, models.map(model => [modelKey(model), modelTitle(model)]), modelKey(staged ?? selected), "模型");
+  modelSelect.disabled = disabled || pending || !list(view.options.models).length;
+  applyModel.hidden = !staged;
+  applyModel.disabled = disabled || pending;
+
+  let message = pending ? "模型切换待完成。" : "";
+  let profile: Wire | undefined;
+  if (canPreview && !pending && target) {
+    const key = JSON.stringify([activeKey, modelKey(target), view.state.thinkingLevel]);
+    if (view.modelPreview?.key !== key && !writes.has(view.session.id)) {
+      const ticket = { key, result: undefined as Wire | undefined };
+      view.modelPreview = ticket;
+      const params = new URLSearchParams({ provider: str(target.provider), modelId: str(target.id) });
+      void api.request(`${sessionPath(view.session.id)}/model-preview?${params}`).catch(() => ({})).then(result => {
+        if (current !== view || view.modelPreview !== ticket) return;
+        ticket.result = result;
+        renderView();
+      });
+    }
+    const preview = view.modelPreview?.key === key ? view.modelPreview.result : undefined;
+    const source = str(preview?.source);
+    const level = str(preview?.level);
+    if (preview?.status === "ok" && Object.hasOwn(thinkingSources, source) && Object.hasOwn(settingLabels, level)) {
+      profile = preview;
+      const levels = list(profile.availableLevels).map(str).filter(item => Object.hasOwn(settingLabels, item));
+      message = `${staged ? "切换后" : "当前"}：${settingLabels[level]}（来源：${thinkingSources[source]}） · 可用：${levels.map(item => settingLabels[item]).join("、")}`;
+    } else message = preview ? "此模型的档位预览和来源不可用。" : "正在读取模型档位…";
+  } else {
+    view.modelPreview = undefined;
+    if (canPreview && !pending && activeKey && !view.optionsError && list(view.options.models).length) {
+      message = "当前模型不在可用列表中，无法预览档位。";
+    }
+  }
+  if (modelStatus.textContent !== message) modelStatus.textContent = message;
+  modelStatus.classList.toggle("sr-only", !staged);
+  modelStatus.hidden = !message;
+  modelSelect.title = !staged && message ? message : "模型";
+  thinkingSelect.title = !staged && message ? message : "思考档";
+  const activeProfile = staged ? undefined : profile;
+  const selectedLevel = str(activeProfile?.level ?? view.state.thinkingLevel);
+  const levels = list(activeProfile?.availableLevels ?? view.options.levels).map(str).filter(level => Object.hasOwn(settingLabels, level));
+  const hasLevels = levels.length > 0;
+  if (Object.hasOwn(settingLabels, selectedLevel) && !levels.includes(selectedLevel)) levels.unshift(selectedLevel);
+  syncSelect(thinkingSelect, levels.map(level => [level, `思考：${settingLabels[level]}`]), selectedLevel, "思考档");
+  thinkingSelect.disabled = disabled || pending || Boolean(staged) || !hasLevels;
+}
+
+function refreshModelOptions(view: View, previousKey: string): void {
+  if (!previousKey || previousKey === modelKey(object(view.state.model))) return;
+  view.modelSelection = undefined;
+  view.modelPreview = undefined;
+  view.options = { ...view.options, levels: [] };
+  void loadOptions(view);
+}
+
 function setTraceTarget(control: HTMLButtonElement, target?: HTMLElement): void {
   const before = traceTargets.get(control);
   if (before === target) return;
@@ -529,7 +620,11 @@ function renderView(): void {
   resume.disabled = connection !== "online" || pending || writes.has(view.session.id);
   resume.classList.toggle("button--primary", !receipt);
   resume.textContent = !receipt && release?.status !== "uncertain" && active && view.session.active ? "重试读取" : "恢复会话";
-  if (!available) return;
+  if (!available) {
+    view.modelSelection = undefined;
+    view.modelPreview = undefined;
+    return;
+  }
 
   const online = connection === "online";
   const busy = pending || writes.has(view.session.id);
@@ -561,16 +656,7 @@ function renderView(): void {
   btn("attach").hidden = commandMode;
   (mode.closest("label") ?? mode).hidden = commandMode;
   mode.disabled = blocked || busy;
-  const selected = object(view.state.model);
-  const models = list(view.options.models).map(object).filter(model => Boolean(modelKey(model)));
-  if (modelKey(selected) && !models.some(model => modelKey(model) === modelKey(selected))) models.unshift(selected);
-  syncSelect(sel("model"), models.map(model => [modelKey(model), modelTitle(model)]), modelKey(selected), "模型");
-  sel("model").disabled = !canSend || !list(view.options.models).length || view.running || busy || posting;
-  const selectedLevel = str(view.state.thinkingLevel);
-  const levels = list(view.options.levels).map(str).filter(Boolean);
-  if (selectedLevel && !levels.includes(selectedLevel)) levels.unshift(selectedLevel);
-  syncSelect(sel("thinking"), levels.map(level => [level, Object.hasOwn(settingLabels, level) ? `思考：${settingLabels[level]}` : level]), selectedLevel, "思考档");
-  sel("thinking").disabled = !canSend || !list(view.options.levels).length || view.running || busy || posting;
+  renderModelOptions(view, !canSend || view.running || busy || posting, online && active && !pending);
   const preset = str(view.state.effectivePermissionPreset) || str(view.state.permissionPreset) || "ask";
   syncSelect(sel("approval"), [...approvalChoices], approvalChoices.some(([value]) => value === preset) ? preset : "ask", "审批");
   sel("approval").dataset.preset = sel("approval").value;
@@ -635,6 +721,7 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     if (requiresManualResume) releases.delete(session.id);
     remember(session);
     const state = object(data.state);
+    const previousModel = modelKey(object(view.state.model));
     view.handoff = object(data.handoff);
     const messages = list(data.messages).map(object);
     const changed = revision !== view.revision;
@@ -675,6 +762,7 @@ async function snapshot(view: View, bottom = false): Promise<void> {
         if (live) view.messages.push({ key: view.liveKey, message: live });
       }
     }
+    refreshModelOptions(view, previousModel);
     view.status = "ready";
     view.error = "";
     renderView();
@@ -868,11 +956,16 @@ function onEvent(event: Wire): void {
       scheduleSnapshot(view);
       break;
     case "model_changed":
-    case "service_tier_changed":
+    case "service_tier_changed": {
+      const previousModel = modelKey(object(view.state.model));
       if (event.model) view.state = { ...view.state, model: event.model, thinkingLevel: event.thinkingLevel ?? view.state.thinkingLevel };
-      void loadOptions(view);
+      if (!previousModel || previousModel === modelKey(object(view.state.model))) {
+        view.modelPreview = undefined;
+        void loadOptions(view);
+      } else refreshModelOptions(view, previousModel);
       scheduleSnapshot(view);
       break;
+    }
     case "commands_changed":
     case "loaded_surfaces_changed":
       void loadOptions(view);
@@ -1038,7 +1131,8 @@ async function sendCommand(view: View): Promise<void> {
   draft.commandStatus = undefined;
   const parsed = parseBuiltinInput(text);
   if (parsed.kind === "malformed" || parsed.kind === "tui-only") {
-    fail(parsed.kind === "malformed" ? parsed.message : `“/${parsed.name}”暂不能在 Web 中执行，未发送给模型。`);
+    fail(parsed.kind === "malformed" ? parsed.message
+      : `“/${parsed.name}”请在本机 OmO 终端重新发起。Web 没有转交输入，也没有发送给模型。`);
     renderView();
     return;
   }
@@ -1206,8 +1300,9 @@ async function runAction(view: View, action: Action, label: string, onError: (te
       }
     }
     if (action.action === "resume") view.status = "loading";
+    if (action.action === "model" || action.action === "thinking") view.modelPreview = undefined;
     await snapshot(view, action.action === "resume" || action.action === "navigate");
-    if (action.action === "resume" || action.action === "model") void loadOptions(view);
+    if (action.action === "resume") void loadOptions(view);
     if (manager.open) renderManager(view);
     if (inspector.open && action.action !== "abort") void loadDetails(view);
     return true;
@@ -1454,7 +1549,62 @@ async function openCommandPicker(view: View): Promise<void> {
 }
 
 let detailsRequest: AbortController | undefined;
+let capabilitiesRequest: AbortController | undefined;
+let capabilitiesAttempted = false;
 const detailsTabs = () => [...inspector.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
+const capabilitiesSelected = () => !box("runtime-capabilities").hidden;
+
+function syncDetailsRefresh(): void {
+  const refresh = btn("details-refresh");
+  if (capabilitiesSelected() && capabilitiesRequest) refresh.setAttribute("aria-disabled", "true");
+  else refresh.removeAttribute("aria-disabled");
+}
+
+function clearCapabilities(): void {
+  capabilitiesRequest?.abort();
+  capabilitiesRequest = undefined;
+  capabilitiesAttempted = false;
+  const status = box("capabilities-status");
+  status.textContent = "";
+  status.className = "sr-only";
+  box("capabilities-content").replaceChildren();
+  syncDetailsRefresh();
+}
+
+function loadCapabilities(view: View): void {
+  if (capabilitiesRequest) return;
+  const request = capabilitiesRequest = new AbortController();
+  const currentRead = () => capabilitiesRequest === request && inspector.open && current === view;
+  const status = box("capabilities-status");
+  const content = box("capabilities-content");
+  const compatibility = renderLocalCompatibility();
+  capabilitiesAttempted = true;
+  content.replaceChildren(compatibility);
+  status.className = "small muted";
+  status.textContent = "正在读取能力清单…";
+  syncDetailsRefresh();
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(10_000)]);
+  void api.request(`${sessionPath(view.session.id)}/capabilities`, undefined, signal).then(data => {
+    if (!currentRead()) return;
+    content.replaceChildren(...renderCapabilities(data));
+    status.className = "sr-only";
+    status.textContent = "已读取当前会话的能力清单。";
+  }, (error: unknown) => {
+    if (!currentRead()) return;
+    status.className = "notice error small";
+    if (error instanceof RequestError && error.status === 404 && error.code === "not_found") {
+      status.textContent = "当前 Web 服务不支持能力清单入口。";
+    } else if (error instanceof RequestError && (error.code === "session_changed" || error.code === "session_not_open" || error.code === "session_not_found")) {
+      status.textContent = "无法读取能力清单：会话连接已变化。请确认当前会话已打开。";
+    } else {
+      status.textContent = "无法读取能力清单。可手动刷新重试。";
+    }
+  }).finally(() => {
+    if (capabilitiesRequest !== request) return;
+    capabilitiesRequest = undefined;
+    syncDetailsRefresh();
+  });
+}
 
 function selectDetailsView(tab: HTMLButtonElement): void {
   if (tab.getAttribute("aria-selected") === "true") return;
@@ -1466,6 +1616,9 @@ function selectDetailsView(tab: HTMLButtonElement): void {
     if (target) box(target).hidden = !selected;
   }
   box("details-scroll").scrollTop = 0;
+  if (capabilitiesSelected() && inspector.open && current?.status === "ready" && !capabilitiesAttempted) {
+    loadCapabilities(current);
+  } else syncDetailsRefresh();
 }
 
 function openDetails(): void {
@@ -1473,7 +1626,7 @@ function openDetails(): void {
   const overview = btn("runtime-open-overview");
   selectDetailsView(overview);
   if (!inspector.open) {
-    for (const panel of inspector.querySelectorAll('[role="tabpanel"]')) panel.replaceChildren();
+    for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities)')) panel.replaceChildren();
     if (compactInspector.matches) inspector.showModal();
     else inspector.show();
     btn("details-button").setAttribute("aria-expanded", "true");
@@ -1487,6 +1640,7 @@ function closeDetails(restoreFocus = true): void {
   if (!inspector.open) return;
   inspector.close();
   detailsRequest?.abort();
+  clearCapabilities();
   const trigger = btn("details-button");
   trigger.setAttribute("aria-expanded", "false");
   if (restoreFocus) (trigger.hidden ? box("conversation") : trigger).focus({ preventScroll: true });
@@ -1516,19 +1670,22 @@ function loadDetails(view: View): void {
   const request = detailsRequest = new AbortController();
   const live = () => !request.signal.aborted && inspector.open && view === current;
   const path = sessionPath(view.session.id);
-  const nativeActivity = box("details-native-activity");
-  const overviewPanels = [...box("details-body").querySelectorAll('[role="tabpanel"]')];
-  const nativePanels = [...nativeActivity.querySelectorAll('[role="tabpanel"]')];
+  const overview = box("runtime-metrics");
+  const todo = box("runtime-todo");
   const fail = (message: string) => notice(box("details-error"), message);
-  for (const panel of overviewPanels) if (!panel.childElementCount) panel.append(el("p", "muted", "正在读取运行详情…"));
-  const nativeStatus = nativePanels.map(panel => {
-    panel.querySelector("[data-activity-status]")?.remove();
-    const status = el("p", "small muted", "正在读取原生快照…");
-    status.dataset.activityStatus = "";
-    status.setAttribute("role", "status");
-    panel.prepend(status);
-    return status;
-  });
+  if (!overview.childElementCount) overview.append(el("p", "muted", "正在读取上下文与运行详情…"));
+  const setJournal = (data?: Wire) => {
+    const next = renderJournal(data);
+    const previous = todo.querySelector("#runtime-journal");
+    if (previous) previous.replaceWith(next);
+    else todo.prepend(next);
+  };
+  const setActivity = (tasks?: Wire, dag?: Wire, snapshot?: "waiting" | Wire) => {
+    box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", tasks, snapshot));
+    box("runtime-dag").replaceChildren(...renderRuntimePane("dag", dag, snapshot));
+  };
+  setJournal();
+  setActivity();
   fail("");
   const stats = api.request(`${path}/details`, undefined, request.signal).then(data => {
     if (!live()) return;
@@ -1554,20 +1711,36 @@ function loadDetails(view: View): void {
     });
   }).catch(error => {
     if (!live()) return;
-    for (const panel of overviewPanels) if (!panel.querySelector("section")) panel.replaceChildren();
+    if (!overview.querySelector("section")) overview.replaceChildren();
     fail(`无法读取运行详情：${errorText(error)}`);
   });
-  const native = api.request(`${path}/activity`, undefined, request.signal).then(data => {
-    if (live()) showNativeActivity(nativeActivity, data);
-  }).catch(error => {
-    if (!live()) return;
-    for (const status of nativeStatus) {
-      status.textContent = `无法读取原生快照：${errorText(error)}`;
-      status.className = "notice error small";
-      status.setAttribute("role", "alert");
+  const runtime = async () => {
+    let data: Wire;
+    try {
+      // The host can fence the three parallel reads with two state requests.
+      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
+      data = await api.request(`${path}/native-runtime`, undefined, signal);
+    } catch (error: unknown) {
+      const reason = error instanceof RequestError && error.status === 404 && error.code === "not_found"
+        ? "web_unsupported"
+        : error instanceof RequestError && error.status >= 400 && error.status < 500 ? "read_refused" : "read_failed";
+      const failure = { status: "unavailable", reason };
+      data = { tasks: failure, dag: failure, memory: failure };
     }
-  });
-  void Promise.all([stats, native]).then(() => {
+    if (!live()) return;
+    const tasks = object(data.tasks);
+    const dag = object(data.dag);
+    setJournal(object(data.memory));
+    const fallback = canShowSnapshot(tasks) || canShowSnapshot(dag);
+    setActivity(tasks, dag, fallback ? "waiting" : undefined);
+    if (fallback) {
+      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(8_000)]);
+      const snapshot = await api.request(`${path}/activity`, undefined, signal)
+        .catch(() => ({ status: "unavailable" }));
+      if (live()) setActivity(tasks, dag, snapshot);
+    }
+  };
+  void Promise.all([stats, runtime()]).then(() => {
     if (detailsRequest === request) detailsRequest = undefined;
   });
 }
@@ -1659,7 +1832,11 @@ function listen(): void {
     selectDetailsView(next);
     next.focus({ preventScroll: true });
   });
-  btn("details-refresh").addEventListener("click", () => { if (current && inspector.open) loadDetails(current); });
+  btn("details-refresh").addEventListener("click", () => {
+    if (!current || !inspector.open) return;
+    if (capabilitiesSelected()) loadCapabilities(current);
+    else loadDetails(current);
+  });
   inspector.querySelector("[data-close]")?.addEventListener("click", () => closeDetails());
   inspector.addEventListener("cancel", event => {
     event.preventDefault();
@@ -1751,25 +1928,46 @@ function listen(): void {
     setTraceTarget(traceControls.assistant, assistant);
     setTraceTarget(traceControls.tool, tool);
   });
+  const traceMotion = matchMedia("(prefers-reduced-motion: no-preference) and (forced-colors: none)");
+  let traceArrival: Animation | undefined;
+  traceMotion.addEventListener("change", () => traceArrival?.cancel());
   for (const control of Object.values(traceControls)) control.addEventListener("click", () => {
     const target = traceTargets.get(control);
     if (trace.hidden || !target?.isConnected) return;
     if (target.tagName !== "SUMMARY") target.tabIndex = -1;
     target.focus({ preventScroll: true });
     target.scrollIntoView({ block: "nearest", inline: "nearest" });
+    traceArrival?.cancel();
+    if (!traceMotion.matches) return;
+    const arrival = target.animate([{ backgroundColor: "var(--trace-arrival)" }, {}], {
+      duration: 460, easing: "ease-out",
+    });
+    traceArrival = arrival;
+    arrival.onfinish = arrival.oncancel = () => {
+      if (traceArrival === arrival) traceArrival = undefined;
+    };
   });
-  sel("model").addEventListener("change", () => {
+  modelSelect.addEventListener("change", () => {
     const view = current;
-    const selected = sel("model").value;
-    const model = list(view?.options.models).map(object).find(item => modelKey(item) === selected);
-    if (view && model) void runAction(view, { action: "model", provider: str(model.provider), modelId: str(model.id) }, "切换模型",
+    if (!view || modelSelect.disabled) return;
+    view.modelSelection = modelSelect.value || undefined;
+    renderView();
+  });
+  applyModel.addEventListener("click", async () => {
+    const view = current;
+    const model = list(view?.options.models).map(object).find(item => modelKey(item) === view?.modelSelection);
+    if (!view || !model || applyModel.disabled) return;
+    await runAction(view, { action: "model", provider: str(model.provider), modelId: str(model.id) }, "切换模型",
       text => { draftFor(view.session.id).error = text; renderView(); });
-    else renderView();
+    if (current !== view) return;
+    view.modelSelection = undefined;
+    renderView();
+    if (document.activeElement === document.body || document.activeElement === applyModel) modelSelect.focus();
   });
   sel("thinking").addEventListener("change", () => {
     const view = current;
     const level = sel("thinking").value;
-    if (view && level) void runAction(view, { action: "thinking", level }, "切换思考档",
+    if (view && level && !sel("thinking").disabled) void runAction(view, { action: "thinking", level }, "切换思考档",
       text => { draftFor(view.session.id).error = text; renderView(); });
     else renderView();
   });

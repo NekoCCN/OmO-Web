@@ -86,12 +86,11 @@ function activity(stats: Wire, state: Wire, memory: Wire): HTMLElement {
   const kernelHeap = num(memory.kernelHeapBytes);
   const kernelCount = num(memory.kernelCount);
   const memoryKnown = mainHeap !== undefined || kernelHeap !== undefined || kernelCount !== undefined;
-  const contextText = context.status === "ok"
-    ? [contextTokens, contextWindow].filter(Boolean).join(" / ") + (contextPercent ? ` (${contextPercent}%)` : "") || "已报告，无数值"
-    : NO_SIGNAL;
+  const contextText = contextPercent ? (contextTokens ? `${contextTokens} (${contextPercent}%)` : `${contextPercent}%`) : contextTokens;
   const section = part("运行状态与用量",
     metricGroup("上下文与缓存", [
-      ["上下文（原生 contextUsage）", contextText],
+      ["上下文已用（原生）", contextText || NO_SIGNAL],
+      ["上下文窗口", contextWindow ? `${contextWindow} token` : NO_SIGNAL],
       ["缓存命中率（原生最新）", formatRate(latest) || (cache.status === "ok" ? "已报告，无数值" : NO_SIGNAL)],
       ["缓存累计命中率", formatRate(cumulative) || (cache.status === "ok" ? "已报告，无数值" : NO_SIGNAL)],
     ]),
@@ -317,7 +316,11 @@ export function renderDetails(data: Wire, state: Wire, options: Wire, controls: 
     activity(object(data.stats), { ...state, ...object(data.state) }, object(data.sessionMemory)),
     queuePanel(object(data.queue), controls), commandPanel(options, controls), treePanel(object(data.tree), controls),
   );
-  todo.replaceChildren(runtimeBranchPanel(object(data.runtime)));
+  const branch = runtimeBranchPanel(object(data.runtime));
+  const oldBranch = todo.querySelector("[data-runtime-branch]");
+  branch.dataset.runtimeBranch = "";
+  if (oldBranch) oldBranch.replaceWith(branch);
+  else todo.append(branch);
   [...metrics.querySelectorAll("details"), ...todo.querySelectorAll("details")].forEach((node, i) => {
     node.open = opened[i] ?? false;
   });

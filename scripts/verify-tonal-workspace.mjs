@@ -16,6 +16,8 @@ const detectorPath = process.env.OMO_WORKSPACE_DETECT;
 const detector = detectorPath ? await import(pathToFileURL(resolve(detectorPath)).href) : undefined;
 const phase = process.argv.includes("--baseline") ? "before" : "after";
 const assertTrace = phase === "after" && !process.argv.includes("--measure-ledger-baseline");
+const assertSignal = process.argv.includes("--verify-prism-motion");
+const assertColorRoles = process.argv.includes("--verify-color-roles");
 const mobileNarrow = { width: 320, height: 740, deviceScaleFactor: 1, mobile: true, hasTouch: true };
 const root = await mkdtemp(join(tmpdir(), "omo-tonal-workspace-"));
 const cwd = join(root, "workspace");
@@ -80,6 +82,87 @@ try {
     assert(controls.every(({ width, height, left, right, viewport }) => width >= 44 && height >= 44 && left >= 0 && right <= viewport),
       "Each live mobile trace target is an on-screen touch target at least 44px square");
   };
+  const checkColorRoles = async (scene, theme) => {
+    const colors = await page.evaluate(scene => {
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const ctx = canvas.getContext("2d");
+      const read = () => Array.from(ctx.getImageData(0, 0, 1, 1).data).slice(0, 3);
+      const measure = selector => {
+        const element = document.querySelector(selector);
+        if (!element?.getClientRects().length) throw new Error(`Missing visible color sample: ${selector}`);
+        const chain = [];
+        for (let ancestor = element; ancestor; ancestor = ancestor.parentElement) chain.unshift(ancestor);
+        ctx.clearRect(0, 0, 1, 1);
+        for (const ancestor of chain) {
+          ctx.fillStyle = getComputedStyle(ancestor).backgroundColor;
+          ctx.fillRect(0, 0, 1, 1);
+        }
+        const background = read();
+        ctx.fillStyle = getComputedStyle(element).color;
+        ctx.fillRect(0, 0, 1, 1);
+        return { background, foreground: read() };
+      };
+      if (scene === "desktop-inspector") return {
+        selectedTab: measure(".runtime-index [aria-selected=true]"),
+        otherTab: measure(".runtime-index [aria-selected=false]"),
+      };
+      if (scene === "desktop-settled") return {
+        assistant: measure("#messages .message:not(.message--user):has(.prose) .speaker"),
+        success: measure(".tool-details[data-state=success] .tool-state-text"),
+      };
+      return {
+        user: measure("#messages .message--user .speaker"),
+        userText: measure("#messages .message--user .message-body"),
+        userTime: measure("#messages .message--user time"),
+        canvas: measure("#transcript"),
+        running: measure(".tool-details[data-state=running] .tool-state-text"),
+        runningGlyph: measure(".tool-details[data-state=running] .tool-state svg"),
+        toolTarget: measure(".tool-details[data-state=running] .tool-target"),
+        approval: measure(".request-title"),
+        traceUser: measure("#trace-jump-user"),
+        traceTool: measure("#trace-jump-tool"),
+        traceApproval: measure("#jump-to-request"),
+        ...(scene === "desktop-awaiting-approval" ? {
+          selectedSession: measure("#session-list .session-link[aria-current=true]"),
+          selectedSessionMeta: measure("#session-list .session-link[aria-current=true] .path"),
+          newSession: measure("#new-sidebar"),
+        } : {}),
+      };
+    }, scene);
+    const luma = ([r, g, b]) => [r, g, b].map(x => {
+      const c = x / 255;
+      return c <= .04045 ? c / 12.92 : ((c + .055) / 1.055) ** 2.4;
+    }).reduce((sum, c, i) => sum + c * [.2126, .7152, .0722][i], 0);
+    const contrast = (a, b) => {
+      const shades = [luma(a), luma(b)].sort((x, y) => y - x);
+      return (shades[0] + .05) / (shades[1] + .05);
+    };
+    const ratios = Object.fromEntries(Object.entries(colors).map(([role, sample]) =>
+      [role, contrast(sample.foreground, sample.background)]));
+    const { canvas, user, running, approval, selectedSession, newSession, selectedTab, otherTab } = colors;
+    const different = (a, b, minimum, name) => {
+      const distance = Math.hypot(...a.map((c, i) => c - b[i]));
+      assert(distance >= minimum, `${theme} ${name} painted color distance: ${distance.toFixed(1)} < ${minimum}`);
+    };
+    if (user) {
+      different(user.background, canvas.background, 28, "user row vs conversation");
+      different(running.background, canvas.background, 28, "running tool vs conversation");
+      different(approval.background, running.background, 35, "waiting approval vs running tool");
+      different(user.background, running.background, 35, "user input vs running tool");
+    }
+    if (selectedSession) different(selectedSession.background, newSession.background, 45, "current session vs New Session");
+    if (selectedTab) {
+      assert(contrast(selectedTab.background, otherTab.background) >= 3,
+        `${theme} selected inspector tab must stand out against the tab bar`);
+    }
+    for (const [role, ratio] of Object.entries(ratios)) {
+      const minimum = role === "runningGlyph" ? 3 : 4.5;
+      assert(ratio >= minimum, `${theme} ${role} contrast: ${ratio.toFixed(2)} < ${minimum}`);
+    }
+    console.log("PRISM_COLOR_ROLES_OK", theme, scene,
+      JSON.stringify(Object.fromEntries(Object.entries(ratios).map(([role, ratio]) => [role, +ratio.toFixed(2)]))));
+  };
   const capture = async (name) => {
     await assertNoOverflow();
     for (const theme of ["light", "dark"]) {
@@ -91,6 +174,9 @@ try {
       }, theme);
       const file = join(evidence, `${phase}-${name}-${theme}`);
       await Bun.write(`${file}.png`, await page.screenshot());
+      if (assertColorRoles && ["desktop-awaiting-approval", "desktop-inspector", "desktop-settled", "phone-awaiting-approval"].includes(name)) {
+        await checkColorRoles(name, theme);
+      }
       if (detector) {
         const source = `(${detector.collectPageSnapshot})(${JSON.stringify(detector.STYLE_PROPS)}, 1500)`;
         const snapshot = await page.evaluate(source);
@@ -141,6 +227,49 @@ try {
       document.activeElement.closest("details").dataset.state === "running" && !document.activeElement.closest("details").open),
     "The trace points to the actual running tool, without expanding it");
     assert.equal(await page.evaluate(() => document.querySelector("#prompt").value), "待原生确认后，继续核对配置。");
+    if (assertSignal) {
+      const media = async (value) => page.cdp.send("Emulation.setEmulatedMedia", {
+        features: [{ name: "prefers-reduced-motion", value }],
+      }, await page.resolveSessionId());
+      for (const reduced of [false, true]) {
+        await media(reduced ? "reduce" : "no-preference");
+        for (const retry of [false, true]) {
+          const motion = await page.evaluate(async () => {
+            document.querySelector("#trace-jump-tool").click();
+            const target = document.activeElement;
+            const animations = target.getAnimations({ subtree: true }).filter(animation =>
+              Number.isFinite(animation.effect.getComputedTiming().endTime));
+            for (const animation of animations) {
+              animation.pause();
+              await animation.ready;
+              animation.currentTime = animation.effect.getComputedTiming().endTime * 0.42;
+            }
+            return {
+              target: target.matches("#messages .tool-details summary"),
+              reduced: matchMedia("(prefers-reduced-motion: reduce)").matches,
+              focus: getComputedStyle(target).outlineStyle !== "none",
+              durations: animations.map(animation => animation.effect.getComputedTiming().endTime),
+            };
+          });
+          assert(motion.target && motion.focus && motion.reduced === reduced,
+            "The trace visibly focuses the same running tool in both motion modes");
+          if (reduced) assert.deepEqual(motion.durations, [], "Reduced motion must not move the trace target");
+          else assert(motion.durations.some(duration => duration >= 150 && duration <= 900),
+            "Trace navigation should replay a brief, finite highlight on its destination");
+          if (!retry) {
+            const mode = reduced ? "reduced" : "normal";
+            await Bun.write(join(evidence, `trace-highlight-${mode}.png`), await page.screenshot());
+          }
+          await page.evaluate(() => {
+            for (const animation of document.activeElement.getAnimations({ subtree: true })) {
+              if (animation.playState === "paused") animation.finish();
+            }
+          });
+        }
+      }
+      await media("no-preference");
+      console.log("PRISM_TRACE_MOTION_OK finite-replay reduced-static-focus");
+    }
   }
   await open();
   await capture("desktop-inspector");

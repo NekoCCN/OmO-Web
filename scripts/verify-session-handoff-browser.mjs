@@ -150,8 +150,12 @@ export async function openBrowserProof() {
       await ready("#branch-dialog[open]");
       await ready("#branch-message:not(:disabled)");
       await click("#branch-close");
-      await submit("/settings");
-      await ready("#compose-error:not([hidden])");
+      const localOnly = "/settings SYNTHETIC-LOCAL-ONLY";
+      await submit(localOnly);
+      const refused = await ready("#compose-error:not([hidden])", "本机 OmO 终端");
+      assert(!refused.text.includes("SYNTHETIC-LOCAL-ONLY"), "Local-only guidance must not echo the typed arguments");
+      assert.equal(await page.evaluate(() => document.querySelector("#prompt").value), localOnly,
+        "Local-only refusal keeps the draft without transferring its arguments");
     },
     async proveCopy(origin, text) {
       await browser.cdp.send("Browser.grantPermissions", {
