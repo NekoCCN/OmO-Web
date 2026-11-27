@@ -33,7 +33,7 @@
   color: var(--muted);
 }
 
-.tool-subject > :is(.tool-label, .tool-operation, .tool-target, .tool-preview) {
+.tool-subject > :is(.tool-label, .tool-operation, .tool-target, .tool-preview, .tool-card-inline) {
   min-inline-size: 0;
   max-inline-size: 100%;
   overflow: visible;
@@ -55,6 +55,120 @@
 .tool-state { justify-self: end; margin-block-start: var(--stroke); }
 .tool-state-text { min-inline-size: 0; }
 .tool-details[data-state="success"] > .tool-summary .tool-state { color: var(--muted); }
+
+.message--tool:not(.tool-group *):has(> .tool-card-preview) {
+  --tool-card-tint: var(--accent-tint);
+  position: relative;
+  isolation: isolate;
+  margin-block: var(--s1);
+  border: var(--stroke) solid var(--line);
+  border-radius: var(--r2);
+  background: color-mix(in srgb, var(--tool-card-tint) 72%, var(--tool-surface));
+}
+
+.message--tool:not(.tool-group *):has(> .tool-card-preview) > .tool-details {
+  border: 0;
+  border-radius: inherit;
+}
+.message--tool:not(.tool-group *):has(> :is([data-tool-kind="agent"], [data-tool-kind="web"]) + .tool-card-preview) {
+  --tool-card-tint: color-mix(in srgb, var(--tool-surface) 56%, var(--accent-tint));
+}
+.message--tool:not(.tool-group *):has(> :is([data-tool-kind="terminal"], [data-tool-kind="memory"]) + .tool-card-preview) {
+  --tool-card-tint: var(--inset);
+}
+.message--tool:not(.tool-group *):has(> [data-tool-kind="modify"] + .tool-card-preview) {
+  --tool-card-tint: var(--user-surface);
+}
+.tool-details:not(.tool-group *):has(+ .tool-card-preview) > .tool-summary {
+  padding-inline: var(--s3);
+  border-radius: inherit;
+  border-end-start-radius: 0;
+  border-end-end-radius: 0;
+}
+.tool-details:not(.tool-group *):has(+ .tool-card-preview) > .tool-summary .tool-label { font-size: var(--body); }
+.tool-details:not(.tool-group *):has(+ .tool-card-preview) > .fold-body { padding: var(--s2) var(--s3) var(--s3) var(--s8); }
+.tool-details:not(.tool-group *, [open]):has(+ .tool-card-preview[data-repeat-recap]) .tool-preview:not([hidden]) {
+  /* Keep the native disclosure's target in its accessible label, not twice on the card. */
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.tool-card-emblem {
+  position: absolute;
+  z-index: -1;
+  inset-block-start: var(--s3);
+  inset-inline-end: var(--s3);
+  inline-size: min(38%, calc(var(--s8) * 4));
+  block-size: auto;
+  color: var(--accent);
+  opacity: .19;
+  stroke-width: 1.25;
+  pointer-events: none;
+}
+.tool-card-content {
+  display: grid;
+  gap: var(--s2);
+  padding: var(--s1) var(--s3) var(--s4) var(--s8);
+}
+.tool-group .tool-card-preview,
+.tool-details[open] + .tool-card-preview > .tool-card-content { display: none; }
+.tool-card-heading { color: var(--accent); font-size: var(--small); font-weight: 700; }
+.tool-card-rows {
+  display: grid;
+  gap: var(--s1);
+  padding-inline-start: var(--s4);
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.tool-card-rows li::marker { color: var(--accent); }
+.tool-card-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2) var(--s6);
+  margin: 0;
+}
+.tool-card-fact {
+  min-inline-size: min(6rem, 100%);
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
+}
+.tool-card-fact dt { color: var(--muted); font-size: var(--caption); }
+.tool-card-fact dd { margin: 0; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tool-card-note { color: var(--muted); font-size: var(--caption); }
+.tool-card-prompts {
+  display: grid;
+  gap: var(--s2);
+  border-block-start: var(--stroke) solid var(--line);
+  padding-block-start: var(--s2);
+}
+.tool-card-prompt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: var(--small);
+}
+.tool-agent pre.tool-agent-prompt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.tool-card-inline { display: none; }
+
+@media (max-height: 38rem) {
+  .tool-card-preview:has(.tool-card-facts) { display: none; }
+  .tool-details:not(.tool-group *, [open]):has(+ .tool-card-preview .tool-card-facts) > .tool-summary { border-radius: inherit; }
+  .tool-details:not(.tool-group *, [open]) .tool-card-inline:not([hidden]) { display: inline; font-size: var(--caption); }
+}
+
+.message .tool-details[data-tool-kind="inspect"]:not(.tool-group *) {
+  border: var(--stroke) solid var(--line);
+  border-radius: var(--r1);
+  background: var(--rail);
+}
+.tool-details[data-tool-kind="inspect"] > .tool-summary .tool-kind-icon { color: var(--accent); }
 
 .message .tool-group {
   background: var(--rail);
@@ -222,6 +336,9 @@
 }
 
 @media (forced-colors: active) {
+  .message--tool:not(.tool-group *):has(> .tool-card-preview),
+  .message .tool-details[data-tool-kind="inspect"]:not(.tool-group *) { border-color: CanvasText; }
+  .tool-card-emblem { display: none; }
   .message :is(.tool-details, .tool-group, .tool-group-row, .tool-group-body, .tool-terminal,
     .tool-terminal-input, .tool-todo-lane, .tool-raw-args, .tool-source, .tool-receipt, .tool-agent-scope) {
     border-color: CanvasText;

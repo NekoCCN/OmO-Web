@@ -7,6 +7,7 @@ export type TodoChange = {
   readonly preview?: string;
   readonly batches: readonly Batch[];
   readonly requested: boolean;
+  readonly card?: { readonly titles: readonly string[]; readonly total: number };
 };
 
 const operations = new Map([
@@ -49,15 +50,18 @@ export function todoChange(input: Wire): TodoChange {
   const operation = operations.get(op);
   const batches = submittedBatches(input);
   const submitted = batches?.flatMap(batch => batch.items) ?? [];
-  const title = submitted.map(item => item.trim()).find(recognizableTitle);
+  const titles = submitted.map(item => item.trim()).filter(recognizableTitle);
   const requested = op === "start" || op === "done" || op === "drop" || op === "rm";
   const task = requested && input.phase === undefined && input.list === undefined && input.items === undefined &&
     validLabel(input.task, 240) ? input.task.trim() : undefined;
-  const preview = task && recognizableTitle(task) ? task : title;
+  const requestTitle = task && recognizableTitle(task) ? task : undefined;
+  const preview = requestTitle ?? titles[0];
   return {
     operation: operation && batches !== undefined ? `${operation} · ${submitted.length} 项` : operation,
     preview: preview && submitted.length > 1 ? `${preview} · 另 ${submitted.length - 1} 项` : preview,
     batches: batches ?? [],
     requested,
+    card: requestTitle ? { titles: [requestTitle], total: 1 }
+      : titles.length ? { titles, total: submitted.length } : undefined,
   };
 }

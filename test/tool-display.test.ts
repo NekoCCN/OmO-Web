@@ -51,6 +51,7 @@ async function withWorkbench(width: number, messages: readonly Wire[], run: (bro
       },
       "/app.js": () => new Response(script),
       "/api/bootstrap": Response.json({ sessions: [session], workspaces: [session.cwd], engine: { online: true } }),
+      "/api/cli-history": Response.json({ available: true, sessions: [] }),
       "/api/events": () => new Response(new ReadableStream<string>({
         start(controller) { events = controller; controller.enqueue(": fixture\n\n"); },
         cancel() { events = undefined; },
@@ -482,6 +483,191 @@ browserTest("Todo separates the submitted list from the receipt; Memory disclosu
   });
 });
 
+browserTest("Featured cards show Todo changes and Agent prompt previews without opening source data", async () => {
+  const changes = ["检查发布路由", "ghp_PrivateTodoTitle", "核对导航状态", "确认移动端主题", "验证键盘操作", "记录发布结论"];
+  const prompt = `核对发布路由和主题。\n${"长说明".repeat(90)}\n<em>逐字保留这行</em>`;
+  const tasks = [{ category: "quick", prompt },
+    { subagent_type: "delivery-worker", prompt: "在手机宽度下复查导航和键盘焦点。" }];
+  for (const width of evidence ? [1440, 390, 320] : [390]) {
+    await withWorkbench(width, [
+      { role: "user", content: "准备发布预览，列出本次验收待办，并派发独立检查。" },
+      assistant(text("先列待办，再把两项检查分别派发。"),
+        call("plan", "todo", { op: "append", phase: "发布验收", items: changes }),
+        call("dispatch", "task", { tasks, run_in_background: true }),
+        call("inspect", "read", { path: "src/web/app.ts" })),
+      result("plan", "todo", false, "private-todo-receipt"),
+      result("dispatch", "task", false, "private-dispatch-receipt"),
+      result("inspect", "read", false, "private-file-output"),
+      { role: "assistant", content: [text("验收任务已派发。合并检查结论前，先保留发布预览。")] },
+    ], async (browser, emit) => {
+      const read = (kind: string) => browser.evaluate<string>(
+        `document.querySelector('.tool-details[data-tool-kind="${kind}"]').parentElement.innerText`);
+      const todo = await read("todo");
+      expect(todo).toContain("检查发布路由");
+      expect(todo).toContain("核对导航状态");
+      expect(todo).toContain("确认移动端主题");
+      expect(todo).toContain("验证键盘操作");
+      expect(todo).not.toMatch(/记录发布结论|PrivateTodoTitle|private-todo-receipt|发布验收/);
+      expect(todo).toContain("其余 2 项");
+      const agent = await read("agent");
+      expect(agent).toMatch(/提交 2 项任务[\s\S]*类别 quick[\s\S]*角色 delivery-worker/);
+      expect(agent).toContain("核对发布路由和主题。");
+      expect(agent).toContain(tasks[1]?.prompt ?? "");
+      expect(agent).not.toMatch(/逐字保留这行|private-dispatch-receipt/);
+      expect(await read("inspect")).not.toContain("private-file-output");
+
+      if (evidence) {
+        if (await browser.evaluate(`!!document.querySelector("#details-dialog[open]")`)) {
+          await browser.click("#details-dialog [data-close]");
+        }
+        for (const theme of ["light", "dark"]) {
+          await browser.evaluate(`document.documentElement.dataset.theme = "${theme}"`);
+          for (const kind of ["todo", "agent"]) {
+            expect(await browser.evaluate(`(async () => {
+              const card = document.querySelector('.tool-details[data-tool-kind="${kind}"]').parentElement;
+              const transcript = document.querySelector("#transcript");
+              const viewport = transcript.getBoundingClientRect();
+              transcript.scrollTop += card.getBoundingClientRect().top - viewport.top - 16;
+              await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              const box = card.getBoundingClientRect();
+              const headerHeight = card.querySelector(".tool-summary").getBoundingClientRect().height;
+              const emblem = card.querySelector(".tool-card-emblem");
+              return { overflow: [card.scrollWidth - card.clientWidth, transcript.scrollWidth - transcript.clientWidth],
+                fits: box.top >= viewport.top && box.bottom <= viewport.bottom,
+                reachable: headerHeight >= (${width} <= 760 ? 44 : 24),
+                decorative: emblem.getAttribute("aria-hidden") === "true" && getComputedStyle(emblem).pointerEvents === "none" };
+            })()`)).toEqual({ overflow: [0, 0], fits: true, reachable: true, decorative: true });
+            await capture(browser, `featured-${width}-${theme}-${kind}`);
+          }
+        }
+      }
+
+      await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="agent"] > summary').focus()`);
+      await browser.press("Enter");
+      const opened = await browser.evaluate(`(() => {
+        const scene = document.querySelector(".tool-agent");
+        return { prompts: [...scene.querySelectorAll("pre.tool-agent-prompt")].map(node => node.textContent),
+          markup: !!scene.querySelector("em"), rawOpen: scene.parentElement.querySelector(".tool-raw-args").open };
+      })()`);
+      expect(opened).toEqual({ prompts: tasks.map(task => task.prompt), markup: false, rawOpen: false });
+      if (evidence) await capture(browser, `featured-${width}-agent-prompts`);
+      await browser.press("Enter");
+
+      await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="todo"] > summary').focus()`);
+      await browser.press("Enter");
+      expect(await read("todo")).toContain("记录发布结论");
+      expect(await read("todo")).not.toContain("private-todo-receipt");
+      await browser.press("Tab");
+      await browser.press("Enter");
+      expect(await read("todo")).toContain("private-todo-receipt");
+      await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="todo"] .tool-raw-args > summary').focus()`);
+      await browser.press("Enter");
+      expect(await read("todo")).toContain('"op": "append"');
+      await capture(browser, `featured-${width}-todo-source`);
+
+      const live = { toolCallId: "finish", toolName: "todo", args: { op: "done", task: "核对发布清单" } };
+      emit({ type: "tool_execution_start", ...live });
+      await waitFor(browser, `!!document.querySelector('.tool-details[data-tool-kind="todo"][data-state="running"]')`);
+      const selector = '.tool-details[data-tool-kind="todo"][data-state="running"]';
+      const running = await browser.evaluate(`document.querySelector(${JSON.stringify(selector)}).parentElement.innerText`);
+      expect(running).toMatch(/请求完成[\s\S]*运行中[\s\S]*核对发布清单/);
+      await browser.evaluate(`document.querySelector(${JSON.stringify(selector + " > summary")}).focus()`);
+      await browser.press("Enter");
+      await browser.press("Tab");
+      await browser.press("Enter");
+      emit({ type: "tool_execution_end", ...live, isError: true, result: { content: [text("原生拒绝：未更新清单")] } });
+      await waitFor(browser, `document.querySelector('.tool-details[data-tool-kind="todo"][data-state="error"]')?.innerText.includes("未更新清单")`);
+      expect(await browser.evaluate(`document.activeElement.matches(".tool-todo-receipt[open] > summary")`)).toBe(true);
+      await browser.press("Enter");
+      await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="todo"][data-state="error"] > summary').focus()`);
+      await browser.press("Enter");
+      const failed = await browser.evaluate(`document.activeElement.parentElement.parentElement.innerText`);
+      expect(failed).toMatch(/请求完成[\s\S]*失败[\s\S]*核对发布清单/);
+      expect(failed).not.toContain("未更新清单");
+      if (evidence) {
+        await browser.cdp("Emulation.setEmulatedMedia", { features: [{ name: "forced-colors", value: "active" }] });
+        expect(await browser.evaluate(`(() => {
+          const header = document.activeElement;
+          return [getComputedStyle(header).outlineStyle, getComputedStyle(header.closest("article")
+            .querySelector(".tool-card-emblem")).display];
+        })()`)).toEqual(["solid", "none"]);
+        await capture(browser, `featured-${width}-forced-failure`);
+      }
+    });
+  }
+}, 20000);
+
+browserTest("Specialized tools show safe facts, but grouped tools stay compact", async () => {
+  const specimens = [
+    ["terminal", "bash", { command: "private-command\nprivate-command-two\n" }, /命令\s*2 行.*可见输出\s*3 行文本/s],
+    ["execution", "eval", { language: "js", code: "private-code\nprivate-code-two" }, /语言\s*JavaScript.*源码\s*2 行/s],
+    ["context", "ctx_batch", { commands: ["private-query"], queries: ["private-first", "private-second"] }, /命令\s*1 条.*查询\s*2 条/s],
+    ["modify", "edit", { path: "src/workbench.ts", oldText: "private-before", newText: "private-after\nprivate-next" },
+      /替换前\s*1 行.*替换后\s*2 行/s],
+    ["memory", "memory", { command: "update_description", file_path: "private-path.md", description: "private-memory" }, /变更对象\s*描述/],
+    ["web", "webfetch", { url: "https://example.org/private-url?q=private-query" }, /主机\s*example\.org/],
+    ["agent", "task", { category: "quick", prompt: "核对交付说明", run_in_background: true }, /类别 quick.*后台.*核对交付说明/s],
+  ] as const;
+  const grouped = [call("group-a", "read", { path: "src/one.ts" }),
+    call("group-b", "eval", { language: "py", code: "private-group-code" }),
+    call("group-c", "webfetch", { url: "https://example.net/private-group-url" })];
+  for (const width of evidence ? [1440, 390, 320] : [390]) {
+    await withWorkbench(width, [
+      { role: "user", content: "检查发布预览中的工具调用和可见证据。" },
+      assistant(...specimens.flatMap(([, name, args], i) => [text("接着核对下一项。"), call(`card-${i}`, name, args)]),
+        text("顺带验证分组探查。"), ...grouped, text("再打开一条独立的读取记录。"),
+        call("single-read", "read", { path: "docs/usage.md" }), text("保留未知插件的原始证据。"),
+        call("extension", "mcp_fixture:custom", { query: "private-extension" })),
+      ...specimens.map(([, name], i) => result(`card-${i}`, name, false, "private-output-1\nprivate-output-2\nprivate-output-3")),
+      ...grouped.map(row => result(String(row.id), String(row.name), false, "private-group-output")),
+      result("single-read", "read", false, "private-file-output"),
+      result("extension", "mcp_fixture:custom", false, "private-extension-output"),
+      { role: "assistant", content: [text("检查结束，可以打开各条回执核对细节。")] },
+    ], async browser => {
+      const rows = await browser.evaluate<string[]>(`[...document.querySelectorAll("#messages .tool-details:not(.tool-group *)")]
+        .map(entry => entry.parentElement.innerText)`);
+      expect(rows.slice(0, specimens.length)).toEqual(specimens.map(([, , , summary]) => expect.stringMatching(summary)));
+      expect(rows.join(" ")).not.toMatch(/private-/);
+      expect(await browser.evaluate(`(() => {
+        const group = document.querySelector(".tool-group");
+        group.open = true;
+        return [...group.querySelectorAll(".tool-details")].map(row =>
+          [row.dataset.toolKind, !!row.parentElement.querySelector(".tool-card-content")?.getClientRects().length]);
+      })()`)).toEqual([["inspect", false], ["execution", false], ["web", false]]);
+      const compact = await browser.evaluate(`["inspect", "unknown"].map(kind => {
+        const row = document.querySelector('.tool-details:not(.tool-group *)[data-tool-kind="' + kind + '"]');
+        return { text: row.parentElement.innerText, card: !!row.parentElement.querySelector(".tool-card-content")?.getClientRects().length };
+      })`);
+      expect(compact).toEqual([
+        { text: expect.stringContaining("docs/usage.md"), card: false },
+        { text: expect.stringContaining("mcp_fixture:custom"), card: false },
+      ]);
+      if (evidence) {
+        if (await browser.evaluate(`!!document.querySelector("#details-dialog[open]")`)) await browser.click("#details-dialog [data-close]");
+        for (const theme of ["light", "dark"]) {
+          await browser.evaluate(`document.documentElement.dataset.theme = "${theme}"`);
+          for (const selector of [...specimens.map(([kind]) => `.tool-details:not(.tool-group *)[data-tool-kind="${kind}"]`),
+            '.tool-details:not(.tool-group *)[data-tool-kind="inspect"]', ".tool-group"]) {
+            const captureName = await browser.evaluate(`(async () => {
+              const entry = document.querySelector(${JSON.stringify(selector)});
+              const card = entry.matches(".tool-group") ? entry : entry.parentElement;
+              const viewport = document.querySelector("#transcript");
+              const bounds = viewport.getBoundingClientRect();
+              viewport.scrollTop += card.getBoundingClientRect().top - bounds.top - 16;
+              await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+              const frame = card.getBoundingClientRect();
+              if (card.scrollWidth > card.clientWidth || viewport.scrollWidth > viewport.clientWidth ||
+                frame.top < bounds.top || frame.bottom > bounds.bottom) throw Error("Card does not fit its viewport");
+              return entry.dataset.toolKind ?? "group";
+            })()`);
+            await capture(browser, `all-cards-${width}-${theme}-${captureName}`);
+          }
+        }
+      }
+    });
+  }
+}, 30000);
+
 browserTest("Todo recap projects one recognizable title, never a private payload or inferred progress", async () => {
   const privateTitles = [
     "ghp_ExampleCredential", "API token CedarValue", "/home/demo/notes.md",
@@ -525,19 +711,19 @@ browserTest("Todo recap projects one recognizable title, never a private payload
   });
 });
 
-browserTest("Ctx and Agent batches show only validated submission counts, independently of the receipt", async () => {
+browserTest("Batch recaps only show validated counts and Agent routes, independently of the receipt", async () => {
   const commands = ["printf private-command-one", "printf private-command-two"];
   const queries = ["private-query-one", "private-query-two", "private-query-three"];
   const task = { prompt: "private-task-prompt", name: "private-task-name", task_summary: "private-task-caption" };
   const tasks = [{ ...task, category: "quick" }, { ...task, subagent_type: "delivery-worker" }];
-  const cases: readonly (readonly [string, Wire, string, string])[] = [
+  const cases: readonly (readonly [string, Wire, string, string, (readonly string[])?])[] = [
     ["ctx_batch", { commands, queries }, "批量查询", "提交 2 条命令 · 3 条查询"],
     ["ctx_batch", { commands, queries: [{ query: "private-query-object" }] }, "批量查询", ""],
     ["ctx_batch", { commands: [], queries }, "批量查询", ""],
     ["ctx_batch", { commands: Array(25).fill(commands[0]), queries }, "批量查询", ""],
     ["ctx_batch", { input: { commands, queries } }, "批量查询", ""],
-    ["task", { tasks, run_in_background: true }, "派发任务", "提交 2 项任务"],
-    ["task", { tasks: [task], category: "quick" }, "派发任务", "提交 1 项任务"],
+    ["task", { tasks, run_in_background: true }, "派发任务", "提交 2 项任务", ["类别 quick", "角色 delivery-worker"]],
+    ["task", { tasks: [task], category: "quick" }, "派发任务", "提交 1 项任务", ["类别 quick"]],
     ["task", { tasks, prompt: "private-mixed-prompt", category: "quick" }, "派发任务", ""],
     ["task", { tasks: [{ category: "quick" }] }, "派发任务", ""],
     ["task", { tasks: [{ ...task, category: "quick", subagent_type: "delivery-worker" }] }, "派发任务", ""],
@@ -549,15 +735,20 @@ browserTest("Ctx and Agent batches show only validated submission counts, indepe
     assistant(...cases.flatMap(([name, args], index) => [call(`batch-${index}`, name, args), text("下一条记录。")])),
     ...cases.map(([name], index) => result(`batch-${index}`, name, false, `批次回执 ${index}：未报告子项状态`)),
   ], async browser => {
-    const shown = await browser.evaluate<{ inputs: string[][]; details: string[]; receipts: string[] }>(`(() => {
+    const shown = await browser.evaluate<{ inputs: string[][]; details: string[]; routes: readonly (readonly string[])[]; prompts: string[][]; receipts: string[] }>(`(() => {
       const rows = [...document.querySelectorAll(".tool-details")];
       const inputs = rows.map(row => [row.querySelector(".tool-operation").innerText, row.querySelector(".tool-preview").textContent]);
       rows.forEach(row => row.open = true);
       return { inputs, details: rows.map(row => row.innerText),
+        routes: rows.map(row => [...row.querySelectorAll(".tool-agent li")].map(route => route.innerText)),
+        prompts: rows.map(row => [...row.querySelectorAll(".tool-agent-prompt")].map(prompt => prompt.textContent)),
         receipts: rows.map(row => row.querySelector(".tool-output").innerText) };
     })()`);
     expect(shown.inputs).toEqual(cases.map(([, , operation, preview]) => [operation, preview]));
-    expect(shown.details.join(" ")).not.toMatch(/private-|后台|quick|delivery-worker/);
+    expect(shown.details.join(" ")).not.toMatch(/private-(?!task-prompt)|后台/);
+    expect(shown.prompts).toEqual(cases.map(([, , , , routes]) => routes?.map(() => task.prompt) ?? []));
+    expect(shown.routes).toEqual(cases.map(([, , , , routes]) => routes ?? []));
+    expect(shown.details.filter((_, index) => !cases[index]?.[4]).join(" ")).not.toMatch(/quick|delivery-worker/);
     expect(shown.receipts).toEqual(cases.map((_, index) => `批次回执 ${index}：未报告子项状态`));
   });
 });
@@ -705,7 +896,9 @@ browserTest("Tool scenes render the connected wire as distinct workspaces withou
                 return title && scene.innerText.includes(title);
               });
             }),
-            extraHidden: ![evaluate, ctx, file, agent, plugin].some(row => /private-/.test(row.innerText)),
+            extraHidden: ![evaluate, ctx, file, plugin].some(row => /private-/.test(row.innerText)) &&
+              !visible(agent, "private-agent-summary"),
+            agentPrompt: agent.querySelector(".tool-agent-prompt")?.innerText,
             generic: !plugin.querySelector(".tool-scene") && visible(plugin, "generic-call-args") && visible(plugin, "8 · 原生工具输出"),
           };
         })()`);
@@ -716,7 +909,7 @@ browserTest("Tool scenes render the connected wire as distinct workspaces withou
           todoReceipt: true, memoryAudit: true, memoryHidden: true,
           execution: [expect.stringContaining("JavaScript"), expect.stringContaining("Python")], codeHidden: true,
           file: ["src/界面/工具.ts", "文件变更回执"], agent: expect.stringMatching(/quick.*后台/s), agentOutput: true,
-          repeatedLabels: false, extraHidden: true, generic: true,
+          repeatedLabels: false, extraHidden: true, generic: true, agentPrompt: "private-agent-prompt",
         });
         for (const [selector, token] of [
           ['[data-tool-kind="memory"] .tool-memory-receipt > summary', "private-memory-output"],
@@ -821,5 +1014,10 @@ browserTest("Streaming terminal retains its viewport and finite signals respect 
         await capture(browser, `scene-${feature.name}`);
       }
     }
+    await browser.evaluate(`document.querySelector(".tool-summary").focus()`);
+    await browser.press("Enter");
+    const preview = await browser.evaluate(`document.querySelector(".tool-details").parentElement.innerText`);
+    expect(preview).toContain("49 行文本");
+    expect(preview).not.toContain("final receipt");
   });
 });

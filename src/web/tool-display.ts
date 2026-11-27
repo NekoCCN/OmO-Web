@@ -1,8 +1,10 @@
 import { codeBlock, el, list, notice, object, pretty, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { projectToolCard, renderToolCard } from "./tool-card.ts";
 import { ToolGroupView } from "./tool-group-view.ts";
 import { createToolScene, toolOutputLabels } from "./tool-scenes.ts";
 import { recapTool, toolGlyphs } from "./tool-semantics.ts";
+import type { ToolRecap } from "./tool-semantics.ts";
 import type { TranscriptEntry } from "./transcript.ts";
 
 export type ToolTrace = {
@@ -50,6 +52,7 @@ export class ToolDisplay {
   private readonly target = el("span", "tool-target path");
   private readonly operation = el("span", "tool-operation small muted");
   private readonly preview = el("span", "tool-preview small muted");
+  private readonly compactFacts = el("span", "tool-card-inline small muted");
   private readonly status = el("span", "tool-state-text");
   private readonly icon = document.createElementNS("http://www.w3.org/2000/svg", "path");
   private readonly kindIcon = document.createElementNS("http://www.w3.org/2000/svg", "path");
@@ -63,6 +66,8 @@ export class ToolDisplay {
   private readonly empty = el("p", "muted small");
   private readonly outputSection = el("div", "tool-result stack stack--tight");
   private readonly body = el("div", "fold-body stack stack--tight");
+  private card?: HTMLElement;
+  private cardKey?: string;
   private scene?: ReturnType<typeof createToolScene>;
   private lastName?: string;
   private lastArgs?: unknown;
@@ -76,7 +81,8 @@ export class ToolDisplay {
     const subject = el("span", "tool-subject");
     const kind = glyph(this.kindIcon);
     kind.classList.add("tool-kind-icon");
-    subject.append(kind, this.label, this.operation, this.target, this.preview);
+    this.compactFacts.hidden = true;
+    subject.append(kind, this.label, this.operation, this.target, this.preview, this.compactFacts);
     const state = el("span", "tool-state");
     state.append(glyph(this.icon), this.status);
     summary.append(chevron, subject, state);
@@ -99,6 +105,28 @@ export class ToolDisplay {
   groupWith(members: readonly HTMLElement[]): HTMLDetailsElement {
     this.group ??= new ToolGroupView();
     return this.group.update(members);
+  }
+
+  private updateCard(recap: ToolRecap, output: unknown): void {
+    const projection = projectToolCard(recap, output);
+    const repeatedRecap = Boolean(recap.preview && !recap.dispatchRoutes);
+    const key = projection && JSON.stringify([recap.kind, projection, repeatedRecap]);
+    if (this.cardKey === key) return;
+    this.cardKey = key;
+    this.card?.remove();
+    this.card = undefined;
+    notice(this.compactFacts, projection && "facts" in projection
+      ? projection.facts.map(([label, value]) => `${label} ${value}`).join(" · ") : "");
+    if (!projection) return;
+    const card = el("div", "tool-card-preview");
+    if (repeatedRecap) card.dataset.repeatRecap = "";
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute("d", recap.kind === "todo" ? "m3 12 6 6L21 6" : toolGlyphs[recap.kind]);
+    const emblem = glyph(path);
+    emblem.classList.add("tool-card-emblem");
+    card.append(emblem, renderToolCard(projection));
+    this.node.append(card);
+    this.card = card;
   }
 
   update(call?: Wire, trace?: ToolTrace, result?: Wire): void {
@@ -150,7 +178,9 @@ export class ToolDisplay {
     notice(this.name, kind === "unknown" || name.toLowerCase() === label.toLowerCase() ? "" : name);
     this.identity.hidden = this.name.hidden;
 
-    if (kindChanged || this.lastArgs !== args || this.lastName !== name) {
+    const inputChanged = kindChanged || this.lastArgs !== args || this.lastName !== name;
+    if (inputChanged || this.lastOutput !== output) this.updateCard(recap, output);
+    if (inputChanged) {
       this.scene?.update?.(recap);
       this.argsSection.hidden = this.rawArgs.hidden = args === undefined;
       const code = this.args.firstElementChild;

@@ -1,4 +1,5 @@
 import { codeBlock, el, notice } from "./dom.ts";
+import { agentPromptLabel, toolCardRows } from "./tool-card.ts";
 import type { ToolRecap } from "./tool-semantics.ts";
 
 type ToolScene = {
@@ -91,8 +92,27 @@ export function createToolScene(kind: ToolRecap["kind"], output: HTMLElement): T
     case "agent": {
       const node = el("div", "tool-scene tool-agent");
       const scope = el("p", "tool-agent-scope small muted");
-      node.append(scope, output);
-      return { node, update: recap => notice(scope, recap.scope && `范围：${recap.scope}`) };
+      const routes = el("div", "stack stack--tight");
+      const prompts = el("div", "stack stack--tight");
+      let shown: readonly string[] = [];
+      prompts.hidden = true;
+      node.append(scope, routes, prompts, output);
+      return { node, update(recap) {
+        notice(scope, recap.scope && `范围：${recap.scope}`);
+        routes.hidden = !recap.dispatchRoutes;
+        if (recap.dispatchRoutes) routes.replaceChildren(el("p", "tool-scene-key", "派发配置"), toolCardRows(recap.dispatchRoutes));
+        const next = recap.agentPrompts ?? [];
+        if (next.length === shown.length && next.every((prompt, index) => prompt === shown[index])) return;
+        shown = next;
+        prompts.hidden = !next.length;
+        prompts.replaceChildren(...next.flatMap((prompt, index) => {
+          const label = agentPromptLabel(index, next.length);
+          const block = codeBlock(prompt);
+          block.classList.add("tool-agent-prompt");
+          block.setAttribute("aria-label", label);
+          return [el("p", "tool-scene-key", label), block];
+        }));
+      } };
     }
     case "web": {
       const node = el("div", "tool-scene tool-web");
