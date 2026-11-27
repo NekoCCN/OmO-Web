@@ -3,13 +3,14 @@ import type { Api, BranchSource, Session } from "./api.ts";
 import { showNativeActivity } from "./details.ts";
 import { byId, button, el, errorText, list, notice, num, object, str } from "./dom.ts";
 import { roleOf, Transcript } from "./transcript.ts";
+import { tr, uiLocale } from "./locale.ts";
 
 type HistoryRow = { readonly id: string; readonly name: string; readonly cwd: string; readonly updatedAt: number;
   readonly adopted: boolean };
 
 const box = (id: string) => byId(id, HTMLElement);
 const btn = (id: string) => byId(id, HTMLButtonElement);
-const date = new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" });
+const date = new Intl.DateTimeFormat(uiLocale, { dateStyle: "medium", timeStyle: "short" });
 const time = (updatedAt: number) => Number.isFinite(new Date(updatedAt).getTime()) ? date.format(updatedAt) : "";
 
 export function cliHistory(api: Api, onClose: () => void, openBranch: (source: BranchSource) => void,
@@ -41,7 +42,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     const reason = resumeUnavailable();
     branch.disabled = !readable || opening !== undefined;
     resume.disabled = branch.disabled || Boolean(reason);
-    notice(resumeStatus, opening ? "正在尝试打开同一会话…" : readable ? reason : "");
+    notice(resumeStatus, opening ? tr("正在尝试打开同一会话…", "Opening the same session in Web…") : readable ? reason : "");
   }
 
   function renderList(): void {
@@ -53,14 +54,14 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       const open = button("", () => openRecord(row), "button--quiet session-link");
       open.dataset.history = row.id;
       open.append(el("span", "", row.name), el("span", "small muted path", row.cwd), el("small", "", time(row.updatedAt)),
-        ...(row.adopted ? [el("small", "muted", "已在 Web 打开")] : []));
+        ...(row.adopted ? [el("small", "muted", tr("已在 Web 打开", "Open in Web"))] : []));
       li.append(open);
       rows.append(li);
     }
     rows.hidden = !matches.length;
-    notice(box("cli-history-list-status"), listing ? "正在读取 CLI 历史…" : available === false
-      ? "CLI 历史不可用：未启用或未找到本地历史记录。" : available && !matches.length
-        ? query ? "没有匹配的 CLI 历史。" : "没有可显示的 CLI 历史。" : "");
+    notice(box("cli-history-list-status"), listing ? tr("正在读取 CLI 历史…", "Loading CLI history…") : available === false
+      ? tr("CLI 历史不可用：未启用或未找到本地历史记录。", "CLI history is disabled or no local history records were found.") : available && !matches.length
+        ? query ? tr("没有匹配的 CLI 历史。", "No matching CLI history.") : tr("没有可显示的 CLI 历史。", "No CLI history to show.") : "");
   }
 
   async function loadList(): Promise<void> {
@@ -75,11 +76,11 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       available = data.available === true;
       items = list(data.sessions).map(object).flatMap(row => {
         const id = str(row.id);
-        return id ? [{ id, name: str(row.name) || "未命名 CLI 会话", cwd: str(row.cwd), updatedAt: num(row.updatedAt) ?? 0,
+        return id ? [{ id, name: str(row.name) || tr("未命名 CLI 会话", "Untitled CLI session"), cwd: str(row.cwd), updatedAt: num(row.updatedAt) ?? 0,
           adopted: row.adopted === true }] : [];
       });
     } catch (error) {
-      if (!request.signal.aborted && modal.open) notice(box("cli-history-list-error"), `无法读取 CLI 历史：${errorText(error)}`);
+      if (!request.signal.aborted && modal.open) notice(box("cli-history-list-error"), tr(`无法读取 CLI 历史：${errorText(error)}`, `Could not load CLI history: ${errorText(error)}`));
     } finally {
       if (listing === request) {
         listing = undefined;
@@ -96,7 +97,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     const request = snapshot = new AbortController();
     const previousStatus = activity.querySelector("[data-activity-status]");
     previousStatus?.remove();
-    const status = el("p", "small muted", "正在读取原生快照…");
+    const status = el("p", "small muted", tr("正在读取原生快照…", "Loading native snapshot…"));
     status.dataset.activityStatus = "";
     status.setAttribute("role", "status");
     activity.append(status);
@@ -107,7 +108,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       showNativeActivity(activity, data);
     } catch (error) {
       if (!request.signal.aborted && modal.open && selected === row) {
-        status.textContent = `无法读取原生快照：${errorText(error)}`;
+        status.textContent = tr(`无法读取原生快照：${errorText(error)}`, `Could not load the native snapshot: ${errorText(error)}`);
         status.className = "notice error small";
         status.setAttribute("role", "alert");
       }
@@ -123,7 +124,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     reading?.abort();
     const request = reading = new AbortController();
     const status = box("cli-history-record-status");
-    notice(status, "正在读取对话记录…");
+    notice(status, tr("正在读取对话记录…", "Loading conversation…"));
     notice(box("cli-history-record-error"));
     try {
       const data = await api.request(recordPath(row), undefined, request.signal);
@@ -133,7 +134,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       readable = true;
       update();
       const modified = time(num(session.updatedAt) ?? row.updatedAt);
-      box("cli-history-record-meta").textContent = [row.cwd, modified && `记录更新：${modified}`].filter(Boolean).join(" · ");
+      box("cli-history-record-meta").textContent = [row.cwd, modified && tr(`记录更新：${modified}`, `Record updated: ${modified}`)].filter(Boolean).join(" · ");
       const entries = list(data.messages).map(object).map((message, i) => {
         const toolId = roleOf(message) === "toolResult" && str(message.toolCallId);
         return { key: toolId ? `result:${toolId}` : `history-${i}`, message };
@@ -141,7 +142,8 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       transcript.render(entries, "", new Map());
       requestAnimationFrame(() => { if (!request.signal.aborted && modal.open && selected === row) modal.scrollTop = 0; });
     } catch (error) {
-      if (!request.signal.aborted && modal.open && selected === row) notice(box("cli-history-record-error"), `无法读取这条记录：${errorText(error)}`);
+      if (!request.signal.aborted && modal.open && selected === row) notice(box("cli-history-record-error"),
+        tr(`无法读取这条记录：${errorText(error)}`, `Could not load this record: ${errorText(error)}`));
     } finally {
       if (reading === request) {
         reading = undefined;
@@ -200,7 +202,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       onResumed(session, stillSelected());
     } catch (error) {
       if (stillSelected()) {
-        notice(resumeError, `无法在 Web 继续：${errorText(error)}`);
+        notice(resumeError, tr(`无法在 Web 继续：${errorText(error)}`, `Could not continue in Web: ${errorText(error)}`));
         if (document.activeElement === resumeStatus) resumeError.focus();
       }
     } finally {

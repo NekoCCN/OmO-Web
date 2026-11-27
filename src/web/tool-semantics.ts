@@ -1,5 +1,6 @@
 import { object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { tr, uiLocale } from "./locale.ts";
 import { todoChange } from "./tool-todo.ts";
 import type { TodoChange } from "./tool-todo.ts";
 
@@ -24,9 +25,13 @@ export type ToolRecap = { readonly kind: Kind; readonly label: string; readonly 
   readonly agentRouting?: readonly string[]; readonly agentPrompts?: readonly string[]; readonly facts?: readonly ToolFact[] };
 
 const memoryActions = new Map<string, readonly [operation: string, target: string]>([
-  ["create", ["新建", "记忆条目"]], ["str_replace", ["替换", "正文"]], ["insert", ["插入", "正文"]],
-  ["delete", ["删除", "记忆条目"]], ["rename", ["重命名", "名称"]],
-  ["update_description", ["更新描述", "描述"]], ["apply_patch", ["应用补丁", "记忆补丁"]],
+  ["create", [tr("新建", "Create"), tr("记忆条目", "Memory entry")]],
+  ["str_replace", [tr("替换", "Replace"), tr("正文", "Content")]],
+  ["insert", [tr("插入", "Insert"), tr("正文", "Content")]],
+  ["delete", [tr("删除", "Delete"), tr("记忆条目", "Memory entry")]],
+  ["rename", [tr("重命名", "Rename"), tr("名称", "Name")]],
+  ["update_description", [tr("更新描述", "Update description"), tr("描述", "Description")]],
+  ["apply_patch", [tr("应用补丁", "Apply patch"), tr("记忆补丁", "Memory patch")]],
 ]);
 const languages = new Map([
   ["js", "JavaScript"], ["javascript", "JavaScript"], ["ts", "TypeScript"], ["typescript", "TypeScript"],
@@ -38,7 +43,7 @@ function codeDesk(tool: "eval" | "ctx_execute" | "ctx_execute_file", input: Wire
   const language = tool === "eval"
     ? input.language === "js" ? "JavaScript" : input.language === "py" ? "Python" : undefined
     : languages.get(str(input.language).toLowerCase());
-  return { preview: language, source: str(input.code) || undefined, facts: language ? [["语言", language]] : undefined };
+  return { preview: language, source: str(input.code) || undefined, facts: language ? [[tr("语言", "Language"), language]] : undefined };
 }
 
 const secretPrefix = /^(?:sk-|gh[pousr]_|github_pat_|xox[baprs]-|AKIA[A-Z0-9]{16}$)/iu;
@@ -47,10 +52,10 @@ const safeAgentRoute = (value: unknown): value is string =>
 
 function agentRouting(input: Wire): readonly string[] {
   const routing: string[] = [];
-  for (const [caption, value] of [["类别", input.category], ["角色", input.subagent_type]] as const) {
+  for (const [caption, value] of [[tr("类别", "Category"), input.category], [tr("角色", "Role"), input.subagent_type]] as const) {
     if (safeAgentRoute(value)) routing.push(`${caption} ${value}`);
   }
-  if (typeof input.run_in_background === "boolean") routing.push(input.run_in_background ? "后台" : "前台");
+  if (typeof input.run_in_background === "boolean") routing.push(input.run_in_background ? tr("后台", "Background") : tr("前台", "Foreground"));
   return routing;
 }
 
@@ -64,8 +69,8 @@ function batchCount(value: unknown, valid: (entry: unknown) => boolean): number 
 }
 
 function taskRoute(category: unknown, role: unknown): string | undefined {
-  if (category === undefined && safeAgentRoute(role)) return `角色 ${role}`;
-  if (role === undefined && safeAgentRoute(category)) return `类别 ${category}`;
+  if (category === undefined && safeAgentRoute(role)) return tr(`角色 ${role}`, `Role ${role}`);
+  if (role === undefined && safeAgentRoute(category)) return tr(`类别 ${category}`, `Category ${category}`);
 }
 
 function taskBatch(input: Wire): readonly { readonly route: string; readonly prompt: string }[] | undefined {
@@ -82,7 +87,9 @@ function taskBatch(input: Wire): readonly { readonly route: string; readonly pro
   return tasks;
 }
 
-const outputScopes = new Map([["status", "状态"], ["tail", "最近输出"], ["full", "完整输出"]]);
+const outputScopes = new Map([
+  ["status", tr("状态", "Status")], ["tail", tr("最近输出", "Recent output")], ["full", tr("完整输出", "Full output")],
+]);
 
 export function textLines(value: unknown): number | undefined {
   if (typeof value !== "string" || value.length > 65_536) return;
@@ -90,26 +97,34 @@ export function textLines(value: unknown): number | undefined {
   return (value.match(/\r\n|[\n\r]/gu)?.length ?? 0) + (value.endsWith("\n") || value.endsWith("\r") ? 0 : 1);
 }
 
+export function toolLineCount(lines: number): string {
+  const count = lines.toLocaleString(uiLocale);
+  return tr(`${count} 行`, `${count} ${lines === 1 ? "line" : "lines"}`);
+}
+
 function fileFacts(tool: string, input: Wire, args: unknown): readonly ToolFact[] {
   if (tool === "apply_patch") {
     const patch = (str(args) || str(input.patch) || str(input.patchText)).trim();
     if (patch.length > 65_536 || !/^\*\*\* Begin Patch\r?\n/u.test(patch) || !/\n\*\*\* End Patch$/u.test(patch)) return [];
     const facts: ToolFact[] = [];
-    for (const [action, label] of [["Add", "提交新增"], ["Update", "提交更新"], ["Delete", "提交删除"]] as const) {
+    for (const [action, label] of [
+      ["Add", tr("提交新增", "Add")], ["Update", tr("提交更新", "Update")], ["Delete", tr("提交删除", "Delete")],
+    ] as const) {
       const count = [...patch.matchAll(new RegExp(`^\\*\\*\\* ${action} File: [^\\r\\n]+`, "gmu"))].length;
-      if (count) facts.push([label, `${count} 个文件`]);
+      const amount = count.toLocaleString(uiLocale);
+      if (count) facts.push([label, tr(`${amount} 个文件`, `${amount} ${count === 1 ? "file" : "files"}`)]);
     }
     return facts;
   }
   if (tool === "write" || tool === "write_file") {
     const lines = textLines(input.content);
-    return lines === undefined ? [] : [["提交文本", `${lines} 行`]];
+    return lines === undefined ? [] : [[tr("提交文本", "Submitted text"), toolLineCount(lines)]];
   }
   const before = textLines(input.oldText ?? input.old_string);
   const after = textLines(input.newText ?? input.new_string);
   const facts: ToolFact[] = [];
-  if (before !== undefined) facts.push(["替换前", `${before} 行`]);
-  if (after !== undefined) facts.push([before === undefined ? "提交文本" : "替换后", `${after} 行`]);
+  if (before !== undefined) facts.push([tr("替换前", "Before replacement"), toolLineCount(before)]);
+  if (after !== undefined) facts.push([before === undefined ? tr("提交文本", "Submitted text") : tr("替换后", "After replacement"), toolLineCount(after)]);
   return facts;
 }
 
@@ -142,27 +157,27 @@ export function recapTool(name: string, args: unknown): ToolRecap {
   const tool = name.toLowerCase();
   switch (tool) {
     case "read": case "read_file":
-      return { kind: "inspect", label: "读取文件", group: "Read", target: localTarget(path ?? file_path ?? filePath) };
-    case "grep": return { kind: "inspect", label: "搜索内容", group: "Grep", target: localTarget(path) };
-    case "search": return { kind: "inspect", label: "搜索内容", target: localTarget(path) };
-    case "find": return { kind: "inspect", label: "查找文件", group: "Find", target: localTarget(path) };
-    case "glob": return { kind: "inspect", label: "查找文件", group: "Glob", target: localTarget(path) };
+      return { kind: "inspect", label: tr("读取文件", "Read file"), group: "Read", target: localTarget(path ?? file_path ?? filePath) };
+    case "grep": return { kind: "inspect", label: tr("搜索内容", "Search contents"), group: "Grep", target: localTarget(path) };
+    case "search": return { kind: "inspect", label: tr("搜索内容", "Search contents"), target: localTarget(path) };
+    case "find": return { kind: "inspect", label: tr("查找文件", "Find files"), group: "Find", target: localTarget(path) };
+    case "glob": return { kind: "inspect", label: tr("查找文件", "Find files"), group: "Glob", target: localTarget(path) };
     case "ls": case "list": case "list_dir": case "list_directory": case "list_files":
-      return { kind: "inspect", label: "列出目录", group: "List", target: localTarget(path) };
-    case "tool_search": return { kind: "inspect", label: "查找工具", group: "Tool Search" };
+      return { kind: "inspect", label: tr("列出目录", "List directory"), group: "List", target: localTarget(path) };
+    case "tool_search": return { kind: "inspect", label: tr("查找工具", "Find tools"), group: "Tool Search" };
     case "edit": case "edit_file": case "multiedit": case "apply_patch":
-      return { kind: "modify", label: "编辑文件", target: localTarget(path ?? file_path ?? filePath), facts: fileFacts(tool, input, args) };
+      return { kind: "modify", label: tr("编辑文件", "Edit file"), target: localTarget(path ?? file_path ?? filePath), facts: fileFacts(tool, input, args) };
     case "write": case "write_file":
-      return { kind: "modify", label: "写入文件", target: localTarget(path ?? file_path ?? filePath), facts: fileFacts(tool, input, args) };
+      return { kind: "modify", label: tr("写入文件", "Write file"), target: localTarget(path ?? file_path ?? filePath), facts: fileFacts(tool, input, args) };
     case "bash": case "shell": case "powershell":
       return { kind: "terminal", label: tool === "powershell" ? "PowerShell" : tool === "shell" ? "Shell" : "Bash",
-        operation: "运行命令", command: str(input.command) };
-    case "bash_output": return { kind: "terminal", label: "Bash", operation: "读取输出" };
-    case "kill_bash": return { kind: "terminal", label: "Bash", operation: "终止命令" };
+        operation: tr("运行命令", "Run command"), command: str(input.command) };
+    case "bash_output": return { kind: "terminal", label: "Bash", operation: tr("读取输出", "Read output") };
+    case "kill_bash": return { kind: "terminal", label: "Bash", operation: tr("终止命令", "Stop command") };
     case "memory": {
       const [operation, target] = memoryActions.get(str(input.command)) ?? [];
       return { kind: "memory", label: "Memory", operation,
-        facts: target ? [["变更对象", target]] : undefined };
+        facts: target ? [[tr("变更对象", "Change target"), target]] : undefined };
     }
     case "todo": case "todowrite": {
       const todo = todoChange(input);
@@ -170,64 +185,71 @@ export function recapTool(name: string, args: unknown): ToolRecap {
     }
     case "eval": {
       const action = str(input.action);
-      const operation = action === "peek" ? "查看执行" : action === "list" ? "列出执行" : action === "stop" ? "停止执行" :
-        action === "run" || input.action === undefined ? "执行脚本" : undefined;
+      const operation = action === "peek" ? tr("查看执行", "View run") : action === "list" ? tr("列出执行", "List runs")
+        : action === "stop" ? tr("停止执行", "Stop run")
+        : action === "run" || input.action === undefined ? tr("执行脚本", "Run script") : undefined;
       return { kind: "execution", label: "Eval", operation, ...codeDesk(tool, input),
         group: operation && action !== "stop" && (input.reset === undefined || input.reset === false) ? "Eval" : undefined };
     }
     case "ctx_execute": case "ctx_execute_file":
-      return { kind: "context", label: "Ctx Execute", operation: "执行脚本", group: "Ctx Execute", ...codeDesk(tool, input) };
+      return { kind: "context", label: "Ctx Execute", operation: tr("执行脚本", "Run script"), group: "Ctx Execute", ...codeDesk(tool, input) };
     case "ctx_search": {
       const count = batchCount(input.queries, batchText);
-      return { kind: "context", label: "Ctx Search", operation: "搜索上下文", group: "Ctx Search",
-        facts: count === undefined ? undefined : [["查询", `${count} 条`]] };
+      return { kind: "context", label: "Ctx Search", operation: tr("搜索上下文", "Search context"), group: "Ctx Search",
+        facts: count === undefined ? undefined : [[tr("查询", "Queries"), tr(`${count.toLocaleString(uiLocale)} 条`, count.toLocaleString(uiLocale))]] };
     }
     case "ctx_batch": {
       const commands = batchCount(input.commands, batchText);
       const queries = batchCount(input.queries, batchText);
       const summary = commands !== undefined && queries !== undefined ? {
-        preview: `提交 ${commands} 条命令 · ${queries} 条查询`,
-        facts: [["命令", `${commands} 条`], ["查询", `${queries} 条`]] as const,
+        preview: tr(`提交 ${commands.toLocaleString(uiLocale)} 条命令 · ${queries.toLocaleString(uiLocale)} 条查询`,
+          `Submitted ${commands.toLocaleString(uiLocale)} ${commands === 1 ? "command" : "commands"} · ${queries.toLocaleString(uiLocale)} ${queries === 1 ? "query" : "queries"}`),
+        facts: [[tr("命令", "Commands"), tr(`${commands.toLocaleString(uiLocale)} 条`, commands.toLocaleString(uiLocale))],
+          [tr("查询", "Queries"), tr(`${queries.toLocaleString(uiLocale)} 条`, queries.toLocaleString(uiLocale))]] as const,
       } : undefined;
-      return { kind: "context", label: "Ctx Batch", operation: "批量查询", group: "Ctx Batch", ...summary };
+      return { kind: "context", label: "Ctx Batch", operation: tr("批量查询", "Batch search"), group: "Ctx Batch", ...summary };
     }
     case "ctx_index": {
-      const inputs = [[input.path, "本机文件"], [input.content, "提交文本"], [input.url, "网页地址"]].filter(([value]) => batchText(value));
+      const inputs = [[input.path, tr("本机文件", "Local file")], [input.content, tr("提交文本", "Submitted text")],
+        [input.url, tr("网页地址", "Web address")]].filter(([value]) => batchText(value));
       const kind = inputs.length === 1 ? str(inputs[0]?.[1]) : "";
-      return { kind: "context", label: "Ctx Index", operation: "收录上下文", facts: kind ? [["来源类型", kind]] : undefined };
+      return { kind: "context", label: "Ctx Index", operation: tr("收录上下文", "Index context"), facts: kind ? [[tr("来源类型", "Source type"), kind]] : undefined };
     }
     case "ctx_purge": {
-      const scopes = [input.project === true && "项目", str(input.session) && "指定会话", str(input.source) && "指定来源"].filter(Boolean);
+      const scopes = [input.project === true && tr("项目", "Project"), str(input.session) && tr("指定会话", "Selected session"),
+        str(input.source) && tr("指定来源", "Selected source")].filter(Boolean);
       const scope = scopes.length === 1 ? str(scopes[0]) : "";
-      return { kind: "context", label: "Ctx Purge", operation: "清除上下文", facts: scope ? [["清除范围", scope]] : undefined };
+      return { kind: "context", label: "Ctx Purge", operation: tr("清除上下文", "Clear context"), facts: scope ? [[tr("清除范围", "Scope"), scope]] : undefined };
     }
     case "task": {
       const batch = taskBatch(input);
       const dispatchRoutes = batch?.map(task => task.route);
       const routing = input.tasks === undefined ? agentRouting(input) : undefined;
       const prompt = input.tasks === undefined && taskRoute(input.category, input.subagent_type) ? str(input.prompt) : "";
-      return { kind: "agent", label: "Agent", operation: "派发任务",
-        preview: routing?.join(" · ") ?? (dispatchRoutes && `提交 ${dispatchRoutes.length} 项任务`),
+      const count = dispatchRoutes?.length.toLocaleString(uiLocale);
+      return { kind: "agent", label: "Agent", operation: tr("派发任务", "Dispatch tasks"),
+        preview: routing?.join(" · ") ?? (dispatchRoutes && tr(`提交 ${count} 项任务`,
+          `Submitted ${count} ${dispatchRoutes.length === 1 ? "task" : "tasks"}`)),
         dispatchRoutes, agentRouting: routing, agentPrompts: batch?.map(task => task.prompt) ?? (prompt.trim() ? [prompt] : undefined) };
     }
-    case "task_output": return { kind: "agent", label: "Agent", operation: "查看任务", scope: outputScopes.get(str(input.mode)) };
-    case "task_send": return { kind: "agent", label: "Agent", operation: "发送消息" };
+    case "task_output": return { kind: "agent", label: "Agent", operation: tr("查看任务", "View task"), scope: outputScopes.get(str(input.mode)) };
+    case "task_send": return { kind: "agent", label: "Agent", operation: tr("发送消息", "Send message") };
     case "web_search": case "mcp_tinyfish_search":
-      return { kind: "web", label: "Web", operation: "网页搜索", group: "Web Search",
-        facts: batchText(input.query) ? [["查询", "1 条"]] : undefined };
+      return { kind: "web", label: "Web", operation: tr("网页搜索", "Search the web"), group: "Web Search",
+        facts: batchText(input.query) ? [[tr("查询", "Queries"), tr("1 条", "1")]] : undefined };
     case "webfetch": case "mcp_tinyfish_fetch_content": {
       const host = webHostname(input.url);
       const addresses = batchCount(input.urls, batchText);
       const single = addresses === 1 && Array.isArray(input.urls) ? webHostname(input.urls[0]) : undefined;
       const hostname = host ?? single;
-      return { kind: "web", label: "Web", operation: "读取网页", group: "Web Fetch", preview: hostname,
-        facts: [...(hostname ? [["主机", hostname]] as const : []),
-          ...(addresses === undefined ? [] : [["地址", `${addresses} 个`]] as const)] };
+      return { kind: "web", label: "Web", operation: tr("读取网页", "Read webpage"), group: "Web Fetch", preview: hostname,
+        facts: [...(hostname ? [[tr("主机", "Host"), hostname]] as const : []),
+          ...(addresses === undefined ? [] : [[tr("地址", "Addresses"), tr(`${addresses.toLocaleString(uiLocale)} 个`, addresses.toLocaleString(uiLocale))]] as const)] };
     }
     default: {
       const safe = /^[\p{L}\p{N}_.:-]{1,80}$/u.test(name) && /\p{L}/u.test(name) &&
         !name.split(/[.:]/u).some(part => secretPrefix.test(part) || /^(?:token|password|authorization|bearer|api[_-]?key)$/iu.test(part));
-      return { kind: "unknown", label: safe ? name : "工具调用" };
+      return { kind: "unknown", label: safe ? name : tr("工具调用", "Tool call") };
     }
   }
 }

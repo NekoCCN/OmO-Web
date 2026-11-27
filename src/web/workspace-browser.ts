@@ -2,6 +2,7 @@ import { RequestError } from "./api.ts";
 import type { Api } from "./api.ts";
 import { byId, button, el, notice, num, object, option, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { tr } from "./locale.ts";
 
 type Platform = "posix" | "win32";
 type Approval = { readonly token: string; readonly path: string; readonly expiresAt: number };
@@ -77,7 +78,7 @@ export function workspaceBrowser(
 
   function expire(): void {
     setApproval();
-    message("审批已过期。请重新选择「使用此目录」，发起新的审批。", true);
+    message(tr("审批已过期。请重新选择「使用此目录」，发起新的审批。", "Approval expired. Choose “Use this directory” to request approval again."), true);
     use.focus();
   }
 
@@ -142,7 +143,7 @@ export function workspaceBrowser(
     }
     resetListing(path);
     message();
-    status.textContent = "正在读取目录…";
+    status.textContent = tr("正在读取目录…", "Reading directory…");
     void request("browse", "browse", { path }, data => {
       const canonical = str(data.path);
       if (!canonical || !Array.isArray(data.entries)) throw new Error("Invalid browse response");
@@ -158,17 +159,18 @@ export function workspaceBrowser(
         const control = kind === "directory"
           ? button("", () => browse(destination), "button--quiet workspace-entry")
           : el("div", "workspace-entry");
-        control.append(el("bdi", "break", name), el("span", "small muted", kind === "directory" ? "目录 ›" : "文件"));
+        control.append(el("bdi", "break", name), el("span", "small muted", kind === "directory" ? tr("目录 ›", "Folder ›") : tr("文件", "File")));
         row.append(control);
         entries.append(row);
       }
       entries.hidden = !entries.childElementCount;
-      status.textContent = data.truncated === true ? "目录条目太多，仅显示部分名称。" : entries.hidden ? "没有可显示的条目。" : "";
+      status.textContent = data.truncated === true ? tr("目录条目太多，仅显示部分名称。", "This directory has too many entries to show them all.") : entries.hidden ? tr("没有可显示的条目。", "No entries to show.") : "";
       render();
     }, error => {
       status.textContent = "";
       roots.value = "";
-      message(isTimeout(error) ? "读取目录超时。请重新选择一个已授权工作区。" : "无法读取该目录。只能浏览已授权范围内仍可访问的目录。", true);
+      message(isTimeout(error) ? tr("读取目录超时。请重新选择一个已授权工作区。", "Reading the directory timed out. Choose an authorized directory and try again.")
+        : tr("无法读取该目录。只能浏览已授权范围内仍可访问的目录。", "Could not read this directory. You can only browse accessible directories within authorized locations."), true);
     });
   }
 
@@ -182,8 +184,8 @@ export function workspaceBrowser(
 
   function prepare(path: string): void {
     if (!path || approval || operation?.kind === "prepare") return;
-    if (operation?.kind === "browse") status.textContent = "目录读取已取消。";
-    message("正在核验目录…");
+    if (operation?.kind === "browse") status.textContent = tr("目录读取已取消。", "Directory read canceled.");
+    message(tr("正在核验目录…", "Verifying directory…"));
     void request("prepare", "prepare", { path }, data => {
       if (data.status === "authorized") { select(data); return; }
       const canonical = str(data.path);
@@ -196,7 +198,8 @@ export function workspaceBrowser(
       setApproval({ token, path: canonical, expiresAt });
       approvalTitle.focus();
     }, error => {
-      message(isTimeout(error) ? "核验目录超时。路径已保留，请重试。" : "无法核验目录。请检查绝对路径、目录是否仍存在及本机 Web 服务是否可用。", true);
+      message(isTimeout(error) ? tr("核验目录超时。路径已保留，请重试。", "Directory verification timed out. The path is still in the field. Try again.")
+        : tr("无法核验目录。请检查绝对路径、目录是否仍存在及本机 Web 服务是否可用。", "Could not verify the directory. Check the absolute path, whether the directory still exists, and whether the local Web server is running."), true);
     });
   }
 
@@ -205,22 +208,22 @@ export function workspaceBrowser(
     const { token, expiresAt } = approval;
     if (expiresAt <= Date.now()) { expire(); return; }
     clearTimeout(expiry);
-    message(allow ? "正在提交允许决定…" : "正在提交拒绝决定…");
+    message(allow ? tr("正在提交允许决定…", "Granting access…") : tr("正在提交拒绝决定…", "Denying access…"));
     void request("decision", "confirm", { confirmation: token, allow }, data => {
       if (allow) { select(data); return; }
       if (data.status !== "cancelled") throw new Error("Invalid denial receipt");
       setApproval();
       if (closeAfter) modal.close();
       else {
-        message("已拒绝。工作区未切换。");
+        message(tr("已拒绝。工作区未切换。", "Access denied. The selected directory did not change."));
         use.focus();
       }
     }, error => {
       setApproval();
       const stale = error instanceof RequestError && (error.code === "workspace_confirmation_stale" || error.status === 410);
       message(stale
-        ? "审批已失效：可能已过期或目录已变更。请重新核验路径。"
-        : "未能确认审批结果，未切换工作区。请重新核验路径。", true);
+        ? tr("审批已失效：可能已过期或目录已变更。请重新核验路径。", "Approval expired or the directory changed. Verify the path again.")
+        : tr("未能确认审批结果，未切换工作区。请重新核验路径。", "Could not confirm the approval result. The selected directory did not change. Verify the path again."), true);
       use.focus();
     });
   }
@@ -237,7 +240,7 @@ export function workspaceBrowser(
   function setRoots(): void {
     const { roots: paths } = scope();
     const selected = roots.value;
-    roots.replaceChildren(option("选择已授权工作区", ""), ...paths.map(path => option(path, path)));
+    roots.replaceChildren(option(tr("选择已授权工作区", "Choose an authorized directory"), ""), ...paths.map(path => option(path, path)));
     roots.value = paths.includes(selected) ? selected : "";
     rootField.hidden = !paths.length;
   }
@@ -252,7 +255,7 @@ export function workspaceBrowser(
     setRoots();
     roots.value = start;
     input.value = start;
-    status.textContent = start ? "" : "没有已授权目录。可手动输入目录的绝对路径。";
+    status.textContent = start ? "" : tr("没有已授权目录。可手动输入目录的绝对路径。", "No directories are authorized. Enter an absolute directory path.");
     resetListing();
     render();
     modal.showModal();
@@ -264,7 +267,7 @@ export function workspaceBrowser(
   });
   input.addEventListener("input", () => {
     if (operation?.kind === "browse" || operation?.kind === "prepare") {
-      if (operation.kind === "browse") status.textContent = "目录读取已取消。";
+      if (operation.kind === "browse") status.textContent = tr("目录读取已取消。", "Directory read canceled.");
       abort();
     }
     message();
@@ -307,7 +310,7 @@ export function workspaceBrowser(
         setApproval();
         resetListing();
         status.textContent = "";
-        message("本机 Web 服务连接已更新。请重新选择或核验目录。", true);
+        message(tr("本机 Web 服务连接已更新。请重新选择或核验目录。", "The local Web server connection changed. Choose a directory or verify the path again."), true);
         input.focus();
       }
     },

@@ -102,6 +102,7 @@
   inset-inline-end: var(--s3);
   inline-size: min(38%, calc(var(--s8) * 4));
   block-size: auto;
+  max-block-size: calc(100% - var(--s6));
   color: var(--accent);
   opacity: .19;
   stroke-width: 1.25;

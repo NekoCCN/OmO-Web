@@ -4,11 +4,12 @@ import { byId, errorText, list, notice, object, option, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { Transcript } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
+import { tr } from "./locale.ts";
 
 type Candidate = { readonly id: string; readonly name: string; readonly cwd: string };
 const box = (id: string) => byId(id, HTMLElement);
 const btn = (id: string) => byId(id, HTMLButtonElement);
-const hint = "仅普通文字。命令、权限审批及私密交互请回到 CLI 处理。";
+const hint = tr("仅普通文字。命令、权限审批及私密交互请回到 CLI 处理。", "Plain text only. Use the CLI for commands, permission approvals, and private interactions.");
 const missing = new Set(["terminal_not_attached", "terminal_not_found", "terminal_offline"]);
 
 export function cliLive(api: Api, onClose: () => void, openBranch: (source: BranchSource) => void, inWorkspace: (cwd: string) => boolean) {
@@ -61,17 +62,21 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
     input.readOnly = pending === "input";
     box("cli-live-conversation").hidden = !hasTranscript && !input.value;
     notice(box("cli-live-workspace"), row?.cwd);
-    notice(box("cli-live-status"), pending === "connect" ? "正在连接 CLI…"
-      : pending === "disconnect" ? "正在释放 Web 连接…"
-      : transport === "lost" ? "实时更新已离线，草稿会保留。连接恢复后只刷新消息，不会重发。"
-      : listing ? "正在查找本地 CLI 会话…"
-      : connected ? !fresh ? "正在同步 CLI 对话…" : state.compacting === true ? "CLI 正在压缩上下文。"
-        : state.running === true ? "已连接 · CLI 正在运行" : "已连接 · 等待输入"
-      : available === false ? "CLI 实时不可用：未启用或找不到本地终端控制服务。"
-      : !items.length ? "没有发现可连接的 CLI 会话。"
-      : transport === "waiting" ? "正在等待 Web 实时连接…"
-      : shown === row?.id ? "已断开；显示最后一次同步的消息。" : "选择会话后，点击「连接」读取对话。");
-    box("cli-live-hint").textContent = unknownDelivery ? `上一次发送的结果未知，请先核对 CLI，不要重发这条消息。${hint}` : hint;
+    notice(box("cli-live-status"), pending === "connect" ? tr("正在连接 CLI…", "Connecting to CLI…")
+      : pending === "disconnect" ? tr("正在释放 Web 连接…", "Disconnecting Web…")
+      : transport === "lost" ? tr("实时更新已离线，草稿会保留。连接恢复后只刷新消息，不会重发。",
+        "Live updates are offline. Your draft is kept. Reconnecting refreshes messages without resending them.")
+      : listing ? tr("正在查找本地 CLI 会话…", "Looking for local CLI sessions…")
+      : connected ? !fresh ? tr("正在同步 CLI 对话…", "Syncing the CLI conversation…")
+        : state.compacting === true ? tr("CLI 正在压缩上下文。", "CLI is compacting context.")
+        : state.running === true ? tr("已连接 · CLI 正在运行", "Connected · CLI is running") : tr("已连接 · 等待输入", "Connected · Waiting for input")
+      : available === false ? tr("CLI 实时不可用：未启用或找不到本地终端控制服务。", "Live CLI is unavailable. The local terminal service is disabled or could not be found.")
+      : !items.length ? tr("没有发现可连接的 CLI 会话。", "No CLI sessions are available to connect.")
+      : transport === "waiting" ? tr("正在等待 Web 实时连接…", "Waiting for the Web connection…")
+      : shown === row?.id ? tr("已断开；显示最后一次同步的消息。", "Disconnected. Showing the last synced messages.")
+        : tr("选择会话后，点击「连接」读取对话。", "Select a session and choose “Connect” to read the conversation."));
+    box("cli-live-hint").textContent = unknownDelivery ? tr(`上一次发送的结果未知，请先核对 CLI，不要重发这条消息。${hint}`,
+      `Delivery of your last message is unknown. Check the CLI before trying again. Do not resend this message. ${hint}`) : hint;
   }
 
   function clearSelection(): void {
@@ -91,7 +96,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
     // whose explicit connect request is already in flight.
     const keep = attached || (pending === "connect" ? previous : "");
     items = discovered.filter(row => row.id === keep || inWorkspace(row.cwd));
-    select.replaceChildren(option("选择可用会话", ""), ...items.map(row => option(row.name, row.id)));
+    select.replaceChildren(option(tr("选择可用会话", "Choose a session"), ""), ...items.map(row => option(row.name, row.id)));
     select.value = items.some(item => item.id === previous) ? previous : items.length === 1 ? items[0]?.id ?? "" : "";
     if (select.value !== previous) clearSelection();
   }
@@ -107,13 +112,13 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
       available = data.available === true;
       discovered = list(data.sessions).map(object).flatMap(row => {
         const id = str(row.id);
-        return id ? [{ id, name: str(row.name) || "未命名 CLI 会话", cwd: str(row.cwd) }] : [];
+        return id ? [{ id, name: str(row.name) || tr("未命名 CLI 会话", "Untitled CLI session"), cwd: str(row.cwd) }] : [];
       });
       scopeCandidates();
     } catch (error) {
       if (!request.signal.aborted && modal.open) {
         available = false;
-        notice(box("cli-live-error"), `无法发现 CLI 会话：${errorText(error)}`);
+        notice(box("cli-live-error"), tr(`无法发现 CLI 会话：${errorText(error)}`, `Could not find CLI sessions: ${errorText(error)}`));
       }
     } finally {
       if (listing === request) listing = undefined;
@@ -180,7 +185,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
         const alert = box("cli-live-error");
         if (alert.hidden || alert.dataset.read === "true") {
           alert.dataset.read = "true";
-          notice(alert, `无法同步 CLI 对话：${errorText(error)}`);
+          notice(alert, tr(`无法同步 CLI 对话：${errorText(error)}`, `Could not sync the CLI conversation: ${errorText(error)}`));
         }
       }
     } finally {
@@ -217,11 +222,11 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
           drafts.delete(id);
           uncertain.delete(id);
           input.value = "";
-          notice(box("cli-live-receipt"), result.disposition === "held" ? "CLI 已暂存消息；请在 CLI 查看，勿重发。"
-            : result.disposition === "queued" ? "CLI 已将消息加入队列。" : "CLI 已接收消息。");
+          notice(box("cli-live-receipt"), result.disposition === "held" ? tr("CLI 已暂存消息；请在 CLI 查看，勿重发。", "The CLI is holding the message. Check the CLI and do not resend it.")
+            : result.disposition === "queued" ? tr("CLI 已将消息加入队列。", "The CLI queued the message.") : tr("CLI 已接收消息。", "The CLI accepted the message."));
           break;
         case "stop":
-          notice(box("cli-live-receipt"), "当前回合已停止。");
+          notice(box("cli-live-receipt"), tr("当前回合已停止。", "The current turn stopped."));
           focus = input;
           break;
       }

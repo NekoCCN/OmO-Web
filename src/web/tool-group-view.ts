@@ -1,4 +1,5 @@
 import { el } from "./dom.ts";
+import { tr, uiLocale } from "./locale.ts";
 
 export class ToolGroupView {
   readonly node = el("details", "tool-group");
@@ -46,9 +47,11 @@ export class ToolGroupView {
       next.remove();
       next = remaining;
     }
-    const count = `${inspectOnly ? "探查工具" : "工具调用"} · ${members.length} 项成功`;
+    const kind = inspectOnly ? tr("探查工具", "File and tool lookups") : tr("工具调用", "Tool calls");
+    const amount = members.length.toLocaleString(uiLocale);
+    const count = tr(`${kind} · ${amount} 项成功`, `${kind} · ${amount} succeeded`);
     if (this.count.textContent !== count) this.count.textContent = count;
-    const labels = [...totals].map(([name, total]) => `${name} ×${total}`);
+    const labels = [...totals].map(([name, total]) => `${name} ×${total.toLocaleString(uiLocale)}`);
     if (this.kinds.textContent !== labels.join(" ")) {
       this.kinds.replaceChildren(...labels.flatMap((value, index) => [
         ...(index ? [" "] : []), el("span", "tool-group-kind", value),

@@ -1,5 +1,6 @@
 import { el, list, object } from "./dom.ts";
-import { textLines } from "./tool-semantics.ts";
+import { tr, uiLocale } from "./locale.ts";
+import { textLines, toolLineCount } from "./tool-semantics.ts";
 import type { ToolFact, ToolRecap } from "./tool-semantics.ts";
 
 type ToolCard = {
@@ -13,19 +14,27 @@ const cardLimit = 4;
 function rowCard(heading: string, rows: readonly string[], total = rows.length, note?: string): ToolCard {
   const items = rows.slice(0, cardLimit);
   const remaining = total - items.length;
-  return { heading, rows: items, note: [note, remaining > 0 && `其余 ${remaining} 项见详情`].filter(Boolean).join(" · ") };
+  const count = remaining.toLocaleString(uiLocale);
+  return { heading, rows: items, note: [note, remaining > 0 && tr(`其余 ${count} 项见详情`, `${count} more in details`)].filter(Boolean).join(" · ") };
 }
 
 function lineFact(label: string, value: string | undefined): readonly ToolFact[] {
   if (!value) return [];
   const count = textLines(value);
-  return [[label, count === undefined ? "已附" : `${count} 行`]];
+  return [[label, count === undefined ? tr("已附", "Included") : toolLineCount(count)]];
+}
+
+function textLineCount(lines: number): string {
+  const count = lines.toLocaleString(uiLocale);
+  return tr(`${count} 行文本`, `${count} ${lines === 1 ? "line" : "lines"} of text`);
 }
 
 function outputFacts(output: unknown): readonly ToolFact[] {
+  const label = tr("可见输出", "Visible output");
+  const received = tr("已收到文本", "Text received");
   if (typeof output === "string") {
     const lines = textLines(output);
-    return output.length ? [["可见输出", lines === undefined ? "已收到文本" : `${lines} 行文本`]] : [];
+    return output.length ? [[label, lines === undefined ? received : textLineCount(lines)]] : [];
   }
   let lines = 0;
   let images = 0;
@@ -33,12 +42,13 @@ function outputFacts(output: unknown): readonly ToolFact[] {
     const part = object(entry);
     if (part.type === "text" && typeof part.text === "string") {
       const count = textLines(part.text);
-      if (count === undefined) return [["可见输出", "已收到文本"]];
+      if (count === undefined) return [[label, received]];
       lines += count;
     } else if (part.type === "image" || part.type === "image_placeholder" || part.type === "imagePlaceholder") images++;
   }
-  const summary = [lines && `${lines} 行文本`, images && `${images} 项图片`].filter(Boolean).join(" · ");
-  return summary ? [["可见输出", summary]] : [];
+  const count = images.toLocaleString(uiLocale);
+  const summary = [lines && textLineCount(lines), images && tr(`${count} 项图片`, `${count} ${images === 1 ? "image" : "images"}`)].filter(Boolean).join(" · ");
+  return summary ? [[label, summary]] : [];
 }
 
 function factCard(heading: string, facts: readonly ToolFact[], note?: string): ToolCard | undefined {
@@ -56,31 +66,31 @@ export function projectToolCard(recap: ToolRecap, output: unknown): ToolCard | u
   switch (recap.kind) {
     case "todo": {
       const card = recap.todo?.card;
-      if (card) return rowCard(recap.todo?.requested ? "请求的变更" : "提交的待办", card.titles, card.total, "非当前进度");
+      if (card) return rowCard(card.heading, card.titles, card.total);
       return;
     }
     case "agent": {
       const routes = recap.dispatchRoutes ?? recap.agentRouting;
       if (routes?.length) {
         const prompts = recap.agentPrompts;
-        return { ...rowCard("派发配置", routes),
+        return { ...rowCard(tr("派发配置", "Dispatch settings"), routes),
           prompts: prompts && { previews: prompts.slice(0, 2).map(promptPreview), count: prompts.length } };
       }
-      if (recap.scope) return factCard("任务读取", [["范围", recap.scope]]);
+      if (recap.scope) return factCard(tr("任务读取", "Task lookup"), [[tr("范围", "Scope"), recap.scope]]);
       return;
     }
     case "terminal":
-      return factCard("终端记录", [...lineFact("命令", recap.command), ...outputFacts(output)]);
+      return factCard(tr("终端记录", "Terminal log"), [...lineFact(tr("命令", "Command"), recap.command), ...outputFacts(output)]);
     case "execution":
     case "context":
-      return factCard(recap.kind === "execution" ? "脚本记录" : "上下文请求",
-        [...facts, ...lineFact("源码", recap.source), ...outputFacts(output)]);
+      return factCard(recap.kind === "execution" ? tr("脚本记录", "Script run") : tr("上下文请求", "Context request"),
+        [...facts, ...lineFact(tr("源码", "Source code"), recap.source), ...outputFacts(output)]);
     case "modify":
-      return factCard("提交内容", facts);
+      return factCard(tr("提交内容", "Submitted changes"), facts);
     case "memory":
-      return factCard("记忆变更", facts, "路径与内容按需查看");
+      return factCard(tr("记忆变更", "Memory changes"), facts, tr("路径与内容按需查看", "Open details to inspect paths and content"));
     case "web":
-      return factCard("网页请求", [...facts, ...outputFacts(output)]);
+      return factCard(tr("网页请求", "Web request"), [...facts, ...outputFacts(output)]);
     case "inspect":
     case "unknown":
       return;
@@ -97,8 +107,10 @@ export function toolCardRows(items: readonly string[]): HTMLUListElement {
   return list;
 }
 
-export const agentPromptLabel = (index: number, total: number): string =>
-  total > 1 ? `任务 ${index + 1} · 提示词` : "提示词";
+export function agentPromptLabel(index: number, total: number): string {
+  const position = (index + 1).toLocaleString(uiLocale);
+  return total > 1 ? tr(`任务 ${position} · 提示词`, `Task ${position} prompt`) : tr("提示词", "Prompt");
+}
 
 export function renderToolCard(card: ToolCard): HTMLElement {
   const node = el("div", "tool-card-content");
@@ -121,7 +133,11 @@ export function renderToolCard(card: ToolCard): HTMLElement {
       item.append(el("p", "tool-card-note", agentPromptLabel(index, count)), el("p", "tool-card-prompt", prompt));
       section.append(item);
     });
-    if (count > previews.length) section.append(el("p", "tool-card-note", `其余 ${count - previews.length} 条提示词见详情`));
+    if (count > previews.length) {
+      const remaining = count - previews.length;
+      const amount = remaining.toLocaleString(uiLocale);
+      section.append(el("p", "tool-card-note", tr(`其余 ${amount} 条提示词见详情`, `${amount} more ${remaining === 1 ? "prompt" : "prompts"} in details`)));
+    }
     node.append(section);
   }
   if (card.note) node.append(el("p", "tool-card-note", card.note));

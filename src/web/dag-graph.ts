@@ -1,6 +1,7 @@
 import { el, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { knownActivityState } from "./native-activity.ts";
+import { tr } from "./locale.ts";
 
 // Match the server projection's node limit; at most N * (N - 1) / 2 edges
 // survive the strictly earlier-wave and unique-upstream checks.
@@ -62,13 +63,13 @@ export function renderDagGraph(data: Wire): HTMLElement | undefined {
   const map = el("div", "dag-graph-map");
   map.tabIndex = 0;
   map.setAttribute("role", "region");
-  map.setAttribute("aria-label", "有向依赖图；可滚动，完整依赖见下方文字列表");
+  map.setAttribute("aria-label", tr("有向依赖图；可滚动，完整依赖见下方文字列表", "Scrollable directed dependency graph. See the text list below for all dependencies."));
   const canvas = el("div", "dag-graph-canvas");
   const scale = (value: number) => `${value / 16}rem`;
 
   for (const [wave, row] of waves.entries()) {
     const y = inset + wave * waveHeight;
-    const label = el("div", "dag-graph-wave", `第 ${wave + 1} 波`);
+    const label = el("div", "dag-graph-wave", tr(`第 ${wave + 1} 波`, `Wave ${wave + 1}`));
     label.style.top = scale(y);
     canvas.append(label);
     for (const [column, node] of row.entries()) {
@@ -82,7 +83,8 @@ export function renderDagGraph(data: Wire): HTMLElement | undefined {
       card.style.top = scale(y + headingHeight);
       card.style.width = scale(cardWidth);
       card.style.height = scale(cardHeight);
-      card.append(el("strong", "", `节点 ${node.id + 1}`), el("span", "", label ?? "状态未知"));
+      card.append(el("strong", "", tr(`节点 ${node.id + 1}`, `Node ${node.id + 1}`)),
+        el("span", "", node.state === "blocked" ? tr("被依赖阻塞", "Blocked") : label ?? tr("状态未知", "Unknown")));
       canvas.append(card);
     }
   }

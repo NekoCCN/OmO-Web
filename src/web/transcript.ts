@@ -1,5 +1,6 @@
 import { button, codeBlock, el, fold, isImageType, list, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { tr, uiLocale } from "./locale.ts";
 import { groupToolCalls, ToolDisplay, visibleToolTarget } from "./tool-display.ts";
 import type { ToolTrace } from "./tool-display.ts";
 export type { ToolTrace } from "./tool-display.ts";
@@ -110,22 +111,24 @@ function renderPart(part: Wire, kind: "markdown" | "plain" | "tool", previous?: 
         text.textContent = thinking;
         return previous;
       }
-      return fold("思考过程", el("p", "plain muted", thinking));
+      return fold(tr("思考过程", "Thinking"), el("p", "plain muted", thinking));
     }
     case "image": {
       const data = str(part.data);
-      if (!isImageType(part.mimeType) || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return el("p", "small muted", "图片内容不可用");
+      if (!isImageType(part.mimeType) || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return el("p", "small muted", tr("图片内容不可用", "Image unavailable"));
       const img = el("img");
-      img.alt = kind === "tool" ? "工具输出图片" : "消息图片";
+      img.alt = kind === "tool" ? tr("工具输出图片", "Tool output image") : tr("消息图片", "Image attached to message");
       img.loading = "lazy";
       img.src = `data:${part.mimeType};base64,${data}`;
       return img;
     }
     case "image_placeholder":
     case "imagePlaceholder":
-      return el("p", "small muted", "此图片未包含在会话快照中");
-    default:
-      return Object.keys(part).length ? el("p", "small muted", `未展开的内容 · ${str(part.type) || "未知类型"}`) : undefined;
+      return el("p", "small muted", tr("此图片未包含在会话快照中", "This image is not included in the session snapshot."));
+    default: {
+      const type = str(part.type) || tr("未知类型", "Unknown type");
+      return Object.keys(part).length ? el("p", "small muted", tr(`未展开的内容 · ${type}`, `Content not displayed · ${type}`)) : undefined;
+    }
   }
 }
 
@@ -143,9 +146,9 @@ function timeLabel(timestamp: unknown): HTMLElement | undefined {
   if (value === undefined) return;
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return;
-  const node = el("time", "numerical", date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }));
+  const node = el("time", "numerical", date.toLocaleTimeString(uiLocale, { hour: "2-digit", minute: "2-digit" }));
   node.dateTime = date.toISOString();
-  node.title = date.toLocaleString("zh-CN");
+  node.title = date.toLocaleString(uiLocale);
   return node;
 }
 
@@ -162,7 +165,8 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
   const conversational = role === "user" || role === "assistant";
   const node = before?.node ?? el("article", conversational ? `message message--${role}` : "message");
   const speaker = before?.speaker ?? el("span", "speaker");
-  const label = role === "assistant" ? live ? "助手 · 正在生成" : "助手" : role === "user" ? "你" : role === "bashExecution" ? "命令输出" : "会话记录";
+  const label = role === "assistant" ? live ? tr("助手 · 正在生成", "Assistant · Writing") : tr("助手", "Assistant")
+    : role === "user" ? tr("你", "You") : role === "bashExecution" ? tr("命令输出", "Command output") : tr("会话记录", "Session record");
   if (speaker.textContent !== label) speaker.textContent = label;
   const body = before?.body ?? el("div", "message-body");
   const time = before?.timestamp === message.timestamp ? before?.time : timeLabel(message.timestamp);
@@ -182,6 +186,7 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
         : "M12 2 22 12 12 22 2 12 12 2Zm0 3-7 7 7 7 7-7-7-7Zm0 4 3 3-3 3-3-3 3-3Z");
       icon.append(path);
       const identity = el("span", "message-identity");
+      speaker.style.overflowWrap = "normal";
       identity.append(icon, speaker);
       header.append(identity);
     } else header.append(speaker);
@@ -210,9 +215,9 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
   const metadata = JSON.stringify([output, error, stop]);
   const notices = before?.metadata === metadata ? before.notices : [
     ...(output ? [codeBlock(output)] : []),
-    ...(error || stop === "error" ? [el("p", "notice error small", error || "生成失败")] : []),
-    ...(stop === "aborted" ? [el("p", "muted small", "已停止生成")] : []),
-    ...(stop === "length" ? [el("p", "muted small", "已达到输出长度限制")] : []),
+    ...(error || stop === "error" ? [el("p", "notice error small", error || tr("生成失败", "Could not generate a response."))] : []),
+    ...(stop === "aborted" ? [el("p", "muted small", tr("已停止生成", "Response stopped."))] : []),
+    ...(stop === "length" ? [el("p", "muted small", tr("已达到输出长度限制", "Response reached the length limit."))] : []),
   ];
   const toolOnly = role === "assistant" && !notices.length && rendered.some(({ part }) => part.type === "toolCall")
     && rendered.every(({ part, node }) => part.type === "toolCall" || !node || (part.type === "text" && !str(part.text).trim()));
@@ -248,7 +253,7 @@ export class Transcript {
   private readonly toolViews = new Map<string, ToolDisplay>();
   private readonly openTools = new Set<string>();
   private readonly results = new Map<string, number>();
-  private readonly older = button("加载更早消息", () => this.flush(true), "transcript-load");
+  private readonly older = button(tr("加载更早消息", "Load older messages"), () => this.flush(true), "transcript-load");
   private readonly status = el("span", "sr-only");
   private latest?: RenderInput;
   private frame?: number;
@@ -402,7 +407,8 @@ export class Transcript {
     };
     if (this.older.parentNode !== this.root) this.root.prepend(this.status, this.older);
     this.older.hidden = !this.start;
-    const label = `加载更早消息（${this.start} 条）`;
+    const olderCount = this.start.toLocaleString(uiLocale);
+    const label = tr(`加载更早消息（${olderCount} 条）`, `Load older messages (${olderCount})`);
     if (this.older.textContent !== label) this.older.textContent = label;
     const renderCall = (key: string, part: Wire): HTMLElement | undefined => {
       const id = str(part.id);
@@ -461,7 +467,10 @@ export class Transcript {
     const tool = latestTool?.closest(".tool-group") ?? latestTool;
     this.trace?.({ user: latestUser, assistant: latestAssistant, tool: tool?.querySelector("summary") ?? undefined });
     if (expand) {
-      if (loaded) this.status.textContent = `已加载 ${loaded} 条更早消息。`;
+      if (loaded) {
+        const count = loaded.toLocaleString(uiLocale);
+        this.status.textContent = tr(`已加载 ${count} 条更早消息。`, `Loaded ${count} older ${loaded === 1 ? "message" : "messages"}.`);
+      }
       const anchor = readingAnchor && this.root.contains(readingAnchor)
         ? visibleToolTarget(readingAnchor) : visibleToolTarget(toolBoundary);
       if (anchor && this.root.contains(anchor) && previousTop !== undefined) {

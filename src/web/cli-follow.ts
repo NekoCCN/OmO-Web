@@ -3,6 +3,7 @@ import { byId, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { messageKey, Transcript } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
+import { tr } from "./locale.ts";
 
 type Target = { readonly id: string; readonly name: string; readonly cwd: string; readonly running: boolean };
 type Snapshot = { readonly status: "ok"; readonly target: Target; readonly messages: readonly Wire[] }
@@ -10,10 +11,10 @@ type Snapshot = { readonly status: "ok"; readonly target: Target; readonly messa
 const pollInterval = 2_000;
 const readTimeout = 8_000;
 const labels = {
-  pending: "正在查找 CLI 会话…",
-  none: "未发现可跟随的 CLI 会话。",
-  ambiguous: "有多个 CLI 会话，无法确认跟随哪一个。",
-  unavailable: "无法核验 CLI 会话，暂不显示对话。",
+  pending: tr("正在查找 CLI 会话…", "Looking for a CLI session…"),
+  none: tr("未发现可跟随的 CLI 会话。", "No CLI session to follow."),
+  ambiguous: tr("有多个 CLI 会话，无法确认跟随哪一个。", "Multiple CLI sessions were found. Could not determine which one to follow."),
+  unavailable: tr("无法核验 CLI 会话，暂不显示对话。", "Could not verify the CLI session. The conversation is hidden."),
 } as const;
 
 function parseSnapshot(data: Wire, authorized: (cwd: string) => boolean): Snapshot {
@@ -36,7 +37,7 @@ function parseSnapshot(data: Wire, authorized: (cwd: string) => boolean): Snapsh
         // Pass only the projected text fields to Transcript, never raw UI events.
         messages.push({ role, content, timestamp: num(timestamp), streaming: role === "assistant" && streaming === true });
       }
-      return { status: "ok", target: { id, name: name || "未命名 CLI 会话", cwd, running: session.running }, messages };
+      return { status: "ok", target: { id, name: name || tr("未命名 CLI 会话", "Untitled CLI session"), cwd, running: session.running }, messages };
     }
     default: return { status: "unavailable" };
   }
@@ -63,7 +64,8 @@ export function cliFollow(api: Api, authorized: (cwd: string) => boolean, onChan
   }
 
   function setStatus(state: keyof typeof labels | "ok", running = false): void {
-    const text = state === "ok" ? `只读跟随 · ${running ? "CLI 正在运行" : "CLI 未在运行"}` : labels[state];
+    const text = state === "ok" ? tr(`只读跟随 · ${running ? "CLI 正在运行" : "CLI 未在运行"}`,
+      `Following · Read-only · ${running ? "CLI is running" : "CLI is idle"}`) : labels[state];
     if (status.dataset.state !== state) status.dataset.state = state;
     if (status.textContent !== text) status.textContent = text;
   }

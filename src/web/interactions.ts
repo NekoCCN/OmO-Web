@@ -1,5 +1,6 @@
-import { button, el, errorText, field, list, notice, num, object, option, str } from "./dom.ts";
+import { button, el, field, list, notice, num, object, option, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { tr, uiLocale } from "./locale.ts";
 
 type QuestionAnswer = { readonly selected: readonly string[]; readonly text?: string };
 export type Answer = { readonly value: string } | { readonly confirmed: boolean } | { readonly cancelled: true } |
@@ -16,7 +17,8 @@ function questionFields(body: HTMLElement, request: Wire): () => Answer | undefi
     const id = str(question.id);
     if (!id) continue;
     const block = el("fieldset", "stack stack--tight");
-    block.append(el("legend", "", str(question.header) || `问题 ${index + 1}`));
+    const position = (index + 1).toLocaleString(uiLocale);
+    block.append(el("legend", "", str(question.header) || tr(`问题 ${position}`, `Question ${position}`)));
     if (str(question.question)) block.append(el("p", "plain", str(question.question)));
     const controls: HTMLInputElement[] = [];
     for (const value of list(question.options)) {
@@ -38,7 +40,7 @@ function questionFields(body: HTMLElement, request: Wire): () => Answer | undefi
     custom.type = "text";
     custom.maxLength = 12000;
     custom.autocomplete = "off";
-    block.append(field("自填回答（选填）", custom));
+    block.append(field(tr("自填回答（选填）", "Your own answer (optional)"), custom));
     body.append(block);
     inputs.push(() => {
       const selected = controls.filter(node => node.checked).map(node => node.value);
@@ -49,8 +51,8 @@ function questionFields(body: HTMLElement, request: Wire): () => Answer | undefi
   const comment = el("textarea");
   comment.rows = 2;
   comment.maxLength = 12000;
-  body.append(field("补充说明（选填）", comment));
-  body.append(el("p", "small muted", "可以只回答部分问题，或仅提交补充说明；至少填写一项。"));
+  body.append(field(tr("补充说明（选填）", "Comment (optional)"), comment));
+  body.append(el("p", "small muted", tr("至少回答一题或填写补充说明。", "Answer at least one question or leave a comment.")));
   return () => {
     const pairs = inputs.flatMap(read => {
       const answer = read();
@@ -65,23 +67,32 @@ function updateQuestionMetadata(node: HTMLFormElement, request: Wire): void {
   const metadata = node.querySelector<HTMLElement>("[data-question-metadata]");
   if (!metadata) return;
   const parts: string[] = [];
-  if (request.waitForAnswer === true) parts.push("等待回答");
-  else if (request.waitForAnswer === false) parts.push("异步提问");
-  if (str(request.raisedBy)) parts.push(`提问人：${str(request.raisedBy)}`);
+  if (request.waitForAnswer === true) parts.push(tr("等待回答", "Waiting for your answer"));
+  else if (request.waitForAnswer === false) parts.push(tr("异步提问", "Not waiting for an answer"));
+  const raisedBy = str(request.raisedBy);
+  if (raisedBy) parts.push(tr(`提问人：${raisedBy}`, `Asked by: ${raisedBy}`));
   const remaining = num(request.remainingMs);
-  if (remaining !== undefined) parts.push(`更新时剩余 ${Math.ceil(Math.max(0, remaining) / 1000)} 秒`);
+  if (remaining !== undefined) {
+    const seconds = Math.ceil(Math.max(0, remaining) / 1000);
+    const amount = seconds.toLocaleString(uiLocale);
+    parts.push(tr(`更新时剩余 ${amount} 秒`, `${amount} ${seconds === 1 ? "second" : "seconds"} left at last update`));
+  }
   const deadline = num(request.deadlineAtMs);
   if (deadline !== undefined) {
     const date = new Date(deadline);
-    if (!Number.isNaN(date.getTime())) parts.push(`截止：${date.toLocaleString()}`);
+    if (!Number.isNaN(date.getTime())) {
+      const time = date.toLocaleString(uiLocale);
+      parts.push(tr(`截止：${time}`, `Deadline: ${time}`));
+    }
   }
   metadata.textContent = parts.join(" · ");
   metadata.hidden = parts.length === 0;
 }
 
 const permissionOptions: Readonly<Record<string, string>> = {
-  Allow: "允许", "Allow once": "仅允许这次", "Allow always": "始终允许", "Allow for session": "本会话始终允许",
-  Deny: "拒绝", Block: "阻止", "Deny with feedback": "拒绝并说明原因",
+  Allow: tr("允许", "Allow"), "Allow once": tr("仅允许这次", "Allow once"),
+  "Allow always": tr("始终允许", "Always allow"), "Allow for session": tr("本会话始终允许", "Allow for this session"),
+  Deny: tr("拒绝", "Deny"), Block: tr("阻止", "Block"), "Deny with feedback": tr("拒绝并说明原因", "Deny with feedback"),
 };
 
 function requestForm(request: Wire, submit: Submit): HTMLFormElement {
@@ -89,10 +100,11 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   const title = str(request.title);
   const permission = Boolean(request.toolCallId) && method !== "question";
   const node = el("form", "request-form");
-  const label = method === "question" ? "待回答问题" : permission ? "工具批准" : "等待你的决定";
+  const label = method === "question" ? tr("待回答问题", "Pending question")
+    : permission ? tr("工具批准", "Tool approval") : tr("等待你的决定", "Your response is needed");
   node.setAttribute("aria-label", label);
   node.dataset.method = method;
-  const heading = el(title ? "p" : "h2", "request-kind", method === "question" ? "Agent 提问" : label);
+  const heading = el(title ? "p" : "h2", "request-kind", method === "question" ? tr("Agent 提问", "Agent question") : label);
   const copy = el("div", "request-copy");
   if (title) copy.append(el("h2", "plain request-title", title));
   if (str(request.message)) copy.append(el("p", "plain", str(request.message)));
@@ -103,8 +115,11 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   }
   const remote = object(request.remoteOrigin);
   const origin = str(remote.deviceName) || str(remote.deviceId);
-  if (origin) copy.append(el("p", "small muted break", `请求设备：${origin}`));
-  if (permission) copy.append(el("p", "small muted path", `工具调用：${str(request.toolCallId)}`));
+  if (origin) copy.append(el("p", "small muted break", tr(`请求设备：${origin}`, `Requesting device: ${origin}`)));
+  if (permission) {
+    const toolCall = str(request.toolCallId);
+    copy.append(el("p", "small muted path", tr(`工具调用：${toolCall}`, `Tool call: ${toolCall}`)));
+  }
 
   const fields = el("div", "stack stack--tight request-fields");
   const status = el("p", "notice error small");
@@ -121,7 +136,8 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
     try {
       await submit(requestId(request), answer);
     } catch (error) {
-      notice(status, `未能提交：${errorText(error)}`);
+      const reason = error instanceof Error ? error.message : tr("发生未知错误", "Unknown error");
+      notice(status, tr(`未能提交：${reason}`, `Could not submit: ${reason}`));
     } finally {
       sending = false;
       node.removeAttribute("aria-busy");
@@ -133,25 +149,26 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
   switch (method) {
     case "question": read = questionFields(fields, request); break;
     case "confirm":
-      actions.append(button("不批准", () => void send({ confirmed: false })), button("确认", () => void send({ confirmed: true })));
+      actions.append(button(tr("不批准", permission ? "Deny" : "No"), () => void send({ confirmed: false })),
+        button(tr("确认", "Confirm"), () => void send({ confirmed: true })));
       break;
     case "select": {
       const select = el("select");
-      const placeholder = option("请选择，不会自动批准", "");
+      const placeholder = option(tr("请选择，不会自动批准", "Choose an option. Nothing is approved automatically."), "");
       placeholder.disabled = true;
       select.append(placeholder);
       for (const item of list(request.options)) {
         if (typeof item === "string" && item) select.append(option(Object.hasOwn(permissionOptions, item) ? permissionOptions[item] ?? item : item, item));
       }
       select.value = "";
-      fields.append(field("可选操作", select));
+      fields.append(field(tr("可选操作", "Options"), select));
       read = () => select.value ? { value: select.value } : undefined;
       break;
     }
     case "input":
     case "editor": {
       if (isSecret) {
-        fields.append(el("p", "muted", "此输入需要在原生客户端中处理。"));
+        fields.append(el("p", "muted", tr("此输入需要在原生客户端中处理。", "Respond in the native client.")));
         break;
       }
       const control = method === "editor" ? el("textarea") : el("input");
@@ -160,14 +177,14 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
         control.value = str(request.prefill);
       } else control.autocomplete = "off";
       control.placeholder = str(request.placeholder);
-      fields.append(field("输入内容", control));
+      fields.append(field(tr("输入内容", "Response"), control));
       read = () => ({ value: control.value });
       break;
     }
   }
-  if (!isSecret) actions.append(button("取消请求", () => void send({ cancelled: true }), "button--quiet"));
+  if (!isSecret) actions.append(button(tr("取消请求", "Cancel request"), () => void send({ cancelled: true }), "button--quiet"));
   if (read) {
-    const submitButton = el("button", "button", "提交回答");
+    const submitButton = el("button", "button", tr("提交回答", "Submit response"));
     submitButton.type = "submit";
     actions.append(submitButton);
   }
@@ -176,7 +193,7 @@ function requestForm(request: Wire, submit: Submit): HTMLFormElement {
     if (!read) return;
     const answer = read();
     if (answer) void send(answer);
-    else notice(status, "请至少填写一项回答或选择一个操作。");
+    else notice(status, tr("请至少填写一项回答或选择一个操作。", "Enter a response or choose an option."));
   });
   const controls = el("div", method === "select" ? "request-controls request-controls--choice" : "request-controls");
   controls.append(fields, actions);

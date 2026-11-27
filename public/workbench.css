@@ -11,12 +11,16 @@
 .workspace-tools:has(#workspace-browser-button:not([hidden])) { grid-template-columns: minmax(0, 1fr) auto; }
 .workspace-tools:has(#workspace-field:not([hidden])) > #new-sidebar { grid-column: 1 / -1; }
 #new-sidebar { justify-content: flex-start; color: var(--accent); }
-#workspace-browser-button { padding-inline: var(--s2); font-size: var(--small); white-space: nowrap; }
+#workspace-browser-button { gap: var(--s1); padding-inline: var(--s1); font-size: var(--small); white-space: nowrap; }
+#workspace-browser-button .icon { inline-size: var(--s3); block-size: var(--s3); }
 #workspace-select { inline-size: 100%; font-size: var(--small); text-overflow: ellipsis; }
+.sidebar-preferences { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s2); }
+.sidebar-preferences select { inline-size: 100%; padding-inline: var(--s2); font-size: var(--small); }
 .workspace-path-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--s2); align-items: end; }
 .workspace-path-form > p { grid-column: 1 / -1; }
 .workspace-path-form input, #workspace-browser-root { inline-size: 100%; min-inline-size: 0; }
 #workspace-browser-root { font-size: var(--small); text-overflow: ellipsis; }
+#new-cwd, #cli-live-session { inline-size: 100%; min-inline-size: 0; text-overflow: ellipsis; }
 .workspace-full-path { white-space: pre-wrap; word-break: keep-all; overflow-wrap: anywhere; unicode-bidi: isolate; }
 .workspace-approval h3:focus { outline: var(--focus) solid var(--accent); outline-offset: var(--s1); }
 .workspace-entries {
@@ -49,7 +53,7 @@ button.workspace-entry { color: var(--accent); }
 }
 .workspace-approval > .workspace-full-path { color: var(--ink); }
 .cli-launchers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s1); }
-.cli-launchers .button { gap: var(--s1); padding-inline: var(--s1); font-size: var(--caption); white-space: nowrap; }
+.cli-launchers .button { gap: var(--s1); padding-inline: var(--s1); font-size: var(--caption); line-height: 1.25; text-wrap: balance; }
 .cli-launchers .icon { inline-size: var(--s3); block-size: var(--s3); }
 #cli-follow-button[aria-pressed="true"] { background: var(--accent-tint); color: var(--accent); }
 .workspace-actions #cli-follow-stop { inline-size: auto; padding-inline: var(--s2); white-space: nowrap; }
@@ -205,16 +209,20 @@ button.workspace-entry { color: var(--accent); }
   background: var(--inset);
 }
 .runtime-index {
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  display: flex;
+  flex-wrap: wrap;
   padding: 0 var(--s3) var(--s2);
   gap: var(--s1);
   border-block-end: var(--stroke) solid var(--line);
 }
-.runtime-index .button { gap: var(--s1); padding-inline: 0; white-space: nowrap; font-size: var(--small); }
+.runtime-index .button { flex: 1 1 0; min-inline-size: max-content; gap: var(--s1); padding-inline: var(--s1); white-space: nowrap; font-size: var(--small); }
 .runtime-index .icon { inline-size: var(--s3); block-size: var(--s3); }
-#details-dialog:modal :is(.details-toolbar, .runtime-index) .button {
+#details-dialog:modal .details-toolbar .button {
   min-inline-size: var(--touch);
+  min-block-size: var(--touch);
+}
+#details-dialog:modal .runtime-index .button {
+  flex-basis: var(--touch);
   min-block-size: var(--touch);
 }
 .details-toolbar .button[aria-disabled="true"] { cursor: wait; }
@@ -704,12 +712,12 @@ button.workspace-entry { color: var(--accent); }
     transform: rotate(45deg);
     pointer-events: none;
   }
-  .compose-submit:has(#stop:not([hidden]) ~ .button:not([hidden])) .button {
+  :is(.compose-submit:has(#stop:not([hidden]) ~ .button:not([hidden])) .button, #send-command) {
     inline-size: var(--control);
     padding-inline: 0;
   }
-  .compose-submit:has(#stop:not([hidden]) ~ .button:not([hidden])) svg { display: block; }
-  .compose-submit:has(#stop:not([hidden]) ~ .button:not([hidden])) .button > span {
+  :is(.compose-submit:has(#stop:not([hidden]) ~ .button:not([hidden])) .button, #send-command) > svg { display: block; }
+  :is(.compose-submit:has(#stop:not([hidden]) ~ .button:not([hidden])) .button, #send-command) > span {
     position: absolute;
     inline-size: var(--stroke);
     block-size: var(--stroke);
@@ -754,7 +762,11 @@ button.workspace-entry { color: var(--accent); }
 }
 
 @media (max-width: 360px) {
+  .workspace-tools { column-gap: var(--s2); }
+  #workspace-browser-button { font-size: var(--caption); }
+  #workspace-select { padding-inline: var(--s1); }
   .workspace-path-form { grid-template-columns: minmax(0, 1fr); }
+  #command-shortcuts .details-list { grid-template-columns: fit-content(36%) minmax(0, 1fr); }
   .trace-inner:has(.trace-node:nth-child(4 of .trace-node:not([hidden]))) {
     grid-template-columns: minmax(0, 1fr);
     gap: 0;

@@ -30,7 +30,7 @@ async function waitFor(browser: Bun.WebView, expression: string): Promise<void> 
   })`);
 }
 
-async function withWorkbench(width: number, messages: readonly Wire[], run: (browser: Bun.WebView, emit: (event: Wire) => void) => Promise<void>) {
+async function withWorkbench(width: number, messages: readonly Wire[], run: (browser: Bun.WebView, emit: (event: Wire) => void) => Promise<void>, locale?: "en") {
   const bundle = await Bun.build({ entrypoints: ["src/web/app.ts"], target: "browser" });
   const script = bundle.outputs[0];
   if (!bundle.success || !script) throw new Error("Could not bundle the workbench browser fixture");
@@ -40,7 +40,8 @@ async function withWorkbench(width: number, messages: readonly Wire[], run: (bro
     routes: {
       "/": async () => {
         const html = await Bun.file("public/index.html").text();
-        return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+        const page = locale ? html.replace("<head>", `<head><script>localStorage.setItem("omo-web-language", ${JSON.stringify(locale)})</script>`) : html;
+        return new Response(page, { headers: { "Content-Type": "text/html; charset=utf-8" } });
       },
       "/icons.svg": () => new Response(Bun.file("public/icons.svg")),
       "/styles.css": () => new Response(Bun.file("public/styles.css")),
@@ -703,12 +704,50 @@ browserTest("Todo recap projects one recognizable title, never a private payload
     const summaries = await browser.evaluate<string[]>(`Array.from(document.querySelectorAll(".tool-summary"), row => row.innerText)`);
     expect(summaries).toEqual(cases.map(([, recap]) => expect.stringMatching(recap)));
     expect(summaries.join(" ")).not.toMatch(/未公开阶段|记录验收结果|整理截图|记录宽屏结果|切换阶段|回执中的文字/);
-    const requested = await browser.evaluate(`Array.from(document.querySelectorAll(".tool-details")).slice(${batches.length}).map(row => {
+    const requested = await browser.evaluate<{ text: string; items: number; caption: string }[]>(`Array.from(document.querySelectorAll(".tool-details")).slice(${batches.length}).map(row => {
       row.open = true;
-      return { text: row.querySelector(".fold-body").innerText, items: row.querySelectorAll(".tool-todo-board li, input[type=checkbox]").length };
+      return { text: row.querySelector(".fold-body").innerText, items: row.querySelectorAll(".tool-todo-board li, input[type=checkbox]").length,
+        caption: row.parentElement.querySelector(".tool-card-heading")?.textContent ?? "" };
     })`);
-    expect(requested).toEqual(Array(requests.length).fill({ text: expect.stringContaining("非当前进度"), items: 0 }));
+    expect(requested.map(({ items, caption }) => [items, caption])).toEqual(
+      requests.map((_, index) => [0, index < 4 ? "待办变更" : ""]));
+    expect(requested.map(({ text }) => text).join(" ")).not.toMatch(/非当前进度|这是请求的变更|回执中的文字/);
   });
+});
+
+browserTest("English tool copy at 320px keeps a pending Todo request and native evidence distinct", async () => {
+  await withWorkbench(320, [
+    { role: "user", content: "验证待办与输出" },
+    assistant(call("read-a", "read", { path: "docs/说明.md" }), call("read-b", "read", { path: "docs/计划.md" })),
+    result("read-a", "read", false, "原生回执"),
+    result("read-b", "read", false, "第二份原生回执"),
+  ], async (browser, emit) => {
+    emit({ type: "tool_execution_start", toolCallId: "pending-add", toolName: "todo", args: { op: "append", items: ["检查版面", "保留回执"] } });
+    await waitFor(browser, `!!document.querySelector('[data-tool-kind=todo][data-state=running]')`);
+    const shown = await browser.evaluate(`(() => {
+      const group = document.querySelector(".tool-group");
+      const groupText = group.querySelector(".tool-group-count").textContent;
+      group.open = true;
+      const read = group.querySelector(".tool-details");
+      read.open = true;
+      const output = read.querySelector(".tool-output");
+      const todo = document.querySelector("[data-tool-kind=todo]");
+      todo.open = true;
+      const transcript = document.querySelector("#transcript");
+      return {
+        speaker: document.querySelector(".message--user .speaker").textContent,
+        groupText, output: [output.getAttribute("aria-label"), output.textContent],
+        state: todo.querySelector(".tool-state-text").textContent,
+        caption: todo.parentElement.querySelector(".tool-card-heading").textContent,
+        items: [...todo.querySelectorAll(".tool-todo-board li")].map(item => item.textContent),
+        overflow: [document.documentElement.scrollWidth, transcript.scrollWidth - transcript.clientWidth],
+      };
+    })()`);
+    expect(shown).toEqual({
+      speaker: "You", groupText: "File and tool lookups · 2 succeeded", output: ["Inspection results", "原生回执"],
+      state: "Running", caption: "Add tasks", items: ["检查版面", "保留回执"], overflow: [320, 0],
+    });
+  }, "en");
 });
 
 browserTest("Batch recaps only show validated counts and Agent routes, independently of the receipt", async () => {

@@ -1,5 +1,6 @@
 import { codeBlock, el, list, notice, object, pretty, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { tr } from "./locale.ts";
 import { projectToolCard, renderToolCard } from "./tool-card.ts";
 import { ToolGroupView } from "./tool-group-view.ts";
 import { createToolScene, toolOutputLabels } from "./tool-scenes.ts";
@@ -13,12 +14,13 @@ export type ToolTrace = {
 };
 
 const states = {
-  running: { label: "运行中", icon: "M12 4a8 8 0 1 0 8 8" },
-  success: { label: "成功", icon: "m5 12 4 4L19 6" },
-  error: { label: "失败", icon: "m6 6 12 12M18 6 6 18" },
-  unknown: { label: "未见结果", icon: "M6 12h12" },
-  incomplete: { label: "结果不完整", icon: "M12 4v10m0 5v1" },
+  running: { label: tr("运行中", "Running"), icon: "M12 4a8 8 0 1 0 8 8" },
+  success: { label: tr("成功", "Succeeded"), icon: "m5 12 4 4L19 6" },
+  error: { label: tr("失败", "Failed"), icon: "m6 6 12 12M18 6 6 18" },
+  unknown: { label: tr("未见结果", "No result"), icon: "M6 12h12" },
+  incomplete: { label: tr("结果不完整", "Incomplete result"), icon: "M12 4v10m0 5v1" },
 } as const;
+const toolOutput = tr("工具输出", "Tool output");
 
 const clipped = (message?: Wire): boolean => message?.truncated === true || message?.partial === true;
 const hasPayload = (result: Wire): boolean => typeof result.content === "string" || Array.isArray(result.content);
@@ -56,13 +58,13 @@ export class ToolDisplay {
   private readonly status = el("span", "tool-state-text");
   private readonly icon = document.createElementNS("http://www.w3.org/2000/svg", "path");
   private readonly kindIcon = document.createElementNS("http://www.w3.org/2000/svg", "path");
-  private readonly identity = el("p", "tool-name small muted", "工具名：");
+  private readonly identity = el("p", "tool-name small muted", tr("工具名：", "Tool name: "));
   private readonly name = el("code");
   private readonly args = codeBlock("");
   private readonly argsSection = el("div", "stack stack--tight");
   private readonly rawArgs = el("details", "tool-raw-args");
   private readonly output = el("div", "tool-output stack stack--tight");
-  private readonly outputLabel = el("p", "small muted", "输出");
+  private readonly outputLabel = el("p", "small muted", toolOutputLabels.unknown);
   private readonly empty = el("p", "muted small");
   private readonly outputSection = el("div", "tool-result stack stack--tight");
   private readonly body = el("div", "fold-body stack stack--tight");
@@ -88,11 +90,11 @@ export class ToolDisplay {
     summary.append(chevron, subject, state);
 
     this.identity.append(this.name);
-    this.rawArgs.append(el("summary", "", "原始参数"));
-    this.argsSection.append(el("p", "small muted", "调用参数"));
+    this.rawArgs.append(el("summary", "", tr("原始参数", "Raw arguments")));
+    this.argsSection.append(el("p", "small muted", tr("调用参数", "Call arguments")));
     this.output.tabIndex = 0;
     this.output.setAttribute("role", "region");
-    this.output.setAttribute("aria-label", "工具输出");
+    this.output.setAttribute("aria-label", toolOutput);
     this.outputSection.append(this.outputLabel, this.output, this.empty);
     this.body.append(this.identity);
     this.details.append(summary, this.body);
@@ -134,7 +136,7 @@ export class ToolDisplay {
     const args = call?.arguments === undefined ? trace?.args : call.arguments;
     const output = result?.content ?? trace?.output;
     const state = toolState(call, trace, result);
-    const stateLabel = state === "unknown" && result ? "状态未知" : states[state].label;
+    const stateLabel = state === "unknown" && result ? tr("状态未知", "Unknown status") : states[state].label;
     const recap = recapTool(name, args);
     const { kind, label, operation, target, preview, group } = recap;
     const kindChanged = this.details.dataset.toolKind !== kind;
@@ -143,7 +145,7 @@ export class ToolDisplay {
       this.kindIcon.setAttribute("d", toolGlyphs[kind]);
       const outputLabel = toolOutputLabels[kind];
       this.outputLabel.textContent = outputLabel;
-      this.output.setAttribute("aria-label", outputLabel === "输出" ? "工具输出" : outputLabel);
+      this.output.setAttribute("aria-label", kind === "unknown" ? toolOutput : outputLabel);
       this.scene?.node.remove();
       this.outputSection.remove();
       this.argsSection.remove();
@@ -205,7 +207,9 @@ export class ToolDisplay {
     this.output.hidden = !this.output.childElementCount;
     this.outputLabel.hidden = this.output.hidden;
     this.empty.hidden = !this.output.hidden;
-    const placeholder = state === "running" ? "等待工具输出…" : state === "unknown" && !result ? "没有可见的工具结果。" : "无可显示的输出。";
+    const placeholder = state === "running" ? tr("等待工具输出…", "Waiting for tool output…")
+      : state === "unknown" && !result ? tr("没有可见的工具结果。", "No tool result is available.")
+      : tr("无可显示的输出。", "No output to display.");
     if (this.empty.textContent !== placeholder) this.empty.textContent = placeholder;
   }
 }

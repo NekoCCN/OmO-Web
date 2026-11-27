@@ -1,6 +1,7 @@
 import { list, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import type { Answer } from "./interactions.ts";
+import { tr } from "./locale.ts";
 
 export type Session = {
   readonly id: string;
@@ -18,7 +19,7 @@ export function parseSession(value: unknown): Session | undefined {
   const id = str(raw.id);
   if (!id) return;
   return {
-    id, name: str(raw.name) || "未命名会话", cwd: str(raw.cwd), updatedAt: num(raw.updatedAt) ?? 0,
+    id, name: str(raw.name) || tr("未命名会话", "Untitled session"), cwd: str(raw.cwd), updatedAt: num(raw.updatedAt) ?? 0,
     archived: raw.archived === true, settled: raw.settled === true, active: raw.active === true, running: raw.running === true,
   };
 }
@@ -84,9 +85,9 @@ export class Api {
       data = object(raw);
     } catch (error) {
       if (!(error instanceof SyntaxError)) throw error;
-      throw new RequestError(`本机 Web 服务返回了无效响应（HTTP ${response.status}）`, response.status, "");
+      throw new RequestError(tr(`本机 Web 服务返回了无效响应（HTTP ${response.status}）`, `The local Web server returned an invalid response (HTTP ${response.status}).`), response.status, "");
     }
-    if (!response.ok) throw new RequestError(str(data.error) || `请求失败（HTTP ${response.status}）`, response.status, str(data.code));
+    if (!response.ok) throw new RequestError(str(data.error) || tr(`请求失败（HTTP ${response.status}）`, `Request failed (HTTP ${response.status}).`), response.status, str(data.code));
     return data;
   }
 
@@ -101,7 +102,7 @@ export class Api {
   async resumeHistory(id: string): Promise<Session> {
     const data = await this.request(`${cliHistoryPath(id)}/resume`, {});
     const session = parseSession(data.session);
-    if (!session?.active) throw new RequestError("没有收到可继续的 Web 会话。请检查会话列表。", 502, "");
+    if (!session?.active) throw new RequestError(tr("没有收到可继续的 Web 会话。请检查会话列表。", "No active Web session was returned. Check the session list."), 502, "");
     return session;
   }
 
@@ -110,7 +111,7 @@ export class Api {
     const session = parseSession(data.session);
     const command = str(data.command);
     if (!session || session.id !== id || object(data.session).active !== false || !command.trim()) {
-      throw new RequestError("无法确认会话已释放，未显示启动命令。", 502, "");
+      throw new RequestError(tr("无法确认会话已释放，未显示启动命令。", "Could not confirm that the session was released. The launch command was not shown."), 502, "");
     }
     return { session, command };
   }

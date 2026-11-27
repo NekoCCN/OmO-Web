@@ -1,18 +1,19 @@
 import { object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
+import { tr, uiLocale } from "./locale.ts";
 
 type Batch = { readonly phase?: string; readonly items: readonly string[] };
 export type TodoChange = {
   readonly operation?: string;
   readonly preview?: string;
   readonly batches: readonly Batch[];
-  readonly requested: boolean;
-  readonly card?: { readonly titles: readonly string[]; readonly total: number };
+  readonly card?: { readonly heading: string; readonly titles: readonly string[]; readonly total: number };
 };
 
 const operations = new Map([
-  ["init", "初始化"], ["start", "请求开始"], ["done", "请求完成"], ["drop", "请求放弃"],
-  ["rm", "请求移除"], ["append", "追加"], ["view", "查看"],
+  ["init", tr("初始化", "Set up list")], ["start", tr("请求开始", "Request to start")],
+  ["done", tr("请求完成", "Request to complete")], ["drop", tr("请求放弃", "Request to drop")],
+  ["rm", tr("请求移除", "Request to remove")], ["append", tr("追加", "Append")], ["view", tr("查看", "View")],
 ]);
 const itemLimit = 24;
 const validLabel = (value: unknown, limit: number): value is string =>
@@ -56,12 +57,15 @@ export function todoChange(input: Wire): TodoChange {
     validLabel(input.task, 240) ? input.task.trim() : undefined;
   const requestTitle = task && recognizableTitle(task) ? task : undefined;
   const preview = requestTitle ?? titles[0];
+  const count = submitted.length.toLocaleString(uiLocale);
+  const remaining = (submitted.length - 1).toLocaleString(uiLocale);
   return {
-    operation: operation && batches !== undefined ? `${operation} · ${submitted.length} 项` : operation,
-    preview: preview && submitted.length > 1 ? `${preview} · 另 ${submitted.length - 1} 项` : preview,
+    operation: operation && batches !== undefined
+      ? tr(`${operation} · ${count} 项`, `${operation} · ${count} ${submitted.length === 1 ? "task" : "tasks"}`) : operation,
+    preview: preview && submitted.length > 1 ? tr(`${preview} · 另 ${remaining} 项`, `${preview} · ${remaining} more`) : preview,
     batches: batches ?? [],
-    requested,
-    card: requestTitle ? { titles: [requestTitle], total: 1 }
-      : titles.length ? { titles, total: submitted.length } : undefined,
+    card: requestTitle ? { heading: tr("待办变更", "Task changes"), titles: [requestTitle], total: 1 }
+      : titles.length ? { heading: op === "append" ? tr("新增待办", "Add tasks") : tr("提交的待办", "Tasks submitted"),
+        titles, total: submitted.length } : undefined,
   };
 }
