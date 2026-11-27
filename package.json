@@ -7,6 +7,8 @@
   "scripts": {
     "build": "bun build src/web/app.ts --target browser --outdir dist --minify",
     "start": "bun run build && bun src/main.ts",
+    "serve": "bun src/main.ts",
+    "release:pack": "bun run build && bun build src/main.ts --target bun --packages=bundle --outfile dist/server.js && bun scripts/pack-release.ts",
     "check": "tsc --noEmit",
     "test": "bun test",
     "verify:native": "bun scripts/verify-native.ts"

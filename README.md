@@ -4,15 +4,37 @@ OmO Native 的本机浏览器工作台。后端直接使用 OmO 的多会话 RPC
 
 ## 启动
 
-需要 Bun 1.3+。运行会话还需要已安装并配置模型凭据的 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)。Linux 上已实测 OmO **5.1.83**（Senpi **2026.11.23**）。这里的 `omo` 是 Native CLI，不是旧版 OpenCode 插件。Windows 的文件浏览与目录授权单独验证，不代表完整 CLI 功能可用。
+需要 Bun 1.3+（安装见 https://bun.sh）。运行会话还需要已安装并配置模型凭据的 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)。Linux 上已实测 OmO **5.1.83**（Senpi **2026.11.23**）。这里的 `omo` 是 Native CLI，不是旧版 OpenCode 插件。Windows 的文件浏览与目录授权单独验证，不代表完整 CLI 功能可用。完整安装、发行包与发版步骤见 [docs/install-release.md](docs/install-release.md)。
+
+Bun 运行 Web 服务；OmO CLI（默认 `OMO_WEB_BIN=omo`）负责模型、工具与权限。程序目录可以替换，`OMO_WEB_WORKSPACES` 指定可用的项目目录。升级时保留 `OMO_WEB_DATA` 和 OmO profile。
+
+### 方式 A：源码 checkout
 
 ```sh
+git clone https://github.com/NekoCCN/OmO-Web.git
+cd OmO-Web
 omo --version
 bun install --frozen-lockfile
 OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 ```
 
-把示例目录换成真实存在的项目。用浏览器打开终端打印的地址，默认是 **http://127.0.0.1:4317**。不设置工作目录时使用启动目录。打开多个项目时，在 Linux/macOS 用 `:` 分隔绝对路径。
+把示例目录换成真实存在的项目。`bun start` 等于先 `bun run build` 再跑 `src/main.ts`；重复启动可用 `bun run serve` 跳过重构建（`dist/app.js` 缺失时会直接报错退出，先补一次 `bun run build`）。用浏览器打开终端打印的地址，默认是 **http://127.0.0.1:4317**。不设置工作目录时使用启动目录。打开多个项目时，在 Linux/macOS 用 `:` 分隔绝对路径。
+
+### 方式 B：发行包解压运行
+
+从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`（版本号如 `0.1.0`；若该版本尚无资产，回退到方式 A 源码安装），校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
+
+```sh
+VERSION="0.1.0"
+ARCHIVE="omo-web-$VERSION.tar.gz"
+sha256sum -c "$ARCHIVE.sha256" &&
+  tar xzf "$ARCHIVE" &&
+  OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun --no-env-file "$PWD/omo-web-$VERSION/dist/server.js"
+```
+
+macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
+
+发行包根为解压出的 `omo-web-$VERSION/` 目录，内含 `dist/server.js`、`dist/app.js`、`public/` 运行资产与第三方许可证，不含源码、`node_modules`、`.env` 与本机数据。可从任意工作目录启动，工作目录与数据目录仍由环境变量决定；缺静态资源时同样拒绝启动（重校验重解，而非 `bun run build`）。升级时保留 `OMO_WEB_DATA` 与已配置的 CLI profile（`OMO_WEB_CLI_AGENT_DIR` 所指目录；默认与本机 CLI 共享），换新版目录重跑即可，不迁移数据；`OMO_WEB_DATA` 只归 Web 注册表与历史记录，原生会话落在 CLI profile。
 
 配置多个目录后，左栏可切换工作区。Web 会话和 CLI 列表随之筛选，新会话默认使用当前目录。切换只改变视图，不移动旧会话，也不会自动恢复或停止会话。
 
@@ -29,10 +51,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 | `OMO_WEB_ORIGIN` | 未设置 | 启用 TLS 时必填；无路径、尾部斜杠或凭据的 HTTPS 访问地址，端口与监听端口一致 |
 | `OMO_WEB_TLS_CERT` / `OMO_WEB_TLS_KEY` | 未设置 | 与访问地址匹配且被浏览器信任的 PEM 证书，以及对应的未加密 PEM 私钥 |
 | `OMO_WEB_BIN` | `omo` | 对应的 Native CLI 可执行文件 |
-| `OMO_WEB_DATA` | `~/.omo-web` | Web 会话索引和原生 JSONL 记录；一个目录只开一个服务实例 |
+| `OMO_WEB_DATA` | `~/.omo-web` | Web 会话索引和私有日志；默认共享的原生会话日志位于 OmO profile。一个数据目录只开一个服务实例 |
 | `OMO_WEB_CLI_AGENT_DIR` | `OMO_CODING_AGENT_DIR` → `SENPI_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR` → `~/.omo/agent` | 选择 Web 原生引擎、本机 CLI 历史、实时发现及快照使用的同一个 OmO 配置目录；设为 `""` 关闭 CLI 数据入口，Web 引擎仍使用继承的 OmO profile。 |
 
-`Ctrl+C` 停止服务及其 OmO 子进程。关闭页面或刷新不会停止生成；停止 Web 服务会结束这个 Web 引擎上的运行任务。保留 `OMO_WEB_DATA` 即可在重启后恢复会话。
+`Ctrl+C` 停止服务及其 OmO 子进程。关闭页面或刷新不会停止生成；停止 Web 服务会结束这个 Web 引擎上的运行任务。重启后可使用原来的数据目录和 OmO profile 恢复会话。
 
 ### 密码与全接口 HTTPS（可选）
 
@@ -96,9 +118,13 @@ bun start
 ```sh
 bun run check           # TypeScript
 bun test                # HTTP、RPC、SSE、持久化及权限边界回归
-bun run build           # 构建浏览器资源
+bun run build           # 构建浏览器资源（dist/app.js）
+bun run serve           # 不重构建，直接跑 src/main.ts
+bun run release:pack    # 构建浏览器与服务端包，产出 dist/omo-web-$VERSION.tar.gz + .sha256
 bun run verify:native   # 真实 OmO，经本地模拟模型验证，无外部模型请求
 ```
+
+发版流程（打 tag、draft 发布）见 [docs/install-release.md](docs/install-release.md)；若 Release 尚无对应资产，用方式 A 源码安装。
 
 验证本机安装的原生 CLI 联动时，把 `SENPI_CLI_MAIN` 设为该安装里的 `dist/cli-main.js` 的绝对路径：
 

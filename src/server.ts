@@ -1,6 +1,5 @@
 import { createHmac } from "node:crypto";
 import { resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 import { z, ZodError } from "zod";
 import { CliHistory } from "./cli-history.ts";
 import type { CliSessionSummary } from "./cli-history.ts";
@@ -15,6 +14,7 @@ import { Sessions } from "./sessions.ts";
 import { TerminalSessions } from "./terminal-sessions.ts";
 import { terminalInput } from "./terminal-view.ts";
 import { headers, loadWebAccess } from "./web-access.ts";
+import { webAsset } from "./web-assets.ts";
 import { WorkspaceAccess, workspacePlatform } from "./workspace-access.ts";
 
 export type AppSettings = {
@@ -26,16 +26,6 @@ export type AppSettings = {
   readonly webEnv?: Readonly<NodeJS.ProcessEnv>;
 };
 
-const assets: Readonly<Record<string, string>> = {
-  "/": "../public/index.html",
-  "/styles.css": "../public/styles.css",
-  "/workbench.css": "../public/workbench.css",
-  "/tool-ledger.css": "../public/tool-ledger.css",
-  "/dag-graph.css": "../public/dag-graph.css",
-  "/app.js": "../dist/app.js",
-  "/favicon.svg": "../public/favicon.svg",
-  "/icons.svg": "../public/icons.svg",
-};
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_STREAM_CLIENTS = 16;
 const encoder = new TextEncoder();
@@ -145,9 +135,8 @@ export async function startApp(settings: AppSettings) {
       const { pathname, searchParams } = new URL(request.url);
 
       if (request.method === "GET") {
-        const asset = Object.hasOwn(assets, pathname) ? assets[pathname] : undefined;
-        if (asset) {
-          const file = Bun.file(fileURLToPath(new URL(asset, import.meta.url)));
+        const file = webAsset(pathname);
+        if (file) {
           if (!(await file.exists())) throw new WebError(404, "missing_asset", "静态资源不存在，请先执行 bun run build。");
           return new Response(file, { headers: { ...headers, "Content-Type": file.type } });
         }
