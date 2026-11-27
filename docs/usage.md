@@ -24,10 +24,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 ### 方式 B：发行包解压运行
 
-登录有仓库访问权限的 GitHub 账户，从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`（版本号如 `0.1.0`；若该版本尚无资产，回退到方式 A 源码安装）。校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
+有仓库访问权限时，可以从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`。校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
 
 ```sh
-VERSION="0.1.0"
+VERSION="0.1.1"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
@@ -54,9 +54,9 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 | --- | --- | --- |
 | `OMO_WEB_WORKSPACES` | 启动目录 | 允许新建和恢复会话的工作目录 |
 | `OMO_WEB_PORT` | `4317` | 非 TLS 模式可用 `0` 分配随机端口 |
-| `OMO_WEB_HOST` | `127.0.0.1` | `0.0.0.0` 表示监听所有 IPv4 接口，需要 HTTPS 和密码，或显式选择无密码 |
+| `OMO_WEB_HOST` | `127.0.0.1` | `0.0.0.0` 监听所有 IPv4 接口；也可绑定本机网卡已分配的 IPv4。非本机监听需要 HTTPS，并要求密码或显式选择无密码 |
 | `OMO_WEB_PASSWORD_FILE` | 未设置 | 私有密码文件，用户名固定为 `omo`；推荐用 `omo-web password-file` 创建 |
-| `OMO_WEB_ALLOW_UNAUTHENTICATED` | 未设置 | 只有 `1` 允许在未配置密码文件时监听所有接口；仍要求 HTTPS，有密码时不会禁用认证 |
+| `OMO_WEB_ALLOW_UNAUTHENTICATED` | 未设置 | 只有 `1` 允许在未配置密码文件时监听非本机地址；仍要求 HTTPS，有密码时不会禁用认证 |
 | `OMO_WEB_ORIGIN` | 未设置 | 启用 TLS 时必填；无路径、尾部斜杠或凭据的 HTTPS 访问地址，端口与监听端口一致 |
 | `OMO_WEB_TLS_CERT` / `OMO_WEB_TLS_KEY` | 未设置 | 与访问地址匹配且被浏览器信任的 PEM 证书，以及对应的未加密 PEM 私钥 |
 | `OMO_WEB_BIN` | `omo` | 对应的 Native CLI 可执行文件 |
@@ -65,7 +65,16 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 ## 密码与远程访问
 
-默认只监听本机，不要求密码。只给本机加密码时，设置 `OMO_WEB_PASSWORD_FILE` 即可；从外地访问时还需要下面的 HTTPS 设置。
+默认只监听本机，不要求密码。可以在 npm 版启动器中配置，也可以给 `omo-web serve` 或 Bun 入口传环境变量。
+
+### 通过 TUI 配置
+
+1. 在交互终端运行 `omo-web`，进入「访问设置」。用「监听地址」选择 `127.0.0.1`、一张网卡上已分配的 IPv4，或 `0.0.0.0`。网卡旁的 CIDR 用于辨认网段，不是入站白名单。
+2. 用「设置 / 修改密码」输入 20–128 个可打印 ASCII 字符，输入不会回显；保存时会开启认证。独立的「密码」开关可以关闭认证，再打开时复用已保存的密码。浏览器用户名固定为 `omo`。
+3. 用「生成 SSL 自签证书」输入浏览器要使用的主机名或 IP，不能填 `0.0.0.0`。生成需要 `PATH` 上的 OpenSSL 1.1.1+，完成后自动开启 HTTPS。证书有效期为 90 天；在客户端核对并信任公开的 `cert.pem`（不要传输 `key.pem`），或改用客户端已经信任的证书。只监听 `127.0.0.1` 时可关闭 HTTPS；重新开启可复用证书。
+4. 返回主菜单启动服务，打开显示的地址。如果改了网卡或浏览器访问地址，检查 URL 和证书是否仍匹配，必要时重新生成。非本机启动没有密码时，先确认风险，再启动。
+
+设置保存在 `OMO_WEB_DATA/launcher/`（默认 `~/.omo-web/launcher/`）；已在 TUI 修改的选项覆盖继承的同名环境配置。请把数据目录放在私有位置，不要放入共享工作区。运行中先停止服务才能改设置，修改会在下次启动生效。`omo-web serve` 不读取启动器设置。
 
 ### 生成密码文件
 
@@ -102,10 +111,10 @@ $env:OMO_WEB_PASSWORD_FILE = "$HOME\.omo-web-password"
 $env:OMO_WEB_TLS_CERT = "$HOME\.omo-web-cert.pem"
 $env:OMO_WEB_TLS_KEY = "$HOME\.omo-web-key.pem"
 $env:OMO_WEB_WORKSPACES = "$HOME\Projects\your-project"
-omo-web
+omo-web serve
 ```
 
-两组命令都需替换域名和文件路径。用 npm 包可把 `bun start` 换成 `omo-web`；源码检出可把 PowerShell 里的 `omo-web` 换成 `bun start`。浏览器打开 `OMO_WEB_ORIGIN`，**不要打开 `0.0.0.0`**。出现登录框时使用用户名 `omo`。确认能在本机用同一个 HTTPS 地址访问后，再到另一台设备验网络路径。
+两组命令都需替换域名和文件路径。用 npm 包可把 `bun start` 换成 `omo-web serve`；源码检出可把 PowerShell 里的 `omo-web serve` 换成 `bun start`。浏览器打开 `OMO_WEB_ORIGIN`，**不要打开 `0.0.0.0`**。出现登录框时使用用户名 `omo`。确认能在本机用同一个 HTTPS 地址访问后，再到另一台设备验网络路径。
 
 启用密码时，网页、静态资源、API 和 SSE 都需要凭据；远程监听会暂时限制同一连接地址的连续错误密码请求。服务直接终止 TLS，不信任 `X-Forwarded-*`，不支持代理代为终止 TLS。配置不完整会拒绝启动，不会回退明文。修改密码或证书需重启；Basic 登录由浏览器缓存，无应用内登出。
 

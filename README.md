@@ -22,9 +22,9 @@ cd /path/to/your/project
 omo-web
 ```
 
-If you can't reach npm, [download the `.tgz` from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) and run `npm install -g ./omo-web-0.1.0.tgz`.
+If you can't reach npm and have repository access, [download the `.tgz` from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) and run `npm install -g ./omo-web-0.1.1.tgz`.
 
-Open the printed address (default `http://127.0.0.1:4317`). In an interactive terminal, `omo-web` opens a keyboard-driven launcher: move with the arrow keys, press Enter to pick a working directory and start. From the same screen you can open the browser, stop the service, or quit; directory edits apply to that launch only. For scripts use `omo-web serve`, and `omo-web --help` lists the startup commands. The launcher follows the system language (English / 简体中文, English fallback).
+In an interactive terminal, `omo-web` opens a launcher. Use the arrow keys and Enter to pick a working directory, edit **Access settings**, or start the service. Open the printed address (default `http://127.0.0.1:4317`). Stop the service from the launcher before changing settings. Access settings persist; directory edits apply only to the current launcher session. For scripts use `omo-web serve`. The launcher follows the system language (English / 简体中文, English fallback).
 
 Prefer source? Clone and run with Bun:
 
@@ -38,10 +38,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 Replace the example path with a directory that exists. `bun start` builds first and then starts; repeat runs can use `bun run serve` to skip the rebuild.
 
-Prefer the Bun-only archive? Download `omo-web-0.1.0.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
+Prefer the Bun-only archive? Download `omo-web-0.1.1.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
 
 ```sh
-VERSION="0.1.0"
+VERSION="0.1.1"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
@@ -105,14 +105,16 @@ Type `/` or `$` in the input, pick with the arrow keys, and press Enter, Tab, or
 
 ## Access and safety
 
-Listens on loopback with no password by default. Common variables:
+The default is loopback with no password. In **Access settings**, you can set or change the password, toggle password protection and HTTPS, generate a self-signed SSL certificate, and bind to loopback, a specific IPv4 interface or `0.0.0.0`. Certificate generation requires OpenSSL 1.1.1+ on `PATH`; use the printed HTTPS address and verify the certificate on the client. The browser username is `omo`.
+
+For direct server startup (`omo-web serve`), use environment variables:
 
 | Variable | Notes |
 | --- | --- |
 | `OMO_WEB_WORKSPACES` | Project directories allowed to host sessions; defaults to the launch directory |
 | `OMO_WEB_PORT` | Listen port, default `4317` |
 | `OMO_WEB_PASSWORD_FILE` | Password file (`0600` on POSIX, user-private ACL on Windows), login name `omo` |
-| `OMO_WEB_ALLOW_UNAUTHENTICATED` | Explicit opt-in to passwordless mode on all interfaces; HTTPS still required |
+| `OMO_WEB_ALLOW_UNAUTHENTICATED` | Explicit opt-in to passwordless non-loopback access; HTTPS still required |
 | `OMO_WEB_DATA` | Web session index and private logs, default `~/.omo-web` |
 | `OMO_WEB_CLI_AGENT_DIR` | Shared OmO profile directory for the engine, CLI history, and snapshots |
 | `OMO_WEB_BIN` | Native CLI binary, default `omo` |
@@ -124,7 +126,7 @@ dirs="$HOME/code/api:$HOME/code/ui"
 OMO_WEB_WORKSPACES="$dirs" bun start
 ```
 
-For access away from the machine, listen on `0.0.0.0` with direct HTTPS. Use a VPN where possible and set a password. Passwordless mode is an explicit opt-in for restricted networks: anyone who can connect can read sessions and run tools through OmO. This is a single-operator workbench, not a multi-user service. See [Linux and Windows remote setup](docs/usage.md#密码与远程访问).
+Non-loopback listeners require HTTPS. Binding to an interface does not configure a firewall or restrict which source addresses can connect. Use a VPN where possible and set a password. Passwordless mode is an explicit opt-in for restricted networks: anyone who can connect can read sessions and run tools through OmO. See [Linux and Windows remote setup](docs/usage.md#密码与远程访问).
 
 ## Platform limits
 
@@ -143,7 +145,7 @@ bun run build     # browser assets
 bun run serve     # start without rebuilding
 ```
 
-[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.0 notes](docs/releases/0.1.0.md) · [Distribution options](docs/distribution.md)
+[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.1 notes](docs/releases/0.1.1.md) · [Distribution options](docs/distribution.md)
 
 [Web API](docs/web-api.md) · [CLI parity matrix](docs/parity/local-cli-web-matrix.md) · [Interface conventions](DESIGN.md)
 

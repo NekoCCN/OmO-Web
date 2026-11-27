@@ -21,7 +21,7 @@ Web 启动一个私有的本机 stdio 引擎子进程（`omo --mode rpc --multi-
 
 ## 用户：源码安装
 
-公开仓库可直接通过 HTTPS 克隆，不需要 GitHub 登录。
+源码安装需要 GitHub 仓库访问权限；没有权限可用公开 npm 包。
 
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
@@ -41,8 +41,8 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 把 `VERSION` 和 `TAG` 换成实际发布的版本和标签。可从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 页面直接下载两个文件。已安装并登录 `gh` 的用户也可执行下例。
 
 ```sh
-VERSION="0.1.0"
-TAG="v0.1.0"
+VERSION="0.1.1"
+TAG="v0.1.1"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 gh release download "$TAG" --repo NekoCCN/OmO-Web --pattern "$ARCHIVE" --pattern "$ARCHIVE.sha256" &&
   sha256sum -c "$ARCHIVE.sha256" &&
@@ -62,7 +62,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 完整表见 [使用详解](usage.md#环境变量)，密码与远程访问见 [使用详解](usage.md#密码与远程访问)，禁区摘要见 [README](../README.md)；这里只记安装相关的默认值：
 
 - 默认本机免密（`127.0.0.1`）。可以用 `omo-web password-file <路径>` 生成私有密码文件，再设置 `OMO_WEB_PASSWORD_FILE`，登录用户名为 `omo`。
-- 全接口需要直接 HTTPS（`OMO_WEB_HOST=0.0.0.0`、`OMO_WEB_ORIGIN` 和证书/私钥）；配置不完整不回退到明文。优先配置密码，无密码只在确认风险后用于受限私网。
+- 非本机监听需要直接 HTTPS（`OMO_WEB_HOST` 为本机某网卡的 IPv4 或 `0.0.0.0`，并指定 `OMO_WEB_ORIGIN` 和证书/私钥）；配置不完整不回退到明文。优先配置密码，无密码只在确认风险后用于受限私网。
 - 单操作者工作台：密码或 HTTPS 本身都不是多用户权限系统。完整 Linux 与 PowerShell 示例见[远程配置](usage.md#密码与远程访问)。
 
 ## 用 npm 安装终端启动器
@@ -73,9 +73,9 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 npm install -g omo-web
 ```
 
-也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载 `.tgz` 后运行 `npm install -g ./omo-web-0.1.0.tgz`。从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.0.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与原先不依赖 Node.js 的 Bun `.tar.gz` 不同。
+也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) 下载 `.tgz` 后运行 `npm install -g ./omo-web-0.1.1.tgz`。从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.1.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与不依赖 Node.js 的 Bun `.tar.gz` 不同。
 
-在实际项目目录运行 `omo-web`。用方向键移动、Enter 选择工作目录或启动。服务启动后可以打开浏览器、停止服务或退出；目录编辑只影响本次启动。`omo-web serve` 不进入交互界面，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
+在实际项目目录运行 `omo-web`。用方向键移动，Enter 选择工作目录、访问设置或开始监听。密码、HTTPS、证书和网卡详见 [TUI 配置](usage.md#通过-tui-配置)。`omo-web serve` 不读取启动器设置，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
 
 ## 维护者：发版
 

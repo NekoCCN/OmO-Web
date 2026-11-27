@@ -4,6 +4,7 @@ import { open } from "node:fs/promises";
 import { isIP } from "node:net";
 import { createSecureContext } from "node:tls";
 import { z } from "zod";
+import { interfaceAddresses, isRemoteAddress, loopbackAddress, wildcardAddress } from "../packaging/npm/listen-address.js";
 import { cliTr } from "../packaging/npm/locale.js";
 import { readWindowsPasswordFile } from "../packaging/npm/windows-password.js";
 import { WebError } from "./protocol.ts";
@@ -27,7 +28,6 @@ export class WebAccessConfigError extends Error {
   }
 }
 
-const hostSchema = z.enum(["127.0.0.1", "0.0.0.0"]);
 const passwordSchema = z.string().regex(/^[\x20-\x7e]{20,128}$/);
 const MAX_AUTH_FAILURES = 5;
 const MAX_TRACKED_ADDRESSES = 1024;
@@ -124,17 +124,20 @@ function validateCertificate(cert: Buffer, key: Buffer, origin: URL): void {
 }
 
 export async function loadWebAccess(env: Readonly<NodeJS.ProcessEnv>, port: number) {
-  const host = hostSchema.safeParse(env.OMO_WEB_HOST ?? "127.0.0.1");
-  if (!host.success) throw new WebAccessConfigError("OMO_WEB_HOST", cliTr(
-    "只允许 127.0.0.1 或 0.0.0.0。", "Only 127.0.0.1 or 0.0.0.0 is allowed."));
+  const host = env.OMO_WEB_HOST ?? loopbackAddress;
+  if (host !== loopbackAddress && host !== wildcardAddress && !interfaceAddresses().some(entry => entry.address === host)) {
+    throw new WebAccessConfigError("OMO_WEB_HOST", cliTr(
+      "请选择 127.0.0.1、0.0.0.0 或本机网卡已分配的 IPv4 地址。",
+      "Use 127.0.0.1, 0.0.0.0, or an IPv4 address assigned to a local interface."));
+  }
   const { OMO_WEB_PASSWORD_FILE: passwordFile, OMO_WEB_ORIGIN: originSetting,
     OMO_WEB_TLS_CERT: certFile, OMO_WEB_TLS_KEY: keyFile } = env;
-  const publicBinding = host.data === "0.0.0.0";
+  const publicBinding = isRemoteAddress(host);
   const unprotected = publicBinding && passwordFile === undefined;
   if (unprotected && env.OMO_WEB_ALLOW_UNAUTHENTICATED !== "1") {
     throw new WebAccessConfigError("OMO_WEB_PASSWORD_FILE", cliTr(
-      "全接口监听必须配置密码文件，或显式设置 OMO_WEB_ALLOW_UNAUTHENTICATED=1。",
-      "Listening on all interfaces requires a password file or explicit OMO_WEB_ALLOW_UNAUTHENTICATED=1."));
+      "非本机监听必须配置密码文件，或显式设置 OMO_WEB_ALLOW_UNAUTHENTICATED=1。",
+      "Non-loopback listening requires a password file or explicit OMO_WEB_ALLOW_UNAUTHENTICATED=1."));
   }
 
   let origin: string | undefined;
@@ -173,7 +176,7 @@ export async function loadWebAccess(env: Readonly<NodeJS.ProcessEnv>, port: numb
   const limiter = publicBinding && digest ? authFailureLimiter() : undefined;
 
   return {
-    hostname: host.data, origin, tls, unprotected,
+    hostname: host, origin, tls, unprotected,
     authorize(request: Request, expected: URL, token: Buffer, address?: string): Response | undefined {
       const requestOrigin = request.headers.get("Origin");
       if (request.headers.get("Host") !== expected.host || (requestOrigin !== null && requestOrigin !== expected.origin) ||

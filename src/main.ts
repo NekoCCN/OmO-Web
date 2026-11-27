@@ -40,8 +40,8 @@ const app = await startApp({
   process.exit(1);
 });
 if (app.unprotected) console.warn(cliTr(
-  "警告：全接口监听未设密码。能访问此地址的人都能读取会话并通过 OmO 操作本机。仅在受限私网或 VPN 内使用。",
-  "Warning: listening on all interfaces without a password. Anyone who can reach this address can read sessions and run tools through OmO. Use only on a restricted private network or VPN.",
+  "警告：非本机监听未设密码。能访问此地址的人都能读取会话并通过 OmO 操作本机。仅在受限私网或 VPN 内使用。",
+  "Warning: non-loopback listening without a password. Anyone who can reach this address can read sessions and run tools through OmO. Use only on a restricted private network or VPN.",
 ));
 console.log(`OmO Web: ${app.url.href}`);
 console.log(`${cliTr("工作目录", "Working directories")}: ${workspaces.join(", ")}`);

@@ -56,9 +56,13 @@ export function readWindowsPasswordFile(path) {
 }
 
 export async function createWindowsPasswordFile(path, password) {
+  if (!/^[\x20-\x7e]{20,128}$/.test(password) || /[\r\n]/.test(password)) throw new Error("Invalid password.");
+  await createWindowsPrivateFile(path, Buffer.from(`${password}\n`, "ascii"));
+}
+
+export async function createWindowsPrivateFile(path, bytes) {
   await powershell(String.raw`
-    $password = [Console]::In.ReadToEnd()
-    if ($password -notmatch '\A[\x20-\x7E]{20,128}\z') { throw 'Invalid password' }
+    $bytes = [Convert]::FromBase64String([Console]::In.ReadToEnd())
     $acl = [System.Security.AccessControl.FileSecurity]::new()
     $acl.SetOwner($sid)
     $acl.SetAccessRuleProtection($true, $false)
@@ -67,10 +71,9 @@ export async function createWindowsPasswordFile(path, password) {
     $file = [IO.FileStream]::new($path, [IO.FileMode]::CreateNew,
       [System.Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::None, $acl)
     try {
-      $bytes = [Text.Encoding]::ASCII.GetBytes($password + [char]10)
       $file.Write($bytes, 0, $bytes.Length)
     } finally {
       $file.Dispose()
     }
-  `, path, password);
+  `, path, bytes.toString("base64"));
 }

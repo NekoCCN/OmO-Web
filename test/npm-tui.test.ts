@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { mkdir, mkdtemp, readFile, rm, stat, symlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { request as httpsRequest } from "node:https";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
+import { checkServerIdentity } from "node:tls";
 import { fileURLToPath } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { readWindowsPasswordFile } from "../packaging/npm/windows-password.js";
@@ -11,6 +13,7 @@ const supported = process.platform !== "win32" && typeof Bun.Terminal === "funct
 const evidence = process.env.OMO_TUI_EVIDENCE;
 const launcher = new URL("../packaging/npm/tui.js", import.meta.url).href;
 const cli = fileURLToPath(new URL("../packaging/npm/omo-web.js", import.meta.url));
+const sourceServer = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 
 async function terminalFixture(
   cols: number, rows: number, color: boolean,
@@ -18,6 +21,7 @@ async function terminalFixture(
     readonly workspace: string;
     readonly second: string;
     readonly keys: (text: string) => void;
+    readonly restart: () => Promise<void>;
     readonly resize: (cols: number, rows: number) => void;
     readonly mark: () => number;
     readonly after: (pattern: RegExp, mark?: number, raw?: boolean) => Promise<RegExpMatchArray>;
@@ -26,7 +30,7 @@ async function terminalFixture(
     readonly exited: Promise<number>;
     readonly launchLog: string;
   }) => Promise<void>,
-  settings: { readonly env?: NodeJS.ProcessEnv; readonly failure?: string } = {},
+  settings: { readonly env?: NodeJS.ProcessEnv; readonly failure?: string; readonly real?: boolean } = {},
 ): Promise<void> {
   if (!node) throw new Error("Node is required to run the launcher.");
   const root = await mkdtemp(join(tmpdir(), "omo-web-tui-test-"));
@@ -59,11 +63,13 @@ async function terminalFixture(
       stream += decoder.decode(bytes, { stream: true });
       for (const check of listeners) check();
     } });
-    const proc = Bun.spawn([node, "--input-type=module", "-e",
+    const installedCli = settings.real ? process.env.OMO_TUI_INSTALLED_CLI : undefined;
+    const command = installedCli ? [node, installedCli, "tui"] : [node, "--input-type=module", "-e",
       `import { startTui } from ${JSON.stringify(launcher)};
-       process.exitCode = await startTui({ entry: ${JSON.stringify(entry)}, version: "0.1.0" });`,
-    ], {
-      cwd: workspace, terminal: pty, timeout: 15_000,
+       process.exitCode = await startTui({ entry: ${JSON.stringify(settings.real ? sourceServer : entry)}, version: "test" });`,
+    ];
+    const spawnLauncher = () => Bun.spawn(command, {
+      cwd: workspace, terminal: pty, timeout: 25_000,
       env: {
         PATH: `${process.execPath.slice(0, process.execPath.lastIndexOf("/"))}:${process.env.PATH ?? ""}`,
         HOME: root, TERM: "xterm-256color", OMO_WEB_PORT: "0", LANG: "en_US.UTF-8",
@@ -71,10 +77,15 @@ async function terminalFixture(
         ...settings.env,
       },
     });
+    let proc = spawnLauncher();
     try {
       await verify({
         workspace, second, launchLog,
         keys: text => { pty.write(text); },
+        async restart() {
+          if (await proc.exited !== 0) throw new Error("Launcher did not quit normally before restarting.");
+          proc = spawnLauncher();
+        },
         resize: (width, height) => {
           pty.resize(width, height);
           // Bun.Terminal updates the window size but this fixture has no foreground process group.
@@ -83,7 +94,7 @@ async function terminalFixture(
         mark: () => stream.length,
         raw: () => stream,
         async capture(name) { if (evidence) await Bun.write(join(evidence, `${name}.ansi`), stream); },
-        exited: proc.exited,
+        get exited() { return proc.exited; },
         after(pattern, mark = 0, raw = false) {
           return new Promise((resolve, reject) => {
             const check = () => {
@@ -187,6 +198,218 @@ test.skipIf(!supported)("A Chinese PTY defaults the remote risk confirmation to 
     await expect(stat(view.launchLog)).rejects.toHaveProperty("code", "ENOENT");
   }, { env: { LC_ALL: "zh_CN.UTF-8", LC_MESSAGES: "en_US.UTF-8", OMO_WEB_HOST: "0.0.0.0" } });
 });
+
+test.skipIf(!supported)("Password changes and its toggle control real HTTP authorization without echoing the secret", async () => {
+  const password = "terminal fixture secret 42";
+  const replacement = "terminal rotated secret 79";
+  await terminalFixture(84, 24, false, async view => {
+    await view.after(/> Start web/u);
+    let mark = view.mark();
+    view.keys("\x1b[B\x1b[B\r");
+    await view.after(/> Listen address/u, mark);
+    await view.capture("84-settings");
+    mark = view.mark();
+    view.keys("\x1b[B\x1b[B\r");
+    await view.after(/New password/u, mark);
+    view.keys(password);
+    await view.after(/\*{20}/u, mark);
+    await view.capture("84-password");
+    mark = view.mark();
+    view.keys("\r");
+    await view.after(/Password: On/u, mark);
+    async function startHttp() {
+      const returning = view.mark();
+      view.keys("\x1b");
+      await view.after(/> Start web/u, returning);
+      const starting = view.mark();
+      view.keys("\r");
+      const [, url] = await view.after(/(http:\/\/127\.0\.0\.1:\d+\/)/u, starting);
+      if (!url) throw new Error("Missing HTTP listener.");
+      return (secret?: string) => fetch(url, {
+        signal: AbortSignal.timeout(2500),
+        headers: secret === undefined ? {} : { Authorization: `Basic ${Buffer.from(`omo:${secret}`).toString("base64")}` },
+      });
+    }
+    async function stopHttp() {
+      const stopping = view.mark();
+      view.keys("\x1b[B\r");
+      await view.after(/> Start web/u, stopping);
+      view.keys("\x1b[B\x1b[B\r");
+      await view.after(/> Listen address/u, stopping);
+    }
+    const first = await startHttp();
+    expect((await first()).status).toBe(401);
+    expect((await first(password)).status).toBe(200);
+    await stopHttp();
+
+    mark = view.mark();
+    view.keys("\x1b[B\x1b[B\r");
+    await view.after(/New password/u, mark);
+    mark = view.mark();
+    view.keys(`${replacement}\r`);
+    await view.after(/Password: On/u, mark);
+    const rotated = await startHttp();
+    expect((await rotated(password)).status).toBe(401);
+    expect((await rotated(replacement)).status).toBe(200);
+    await stopHttp();
+
+    mark = view.mark();
+    view.keys("\x1b[B\r");
+    await view.after(/Password: Off/u, mark);
+    expect((await (await startHttp())()).status).toBe(200);
+    await stopHttp();
+    mark = view.mark();
+    view.keys("\x1b[B\r");
+    await view.after(/Password: On/u, mark);
+    const enabled = await startHttp();
+    expect((await enabled()).status).toBe(401);
+    expect((await enabled(replacement)).status).toBe(200);
+    view.keys("q");
+    mark = view.mark();
+    await view.restart();
+    await view.after(/> Start web/u, mark);
+    mark = view.mark();
+    view.keys("\r");
+    const [, restarted] = await view.after(/(http:\/\/127\.0\.0\.1:\d+\/)/u, mark);
+    if (!restarted) throw new Error("Missing listener after restarting the launcher.");
+    expect((await fetch(restarted, { signal: AbortSignal.timeout(2000) })).status).toBe(401);
+    expect((await fetch(restarted, { signal: AbortSignal.timeout(2000),
+      headers: { Authorization: `Basic ${Buffer.from(`omo:${replacement}`).toString("base64")}` } })).status).toBe(200);
+    expect(view.raw()).not.toContain(password);
+    expect(view.raw()).not.toContain(replacement);
+    view.keys("q");
+    expect(await view.exited).toBe(0);
+  }, { real: true });
+}, 27_000);
+
+test.skipIf(!supported || process.env.OMO_WEB_TEST_TLS !== "1")(
+  "TUI generates trusted HTTPS, binds only the chosen IPv4, and confirms unauthenticated wildcard access", async () => {
+    const lan = Object.values(networkInterfaces()).flatMap(entries => entries ?? [])
+      .find(address => address.family === "IPv4" && !address.internal);
+    const address = lan?.address ?? "127.0.0.1";
+    const reservation = Bun.serve({ hostname: address, port: 0, fetch: () => new Response() });
+    const port = reservation.port;
+    await reservation.stop(true);
+    if (!port) throw new Error("Missing test listener port.");
+    const origin = `https://${address}:${port}`;
+    await terminalFixture(90, 25, false, async view => {
+      await view.after(/> Start web/u);
+      let mark = view.mark();
+      view.keys("\x1b[B\x1b[B\r");
+      await view.after(/> Listen address/u, mark);
+      mark = view.mark();
+      view.keys("\r");
+      await view.after(/All IPv4 interfaces/u, mark);
+      await view.capture("90-listen");
+      if (lan) {
+        const index = Object.values(networkInterfaces()).flatMap(entries => entries ?? [])
+          .filter(entry => entry.family === "IPv4" && !entry.internal)
+          .findIndex(entry => entry.address === address);
+        mark = view.mark();
+        view.keys(`${"\x1b[B".repeat(index + 2)}\r`);
+        await view.after(new RegExp(`> Listen address: ${address.replaceAll(".", "\\.")}`, "u"), mark);
+      } else view.keys("\r");
+      mark = view.mark();
+      view.keys("\x1b[B\x1b[B\x1b[B\x1b[B\r");
+      await view.after(/Certificate host/u, mark);
+      await view.capture("90-certificate");
+      mark = view.mark();
+      view.keys(`\x15${address}\r`);
+      await view.after(/HTTPS: On/u, mark);
+      const certDir = join(view.workspace, "data", "launcher");
+      const pem = await Array.fromAsync(new Bun.Glob("tls-*/cert.pem").scan({ cwd: certDir }));
+      expect(pem).toHaveLength(1);
+      const [certificate] = pem;
+      if (!certificate) throw new Error("Missing generated certificate.");
+      const ca = await readFile(join(certDir, certificate));
+      const get = (hostname: string) => new Promise<number | undefined>((resolve, reject) => {
+        const req = httpsRequest(origin, { hostname, ca, headers: { Host: new URL(origin).host },
+          checkServerIdentity: (_name, cert) => checkServerIdentity(address, cert),
+          agent: false, signal: AbortSignal.timeout(1800) }, response => {
+          response.resume();
+          response.once("end", () => resolve(response.statusCode));
+        });
+        req.once("error", reject);
+        req.end();
+      });
+      mark = view.mark();
+      view.keys("\x1b");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\r");
+      if (lan) {
+        await view.after(/> Back/u, mark);
+        mark = view.mark();
+        view.keys("\x1b[B\r");
+      }
+      await view.after(new RegExp(origin.replaceAll(".", "\\."), "u"), mark);
+      expect(await get(address)).toBe(200);
+      if (lan) await expect(get("127.0.0.1")).rejects.toHaveProperty("code", "ECONNREFUSED");
+
+      mark = view.mark();
+      view.keys("\x1b[B\r");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\x1b[B\x1b[B\r\r");
+      await view.after(/All IPv4 interfaces/u, mark);
+      mark = view.mark();
+      view.keys("\x1b[B\r");
+      await view.after(/> Listen address: 0\.0\.0\.0/u, mark);
+      mark = view.mark();
+      view.keys("\x1b");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\r");
+      await view.after(/> Back/u, mark);
+      await view.capture("90-confirm");
+      await expect(get(address)).rejects.toHaveProperty("code", "ECONNREFUSED");
+      mark = view.mark();
+      view.keys("\x1b[B\r");
+      await view.after(new RegExp(origin.replaceAll(".", "\\."), "u"), mark);
+      if (lan) expect(await get(address)).toBe(200);
+      // Connect via loopback while preserving the certificate name and exact HTTP authority.
+      expect(await get("127.0.0.1")).toBe(200);
+      mark = view.mark();
+      view.keys("\x1b[B\r");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\x1b[B\x1b[B\r\r");
+      await view.after(/All IPv4 interfaces/u, mark);
+      mark = view.mark();
+      view.keys("\r");
+      await view.after(/> Listen address: 127\.0\.0\.1/u, mark);
+      mark = view.mark();
+      view.keys("\x1b[B\x1b[B\x1b[B\r");
+      await view.after(/HTTPS: Off/u, mark);
+      mark = view.mark();
+      view.keys("\x1b");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\r");
+      const [, plain] = await view.after(/(http:\/\/127\.0\.0\.1:\d+\/)/u, mark);
+      if (!plain) throw new Error("Missing plaintext listener after disabling HTTPS on loopback.");
+      expect((await fetch(plain, { signal: AbortSignal.timeout(2000) })).status).toBe(200);
+      await expect(get("127.0.0.1")).rejects.toThrow();
+      mark = view.mark();
+      view.keys("\x1b[B\r");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\x1b[B\x1b[B\r");
+      await view.after(/> Listen address/u, mark);
+      mark = view.mark();
+      view.keys("\x1b[B\x1b[B\x1b[B\r");
+      await view.after(/HTTPS: On/u, mark);
+      mark = view.mark();
+      view.keys("\x1b");
+      await view.after(/> Start web/u, mark);
+      mark = view.mark();
+      view.keys("\r");
+      await view.after(new RegExp(origin.replaceAll(".", "\\."), "u"), mark);
+      expect(await get("127.0.0.1")).toBe(200);
+      view.keys("q");
+      expect(await view.exited).toBe(0);
+    }, { real: true, env: { OMO_WEB_PORT: String(port), OMO_WEB_DATA: "data" } });
+  }, 28_000);
 
 test.skipIf(!supported)("Confirming starts exactly one unprotected child and asks again after Stop", async () => {
   await terminalFixture(84, 24, false, async view => {

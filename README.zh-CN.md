@@ -20,9 +20,9 @@ cd /path/to/your/project
 omo-web
 ```
 
-如果连不上 [npm](https://www.npmjs.com/package/omo-web)，可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载 `.tgz`，再运行 `npm install -g ./omo-web-0.1.0.tgz`。`omo-web` 在交互终端打开 TUI，可以选目录、启动、打开浏览器和停止服务。脚本用 `omo-web serve` 直接启动。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。
+如果连不上 [npm](https://www.npmjs.com/package/omo-web)，且有仓库访问权限，可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) 下载 `.tgz`，再运行 `npm install -g ./omo-web-0.1.1.tgz`。在交互终端运行 `omo-web`，用方向键和回车选择工作目录、进入「访问设置」或启动服务。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。运行中要改设置，先停止服务；访问设置会保留，工作目录编辑只对本次 TUI 会话有效。脚本用 `omo-web serve` 直接启动。
 
-也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载原来的 Bun 运行包，或从源码运行最新版：
+也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) 下载 Bun 运行包，或从源码运行最新版：
 
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
@@ -73,7 +73,9 @@ Web 和 CLI 使用同一 OmO profile 时，可继续同一份会话日志。终�
 
 ## 外地访问
 
-默认只监听本机。跨设备访问使用 `0.0.0.0` 和 HTTPS，打开 `OMO_WEB_ORIGIN` 指定的真实地址，而不是 `0.0.0.0`。推荐通过 VPN 并设置密码；可用 `omo-web password-file <路径>` 生成密码文件，浏览器登录用户名为 `omo`。无密码只适合能限制连接对象的私网：能连接的人可以读会话并操作本机。
+默认只监听本机。在「访问设置」可以改密码、独立开关密码和 HTTPS、生成 SSL 自签证书，并选择仅本机、指定 IPv4 网卡或全部 IPv4（`0.0.0.0`）。生成证书需要 `PATH` 上的 OpenSSL 1.1.1+；请打开启动器显示的 HTTPS 地址，并在访问设备上核验证书。浏览器登录用户名为 `omo`。
+
+非本机监听必须使用 HTTPS。选网卡不会改防火墙，也不会限制客户端来源，推荐通过 VPN 并设置密码。无密码只适合能限制连接对象的私网：能连接的人可以读会话并操作本机。
 
 [Linux 和 Windows 的远程配置](docs/usage.md#密码与远程访问) · [环境变量](docs/usage.md#环境变量)
 

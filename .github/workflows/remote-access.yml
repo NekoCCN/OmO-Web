@@ -70,3 +70,9 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'private password.txt'
           & $launcher password-file $path
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $path)) { throw 'Installed omo-web failed to create its password file' }
+          if (-not $IsWindows) {
+            $env:OMO_WEB_TEST_TLS = '1'
+            $env:OMO_TUI_INSTALLED_CLI = Join-Path $prefix 'lib/node_modules/omo-web/bin/omo-web.js'
+            bun test ./test/npm-tui.test.ts -t 'Password changes|TUI generates' --timeout 30000
+            exit $LASTEXITCODE
+          }

@@ -4,6 +4,9 @@ import { statSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { stripVTControlCharacters } from "node:util";
+import { loadLauncherSettings } from "./launcher-settings.js";
+import { generateCertificate } from "./launcher-tls.js";
+import { interfaceAddresses, isRemoteAddress, loopbackAddress, wildcardAddress } from "./listen-address.js";
 import { cliTr } from "./locale.js";
 
 const CSI = "\x1b[";
@@ -15,10 +18,8 @@ const CONFIG_PREFIX = "OmO Web config: ";
 const START_MS = 30_000;
 const STOP_MS = 4_000;
 const REMOTE_WARNING = cliTr("警告：无密码保护", "Warning: No password protection");
-const REMOTE_RISK = [
-  cliTr("0.0.0.0 无密码访问", "0.0.0.0 without a password"),
-  cliTr("能连上的人可访问 OmO 和工作目录。", "Anyone who connects can access OmO and your working directories."),
-];
+const REMOTE_RISK = cliTr("能连上的人可访问 OmO 和工作目录。",
+  "Anyone who connects can access OmO and your working directories.");
 const windows = process.platform === "win32";
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const controls = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
@@ -139,17 +140,25 @@ export async function startTui({ entry, version }) {
   const color = process.env.NO_COLOR === undefined;
   const ink = (sgr, text) => color ? `${CSI}${sgr}m${text}${CSI}0m` : text;
   const cwd = process.cwd();
-  const unprotected = process.env.OMO_WEB_HOST === "0.0.0.0" && !process.env.OMO_WEB_PASSWORD_FILE;
-  const optedIn = process.env.OMO_WEB_ALLOW_UNAUTHENTICATED === "1";
+  const settings = await loadLauncherSettings(process.env);
+  let env = settings.effectiveEnv();
+  const address = () => env.OMO_WEB_HOST ?? loopbackAddress;
+  const unprotected = () => isRemoteAddress(address()) && !env.OMO_WEB_PASSWORD_FILE;
+  const optedIn = () => env.OMO_WEB_ALLOW_UNAUTHENTICATED === "1";
+  const hasPassword = () => Boolean(env.OMO_WEB_PASSWORD_FILE);
+  const hasHttps = () => Boolean(env.OMO_WEB_TLS_CERT && env.OMO_WEB_TLS_KEY && env.OMO_WEB_ORIGIN);
+  const switchLabel = on => on ? cliTr("开", "On") : cliTr("关", "Off");
   let workspaces;
   let draft;
+  let saving;
+  let networks = [];
   let pasting = false;
   let selected = 0;
   let server;
   let url;
   let phase = "idle";
   let stopped = false;
-  let notice = "";
+  let notice = settings.warning;
   let exitCode;
   let settle;
   let paint;
@@ -158,8 +167,10 @@ export async function startTui({ entry, version }) {
   const directoriesLabel = cliTr("工作目录", "Working directories");
   const quitAction = [cliTr("退出", "Quit"), () => quit(0)];
   const stopAction = [cliTr("停止服务", "Stop web"), stopWeb];
+  const backAction = [cliTr("返回", "Back"), () => go("idle")];
   const menus = {
-    idle: [[cliTr("启动服务", "Start web"), requestStart], [directoriesLabel, editWorkspaces], quitAction],
+    idle: [[cliTr("启动服务", "Start web"), requestStart], [directoriesLabel, editWorkspaces],
+      [cliTr("访问设置", "Access settings"), () => go("settings")], quitAction],
     confirming: [
       [cliTr("返回", "Back"), backFromConfirmation],
       [cliTr("仅本次无密码启动", "Start once without a password"), () => startWeb(true)],
@@ -171,6 +182,8 @@ export async function startTui({ entry, version }) {
   const status = {
     idle: [() => notice ? cliTr("待机 / 见提示", "Idle / see notice")
       : stopped ? cliTr("已停止", "Stopped") : cliTr("待机", "Idle"), "36"],
+    settings: [() => cliTr("访问设置", "Access settings"), "36;1"],
+    networks: [() => cliTr("监听地址", "Listen address"), "36;1"],
     confirming: [() => cliTr("确认远程访问", "Confirm remote access"), "33;1"],
     starting: [() => cliTr("启动中", "Starting"), "33;1"],
     ready: [() => cliTr("监听中", "Listening"), "32;1"],
@@ -184,10 +197,30 @@ export async function startTui({ entry, version }) {
     width: Math.min(72, (output.columns || 80) - 4),
     height: Math.max(1, (output.rows || 24) - 1),
   });
-  const riskLines = width => REMOTE_RISK.flatMap(line => fold(line, width));
+  const riskLines = width => [cliTr(`${address()} 无密码访问`, `${address()} without a password`), REMOTE_RISK]
+    .flatMap(line => fold(line, width));
   const confirmationFits = ({ width, height }) => width >= 32 && riskLines(width).length + 2 <= height;
-  const activeMenu = dimensions => phase === "confirming" && !confirmationFits(dimensions)
-    ? menus.confirming.slice(0, 1) : menus[phase];
+  function activeMenu(dimensions) {
+    if (phase === "settings") return [
+      [cliTr(`监听地址：${address()}`, `Listen address: ${address()}`), () => {
+        networks = interfaceAddresses();
+        go("networks");
+      }],
+      [cliTr(`密码：${switchLabel(hasPassword())}`, `Password: ${switchLabel(hasPassword())}`), togglePassword],
+      [cliTr("设置 / 修改密码", "Set / change password"), editPassword],
+      [cliTr(`HTTPS：${switchLabel(hasHttps())}`, `HTTPS: ${switchLabel(hasHttps())}`), toggleHttps],
+      [cliTr("生成 SSL 自签证书", "Generate self-signed SSL certificate"), editCertificate],
+      backAction,
+    ];
+    if (phase === "networks") return [
+      [cliTr(`仅本机 (${loopbackAddress})`, `Loopback only (${loopbackAddress})`), () => chooseAddress(loopbackAddress)],
+      [cliTr(`全部 IPv4 网卡 (${wildcardAddress})`, `All IPv4 interfaces (${wildcardAddress})`), () => chooseAddress(wildcardAddress)],
+      ...networks.map(({ name, address: ip, cidr }) =>
+        [`${cidr ?? ip} — ${name}`, () => chooseAddress(ip)]),
+      [cliTr("返回", "Back"), () => go("settings")],
+    ];
+    return phase === "confirming" && !confirmationFits(dimensions) ? menus.confirming.slice(0, 1) : menus[phase];
+  }
 
   function render() {
     paint = undefined;
@@ -210,29 +243,34 @@ export async function startTui({ entry, version }) {
       ink("36", `+${"-".repeat(width)}+`),
     ] : fold(`OmO Web / ${label}`, width).map(line => ink(tone, line));
     const short = text => fold(text, width)[0];
-    const editorTitle = ink("1", short(cliTr("编辑目录", "Edit directories")));
+    const editorTitle = draft && ink("1", short(draft.title));
     const menu = activeMenu(dimensions);
     const focus = Math.min(selected, menu.length - 1);
     const actions = menu.map(([action], index) => index === focus
       ? ink("7;1", short(`> ${action} `)) : short(`  ${action}`));
     const message = notice ? fold(notice, width).slice(0, 2).map(line => ink("33;1", line)) : [];
-    const warning = unprotected && (optedIn || server) && phase !== "confirming"
+    const warning = unprotected() && (optedIn() || server) && phase !== "confirming"
       ? fold(REMOTE_WARNING, width).map(line => ink("33;1", line)) : [];
     const risk = phase === "confirming" && menu.length > 1
       ? riskLines(width).map(line => ink("33;1", line)) : [];
     let editor;
     let lines;
     if (draft) {
-      editor = editorLine(draft, Math.max(2, width - 2));
+      editor = editorLine(draft.masked ? { ...draft, text: "*".repeat(draft.text.length) } : draft, Math.max(2, width - 2));
       lines = [...header, "", editorTitle, `> ${editor}`, "",
-        ...fold(cliTr(`用 "${delimiter}" 分隔路径，留空使用启动目录。`,
-          `Separate paths with "${delimiter}". Empty uses the launch directory.`), width),
+        ...fold(draft.hint, width),
         ...message, "", ...fold(cliTr("Enter 确认 / Esc 取消 / Ctrl+U 清空", "Enter confirm / Esc cancel / Ctrl+U clear"), width)];
     } else if (phase === "confirming") {
       lines = [...header, "", ...risk, "", ...actions, "",
         ...fold(menu.length > 1
           ? cliTr("↑/↓ 移动 / Enter 选择 / Esc 返回", "Up/Down move / Enter select / Esc back")
           : cliTr("请放大终端以查看风险提示。", "Enlarge the terminal to review the risk."), width)];
+    } else if (phase === "settings" || phase === "networks") {
+      const hint = phase === "networks" ? cliTr("选择监听网卡，不会修改防火墙规则。", "Select a listen interface; firewall rules are unchanged.")
+        : cliTr("Enter 修改 · 保存后下次启动生效 · Esc 返回", "Enter to edit · Applies on the next start · Esc back");
+      const origin = phase === "settings" && hasHttps() ? fold(cliTr(`HTTPS 地址：${env.OMO_WEB_ORIGIN}`,
+        `HTTPS URL: ${env.OMO_WEB_ORIGIN}`), width) : [];
+      lines = [...header, "", ...actions, "", ...message, ...origin, ...fold(hint, width)];
     } else {
       const paths = activePaths();
       const urlRows = url ? fold(url, Math.max(2, width - 2)) : [];
@@ -242,7 +280,11 @@ export async function startTui({ entry, version }) {
       const directories = paths.length ? paths.slice(0, pathCount).map(path => `  ${pathLabel(path, width - 2)}`)
         : [short(cliTr("  （未配置）", "  (none configured)"))];
       if (paths.length > pathCount) directories.push(short(cliTr(`  另有 ${paths.length - pathCount} 个`, `  +${paths.length - pathCount} more`)));
-      lines = [...header, ...warning, "", ...details, ink("1", short(directoriesLabel)), ...directories,
+      const connection = phase === "idle" ? [
+        short(cliTr(`  ${address()} · ${hasHttps() ? "HTTPS" : "HTTP"} · 密码${switchLabel(hasPassword())}`,
+          `  ${address()} · ${hasHttps() ? "HTTPS" : "HTTP"} · Password ${switchLabel(hasPassword())}`)),
+      ] : [];
+      lines = [...header, ...warning, "", ...details, ...connection, ink("1", short(directoriesLabel)), ...directories,
         "", ...actions, ...message, "", ...fold(cliTr("↑/↓ 移动 / Enter 选择 / Q 退出", "Up/Down move / Enter select / Q quit"), width)];
     }
     for (let blank = lines.lastIndexOf(""); lines.length > height && blank >= 0; blank = lines.lastIndexOf("")) {
@@ -257,7 +299,11 @@ export async function startTui({ entry, version }) {
         lines = [...risk, ...actions];
       } else {
         const compactStatus = ink(tone, short(`OmO Web / ${label}`));
-        lines = warning.length && height > 1
+        if (phase === "settings" || phase === "networks") {
+          const slots = Math.max(1, height - 1 - message.length);
+          const first = Math.max(0, Math.min(focus - Math.floor(slots / 2), actions.length - slots));
+          lines = height > 1 ? [compactStatus, ...actions.slice(first, first + slots), ...message] : [actions[focus]];
+        } else lines = actions.length > height ? [actions[focus]] : warning.length && height > 1
           ? [compactStatus, ...warning.slice(0, Math.max(1, height - 2)), actions[focus]]
           : [...actions, ...message, compactStatus];
       }
@@ -270,9 +316,120 @@ export async function startTui({ entry, version }) {
     paint ??= setImmediate(render);
   }
 
+  function go(next) {
+    phase = next;
+    selected = 0;
+    notice = "";
+  }
+
+  function runSetting(action) {
+    notice = cliTr("正在保存…", "Saving…");
+    saving = Promise.resolve().then(action).then(message => {
+      env = settings.effectiveEnv();
+      notice = message ?? cliTr("已保存，下次启动生效。", "Saved. Applies on the next start.");
+    }).catch(error => {
+      if (!(error instanceof Error)) throw error;
+      notice = error.message;
+    }).finally(() => {
+      saving = undefined;
+      if (exitCode !== undefined) settle(exitCode);
+      else redraw();
+    });
+    redraw();
+  }
+
+  function chooseAddress(host) {
+    runSetting(async () => {
+      await settings.save({ OMO_WEB_HOST: host, OMO_WEB_ALLOW_UNAUTHENTICATED: null });
+      go("settings");
+    });
+  }
+
+  function togglePassword() {
+    runSetting(async () => {
+      if (!await settings.setPasswordEnabled(!hasPassword())) {
+        editPassword();
+        return "";
+      }
+    });
+  }
+
+  function editPassword() {
+    draft = {
+      masked: true, text: "", cursor: 0, title: cliTr("新密码", "New password"),
+      hint: cliTr("20–128 个可打印 ASCII 字符，输入仅显示星号。", "20–128 printable ASCII characters. Input is masked."),
+      submit(password) {
+        if (!/^[\x20-\x7e]{20,128}$/u.test(password)) {
+          notice = cliTr("请使用 20–128 个可打印 ASCII 字符。", "Use 20–128 printable ASCII characters.");
+          return;
+        }
+        runSetting(async () => {
+          await settings.changePassword(password);
+          draft = undefined;
+        });
+      },
+    };
+    notice = "";
+  }
+
+  function toggleHttps() {
+    runSetting(async () => {
+      if (!await settings.setHttpsEnabled(!hasHttps())) {
+        editCertificate();
+        return "";
+      }
+    });
+  }
+
+  function editCertificate() {
+    let current;
+    try {
+      if (env.OMO_WEB_ORIGIN) current = new URL(env.OMO_WEB_ORIGIN).hostname;
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+    }
+    const text = current ?? (address() === wildcardAddress ? interfaceAddresses()[0]?.address ?? loopbackAddress : address());
+    draft = {
+      text, cursor: text.length, title: cliTr("证书主机名", "Certificate host"),
+      hint: cliTr("浏览器使用的 IP 或 DNS 名。需 OpenSSL；请核验证书。",
+        "Browser IP or DNS name. Requires OpenSSL. Verify the certificate."),
+      submit(host) {
+        runSetting(async () => {
+          const path = await generateCertificate(settings, host, Number(env.OMO_WEB_PORT ?? "4317"));
+          draft = undefined;
+          return cliTr(`证书已生成：${path}`, `Certificate generated: ${path}`);
+        });
+      },
+    };
+    notice = "";
+  }
+
   function editWorkspaces() {
     const text = configured() || cwd;
-    draft = { text, cursor: text.length };
+    draft = {
+      text, cursor: text.length, title: cliTr("编辑目录", "Edit directories"),
+      hint: cliTr(`用 "${delimiter}" 分隔路径，留空使用启动目录。`,
+        `Separate paths with "${delimiter}". Empty uses the launch directory.`),
+      submit: applyWorkspaces,
+    };
+    notice = "";
+  }
+
+  function applyWorkspaces(text) {
+    const paths = text.split(delimiter).filter(Boolean).map(path => resolve(cwd, path));
+    for (const path of paths) {
+      try {
+        if (statSync(path, { throwIfNoEntry: false })?.isDirectory()) continue;
+        notice = cliTr(`不是目录：${path}`, `Not a directory: ${path}`);
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        notice = cliTr(`无法使用目录 (${error.code ?? "?"})：${path}`,
+          `Cannot use directory (${error.code ?? "?"}): ${path}`);
+      }
+      return;
+    }
+    workspaces = paths.join(delimiter);
+    draft = undefined;
     notice = "";
   }
 
@@ -281,43 +438,34 @@ export async function startTui({ entry, version }) {
       draft = undefined;
       notice = "";
     } else if (!pasting && (key.name === "return" || key.name === "enter")) {
-      const paths = draft.text.split(delimiter).filter(Boolean).map(path => resolve(cwd, path));
-      for (const path of paths) {
-        try {
-          if (statSync(path, { throwIfNoEntry: false })?.isDirectory()) continue;
-          notice = cliTr(`不是目录：${path}`, `Not a directory: ${path}`);
-        } catch (error) {
-          if (!(error instanceof Error)) throw error;
-          notice = cliTr(`无法使用目录 (${error.code ?? "?"})：${path}`,
-            `Cannot use directory (${error.code ?? "?"}): ${path}`);
-        }
-        return;
-      }
-      workspaces = paths.join(delimiter);
-      draft = undefined;
-      notice = "";
+      draft.submit(draft.text);
     } else {
       const { text: value, cursor } = draft;
       const left = value.slice(0, cursor), right = value.slice(cursor);
       const previous = () => cursor - (glyphs(left).at(-1)?.length ?? 0);
       const next = () => cursor + (glyphs(right)[0]?.length ?? 0);
-      if (!pasting && key.ctrl && key.name === "u") draft = { text: "", cursor: 0 };
+      if (!pasting && key.ctrl && key.name === "u") Object.assign(draft, { text: "", cursor: 0 });
       else if (!pasting && key.name === "left") draft.cursor = previous();
       else if (!pasting && key.name === "right") draft.cursor = next();
       else if (!pasting && key.name === "home") draft.cursor = 0;
       else if (!pasting && key.name === "end") draft.cursor = value.length;
       else if (!pasting && key.name === "backspace") {
-        draft = { text: value.slice(0, previous()) + right, cursor: previous() };
+        Object.assign(draft, { text: value.slice(0, previous()) + right, cursor: previous() });
       } else if (!pasting && key.name === "delete") draft.text = left + value.slice(next());
       else if (!key.ctrl && !key.meta && text && text === safeText(text) && value.length + text.length <= 8192) {
-        draft = { text: left + text + right, cursor: cursor + text.length };
+        Object.assign(draft, { text: left + text + right, cursor: cursor + text.length });
       } else return;
       notice = "";
     }
   }
 
   function requestStart() {
-    if (unprotected && !optedIn) {
+    if (settings.warning) {
+      notice = settings.warning;
+    } else if (settings.hasListenerOverride && isRemoteAddress(address()) && !hasHttps()) {
+      notice = cliTr("非本机监听必须启用 HTTPS。请在访问设置中启用或生成证书。",
+        "Remote listening requires HTTPS. Enable it or generate a certificate in Access settings.");
+    } else if (unprotected() && !optedIn()) {
       phase = "confirming";
       selected = 0;
     } else startWeb();
@@ -333,13 +481,13 @@ export async function startTui({ entry, version }) {
     selected = 0;
     notice = "";
     redraw();
-    const env = {
-      ...process.env,
+    const serverEnv = {
+      ...env,
       ...(workspaces === undefined ? {} : { OMO_WEB_WORKSPACES: workspaces }),
       ...(confirmed ? { OMO_WEB_ALLOW_UNAUTHENTICATED: "1" } : {}),
     };
     const child = spawn("bun", ["--no-env-file", entry], {
-      env, stdio: ["ignore", "pipe", "pipe"], detached: !windows, windowsHide: true,
+      env: serverEnv, stdio: ["ignore", "pipe", "pipe"], detached: !windows, windowsHide: true,
     });
     let errorMessage;
     let configMessage;
@@ -434,12 +582,13 @@ export async function startTui({ entry, version }) {
     if (exitCode !== undefined) return;
     exitCode = code;
     if (server) stopWeb();
-    else settle(code);
+    else if (!saving) settle(code);
   }
 
   function onKey(text, key) {
     if (exitCode !== undefined || !key) return;
     if (key.ctrl && key.name === "c") return quit(130);
+    if (saving) return;
     if (key.name === "paste-start" || key.name === "paste-end") {
       pasting = key.name === "paste-start";
       return;
@@ -447,6 +596,7 @@ export async function startTui({ entry, version }) {
     if (draft) editKey(text, key);
     else if (pasting) return;
     else if (key.name === "escape" && phase === "confirming") backFromConfirmation();
+    else if (key.name === "escape" && (phase === "settings" || phase === "networks")) go(phase === "settings" ? "idle" : "settings");
     else if (key.name === "q" || key.name === "escape") return quit(0);
     else {
       const menu = activeMenu(viewport());

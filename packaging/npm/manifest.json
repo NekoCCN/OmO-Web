@@ -18,5 +18,5 @@
     "url": "https://github.com/NekoCCN/OmO-Web/issues"
   },
   "keywords": ["omo-native", "bun", "local-first", "workbench"],
-  "files": ["bin/omo-web.js", "bin/tui.js", "bin/locale.js", "bin/windows-password.js", "dist/app.js", "dist/server.js", "public"]
+  "files": ["bin/*.js", "dist/app.js", "dist/server.js", "public"]
 }
