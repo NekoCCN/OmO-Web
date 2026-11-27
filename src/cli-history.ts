@@ -11,8 +11,14 @@ import { WorkspaceAccess } from "./workspace-access.ts";
  * Scan and read budgets. list() stats every candidate, ranks newest first,
  * then fully parses only what fits: at most maxListFiles files and
  * maxListBytes aggregate content bytes, returning at most maxSessions
- * summaries. Single files above maxFileBytes are skipped by list() and
- * rejected by read(). read() returns at most maxMessages messages.
+ * summaries. Journals above maxFileBytes skip the full parse: list()
+ * summarizes them from bounded head/tail windows (first and last
+ * maxHeaderBytes, complete JSONL records only) so an oversized named journal
+ * stays discoverable, while read() still refuses the full transcript and
+ * branch/resume admission keeps its own bounded header checks. Sampling
+ * misses renames that land strictly between the two windows; names found in
+ * the tail window win over head names, otherwise the workspace cwd is shown.
+ * read() returns at most maxMessages messages.
  */
 export const CLI_HISTORY_LIMITS = {
   maxFileBytes: 8 * 1024 * 1024,
@@ -138,16 +144,25 @@ export class CliHistory {
     for (const candidate of candidates) {
       if (sessions.length >= CLI_HISTORY_LIMITS.maxSessions ||
         parsed >= CLI_HISTORY_LIMITS.maxListFiles || bytes >= CLI_HISTORY_LIMITS.maxListBytes) break;
-      if (candidate.size > CLI_HISTORY_LIMITS.maxFileBytes) continue;
       try {
         if (!await this.#rootMatches(candidate.file)) continue;
-        const loaded = await this.#loadContent(candidate.file.path);
-        parsed += 1;
-        bytes += loaded.bytes;
-        if (loaded.cwd !== candidate.file.root || !await this.#rootMatches(candidate.file)) continue;
-        sessions.push({ id: loaded.sessionId, name: nameOf(loaded.entries, loaded.cwd),
-          cwd: loaded.cwd, updatedAt: loaded.updatedAt, nativeSessionId: loaded.sessionId,
-          ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
+        if (candidate.size <= CLI_HISTORY_LIMITS.maxFileBytes) {
+          const loaded = await this.#loadContent(candidate.file.path);
+          parsed += 1;
+          bytes += loaded.bytes;
+          if (loaded.cwd !== candidate.file.root || !await this.#rootMatches(candidate.file)) continue;
+          sessions.push({ id: loaded.sessionId, name: nameOf(loaded.entries, loaded.cwd),
+            cwd: loaded.cwd, updatedAt: loaded.updatedAt, nativeSessionId: loaded.sessionId,
+            ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
+        } else {
+          const oversized = await this.#summarizeOversized(candidate.file.path);
+          parsed += 1;
+          bytes += oversized.sampledBytes;
+          if (oversized.cwd !== candidate.file.root || !await this.#rootMatches(candidate.file)) continue;
+          sessions.push({ id: oversized.sessionId, name: oversized.name,
+            cwd: oversized.cwd, updatedAt: oversized.updatedAt, nativeSessionId: oversized.sessionId,
+            ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
+        }
       } catch {
         continue;
       }
@@ -286,6 +301,54 @@ export class CliHistory {
       await handle?.close().catch(() => undefined);
     }
   }
+
+  /** Bounded summary for a journal above maxFileBytes: header plus newest sampled
+   * rename from the first and last maxHeaderBytes windows, complete records
+   * only. Never reads the body between the windows and never projects messages.
+   * A journal that shrank to the full-parse cap after listing is skipped here
+   * and picked up on the next refresh. Sampling misses renames strictly between
+   * the windows, falling back to the workspace cwd. The caller charges
+   * sampledBytes against list budgets and revalidates cwd and workspace. */
+  async #summarizeOversized(path: string): Promise<{ readonly sessionId: string;
+    readonly cwd: string; readonly name: string; readonly updatedAt: number; readonly sampledBytes: number }> {
+    const window = CLI_HISTORY_LIMITS.maxHeaderBytes;
+    let handle: FileHandle | undefined;
+    try {
+      handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      const target = await handle.stat();
+      if (!target.isFile() || target.size <= CLI_HISTORY_LIMITS.maxFileBytes) throw invalid();
+      const headText = await readAt(handle, 0, window);
+      const cut = headText.lastIndexOf("\n");
+      if (cut < 0) throw invalid();
+      const { header, entries } = parse(headText.slice(0, cut));
+      if (!header || typeof header.cwd !== "string") throw invalid();
+      const tailLen = Math.min(target.size - window, window);
+      const tailText = await readAt(handle, target.size - tailLen, tailLen);
+      const first = tailText.indexOf("\n");
+      const tailEntries: WireObject[] = [];
+      for (const lineText of (first < 0 ? "" : tailText.slice(first + 1)).split("\n")) {
+        if (!lineText.trim()) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(lineText);
+        } catch {
+          continue;
+        }
+        const entry = record(parsed);
+        if (typeof entry.id !== "string" || !entry.id || entry.type === "session") continue;
+        tailEntries.push(entry);
+      }
+      return { sessionId: header.id as string, cwd: header.cwd,
+        name: nameOf([...entries, ...tailEntries], header.cwd),
+        updatedAt: Math.floor(target.mtimeMs), sampledBytes: window + tailLen };
+    } catch (error) {
+      if (error instanceof WebError) throw error;
+      if ((error as NodeJS.ErrnoException)?.code === "ELOOP") throw invalid();
+      throw notFound();
+    } finally {
+      await handle?.close().catch(() => undefined);
+    }
+  }
 }
 
 /** Native per-cwd journal bucket under `<profile>/sessions`. Shared by discovery and
@@ -343,6 +406,19 @@ async function readPrefix(handle: FileHandle, cap: number): Promise<string> {
     chunks.push(Buffer.from(scratch.subarray(0, bytesRead)));
     total += bytesRead;
     if (total >= cap) break;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function readAt(handle: FileHandle, offset: number, length: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const scratch = Buffer.allocUnsafe(16384);
+  while (total < length) {
+    const { bytesRead } = await handle.read(scratch, 0, Math.min(scratch.length, length - total), offset + total);
+    if (bytesRead === 0) break;
+    chunks.push(Buffer.from(scratch.subarray(0, bytesRead)));
+    total += bytesRead;
   }
   return Buffer.concat(chunks).toString("utf8");
 }

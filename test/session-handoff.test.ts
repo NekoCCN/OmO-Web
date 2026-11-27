@@ -39,6 +39,15 @@ async function journal(agent: string, cwd: string, id: string, title: string, se
   return path;
 }
 
+async function bigJournal(agent: string, cwd: string, id: string, title: string): Promise<string> {
+  const dir = join(agent, "sessions", `--${cwd.slice(1).replace(/[/\\:]/g, "-")}--`);
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `history-${id.slice(0, 8)}.jsonl`);
+  await writeFile(path, line(headerOf(id, cwd)) + line(nameEntry(null, title)) +
+    line(userEntry("u-big", null, "x".repeat(9 * 1024 * 1024))));
+  return path;
+}
+
 async function prepareDirs() {
   const root = await mkdtemp(join(tmpdir(), "omo-handoff-http-"));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
@@ -48,9 +57,14 @@ async function prepareDirs() {
   return { root, agent, cwd };
 }
 
-async function launchHttp(held: readonly string[] = [], { profile = true } = {}) {
+async function launchHttp(held: readonly string[] = [], { profile = true, prime }: {
+  readonly profile?: boolean;
+  readonly prime?: (dirs: { readonly root: string; readonly agent: string; readonly cwd: string }) =>
+    Promise<readonly string[]>;
+} = {}) {
   const { root, agent, cwd } = await prepareDirs();
-  if (held.length) process.env.SESSION_HANDOFF_HELD = held.join(",");
+  const primed = prime ? await prime({ root, agent, cwd }) : [];
+  if (held.length || primed.length) process.env.SESSION_HANDOFF_HELD = [...held, ...primed].join(",");
   if (profile) process.env.SESSION_HANDOFF_PROFILE = agent;
   const dataDir = join(root, "web");
   const app = await startApp({
@@ -126,6 +140,44 @@ describe("sequential handoff HTTP routes", () => {
     expect((await resumed.json()).session.id).toBe(webId);
     expect((await (await client.get("/api/sessions")).json()).sessions[0])
       .toMatchObject({ id: webId, active: true });
+  });
+
+  test("oversized journals resume through the opaque key with capped preview", async () => {
+    const nativeId = crypto.randomUUID();
+    const client = await launchHttp([], { prime: async ({ agent, cwd }) => {
+      await bigJournal(agent, cwd, nativeId, "Oversized HTTP history");
+      return [];
+    } });
+    const history = await (await client.get("/api/cli-history")).json();
+    expect(history.available).toBe(true);
+    expect(history.sessions).toHaveLength(1);
+    expect(history.sessions[0]).toMatchObject({ name: "Oversized HTTP history", cwd: client.cwd, adopted: false });
+    expect(JSON.stringify(history)).not.toContain(nativeId);
+    const opaque = String(history.sessions[0].id);
+    const preview = await client.get(`/api/cli-history/${opaque}`);
+    expect(preview.status).toBe(400);
+    expect(await preview.json()).toMatchObject({ code: "history_too_large" });
+    const resumed = await client.post(`/api/cli-history/${opaque}/resume`, {});
+    expect(resumed.status).toBe(200);
+    expect((await resumed.json()).session)
+      .toMatchObject({ active: true, cwd: client.cwd, name: "Oversized HTTP history" });
+    const again = await (await client.get("/api/cli-history")).json();
+    expect(again.sessions).toMatchObject([{ id: opaque, adopted: true }]);
+  });
+
+  test("held oversized journals refuse resume without publishing a bookmark", async () => {
+    const nativeId = crypto.randomUUID();
+    const client = await launchHttp([], { prime: async ({ agent, cwd }) => {
+      const source = await bigJournal(agent, cwd, nativeId, "Held oversized history");
+      return [source];
+    } });
+    const history = await (await client.get("/api/cli-history")).json();
+    expect(history.sessions).toMatchObject([{ name: "Held oversized history", cwd: client.cwd }]);
+    const opaque = String(history.sessions[0].id);
+    const refused = await client.post(`/api/cli-history/${opaque}/resume`, {});
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({ code: "session_held" });
+    expect((await (await client.get("/api/sessions")).json()).sessions).toEqual([]);
   });
 
   test("resume rejects strict bodies and unknown keys before touching the engine", async () => {

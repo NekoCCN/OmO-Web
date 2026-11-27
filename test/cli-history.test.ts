@@ -220,7 +220,9 @@ describe("CliHistory", () => {
     await writeSession(agentDir, ws, `2026-11-20T00-00-04-000Z_${big}.jsonl`,
       header(big, ws) + msg("g1", null, "user", filler), 1_700_000_004_000);
     const history = new CliHistory(agentDir, [ws]);
-    expect((await history.list()).sessions).toEqual([]);
+    expect((await history.list()).sessions).toEqual([
+      { id: big, name: ws, cwd: ws, updatedAt: 1_700_000_004_000 },
+    ]);
     const tooLarge = await history.read(big).catch(error => error);
     expect(tooLarge).toBeInstanceOf(WebError);
     expect((tooLarge as WebError).status).toBe(400);
@@ -240,5 +242,100 @@ describe("CliHistory", () => {
       (m as { content?: { text?: unknown }[] }).content?.[0]?.text);
     expect(texts[0]).toBe("m50");
     expect(texts.at(-1)).toBe(`m${CLI_HISTORY_LIMITS.maxMessages + 49}`);
+  });
+});
+
+describe("CliHistory oversized journals", () => {
+  const isoBig = "2026-11-20T00:00:00.000Z";
+  const rename = (id: string, parentId: string | null, name: string) =>
+    line({ type: "session_info", id, parentId, timestamp: isoBig, name });
+  const tooLargeOf = async (history: CliHistory, id: string) =>
+    history.read(id).catch(error => error);
+
+  test("discovers oversized journals by bounded head scan and keeps full preview capped", async () => {
+    const { agentDir, ws } = await setup();
+    const t0 = 1_700_000_010_000;
+    const id = "10101010-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const filler = "x".repeat(CLI_HISTORY_LIMITS.maxFileBytes + 4096);
+    await writeSession(agentDir, ws, `2026-11-20T00-00-10-000Z_${id}.jsonl`,
+      header(id, ws) + rename("s1", null, "Big Early Title") + msg("m1", null, "user", filler), t0);
+    const small = "20202020-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    await writeSession(agentDir, ws, `2026-11-20T00-00-11-000Z_${small}.jsonl`,
+      header(small, ws) + msg("n1", null, "user", "small hello"), t0 - 1000);
+    const history = new CliHistory(agentDir, [ws]);
+    const result = await history.list();
+    expect(result.available).toBe(true);
+    expect(result.sessions.find(session => session.id === id))
+      .toMatchObject({ id, name: "Big Early Title", cwd: ws });
+    expect(result.sessions.find(session => session.id === small))
+      .toMatchObject({ id: small, name: ws, cwd: ws });
+    const refused = await tooLargeOf(history, id);
+    expect(refused).toBeInstanceOf(WebError);
+    expect((refused as WebError).status).toBe(400);
+    expect((refused as WebError).code).toBe("history_too_large");
+    const reread = await history.read(small);
+    expect(reread.messages).toHaveLength(1);
+  });
+
+  test("prefers the newest sampled rename from the tail window", async () => {
+    const { agentDir, ws } = await setup();
+    const t0 = 1_700_000_011_000;
+    const id = "30303030-cccc-4ccc-8ccc-cccccccccccc";
+    await writeSession(agentDir, ws, `2026-11-20T00-00-12-000Z_${id}.jsonl`,
+      header(id, ws) + rename("s1", null, "Big Early Title") +
+      msg("m1", null, "user", "a".repeat(CLI_HISTORY_LIMITS.maxFileBytes + 64)) +
+      rename("s2", "m1", "Big Renamed Title"), t0);
+    const result = await new CliHistory(agentDir, [ws]).list();
+    expect(result.sessions.find(session => session.id === id))
+      .toMatchObject({ id, name: "Big Renamed Title", cwd: ws });
+  });
+
+  test("falls back to cwd when the only rename lies outside sampled windows", async () => {
+    const { agentDir, ws } = await setup();
+    const t0 = 1_700_000_012_000;
+    const id = "40404040-dddd-4ddd-8ddd-dddddddddddd";
+    await writeSession(agentDir, ws, `2026-11-20T00-00-13-000Z_${id}.jsonl`,
+      header(id, ws) + msg("m1", null, "user", "a".repeat(4 * 1024 * 1024)) +
+      rename("s1", "m1", "Middle Only Title") +
+      msg("m2", "s1", "user", "b".repeat(4 * 1024 * 1024 + 4096)), t0);
+    const result = await new CliHistory(agentDir, [ws]).list();
+    expect(result.sessions.find(session => session.id === id))
+      .toMatchObject({ id, name: ws, cwd: ws });
+  });
+
+  test("omits oversized journals whose header cwd disagrees with the bucket", async () => {
+    const { agentDir, ws } = await setup();
+    const t0 = 1_700_000_013_000;
+    const id = "50505050-eeee-4eee-8eee-eeeeeeeeeeee";
+    await writeSession(agentDir, ws, `2026-11-20T00-00-14-000Z_${id}.jsonl`,
+      header(id, join(ws, "elsewhere")) + rename("s1", null, "Elsewhere") +
+      msg("m1", null, "user", "x".repeat(CLI_HISTORY_LIMITS.maxFileBytes + 64)), t0);
+    const result = await new CliHistory(agentDir, [ws]).list();
+    expect(result.sessions.find(session => session.id === id)).toBeUndefined();
+  });
+
+  test("keeps oversized journals outside configured workspaces hidden", async () => {
+    const { agentDir, ws } = await setup();
+    const other = join(ws, "..", "elsewhere");
+    await mkdir(join(agentDir, "sessions", sessionDirName(other)), { recursive: true });
+    const foreign = "60606060-ffff-4fff-8fff-ffffffffffff";
+    await writeSession(agentDir, other, `2026-11-20T00-00-15-000Z_${foreign}.jsonl`,
+      header(foreign, other) + rename("s1", null, "Foreign Big") +
+      msg("m1", null, "user", "x".repeat(CLI_HISTORY_LIMITS.maxFileBytes + 64)), 1_700_000_014_000);
+    const history = new CliHistory(agentDir, [ws]);
+    expect((await history.list()).sessions).toEqual([]);
+    const refused = await tooLargeOf(history, foreign);
+    expect(refused).toBeInstanceOf(WebError);
+    expect((refused as WebError).status).toBe(404);
+  });
+
+  test("resolves an owned oversized journal for resume without parsing the body", async () => {
+    const { agentDir, ws } = await setup();
+    const id = "70707070-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const sourcePath = await writeSession(agentDir, ws, `2026-11-20T00-00-16-000Z_${id}.jsonl`,
+      header(id, ws) + rename("s1", null, "Big Resumable") +
+      msg("m1", null, "user", "x".repeat(CLI_HISTORY_LIMITS.maxFileBytes + 64)), 1_700_000_015_000);
+    const source = await new CliHistory(agentDir, [ws]).branchSource(id, ws);
+    expect(source).toMatchObject({ cwd: ws, nativeSessionId: id, sourcePath });
   });
 });

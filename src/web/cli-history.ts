@@ -1,4 +1,4 @@
-import { cliHistoryPath } from "./api.ts";
+import { RequestError, cliHistoryPath } from "./api.ts";
 import type { Api, BranchSource, Session } from "./api.ts";
 import { showNativeActivity } from "./details.ts";
 import { byId, button, el, errorText, list, notice, num, object, str } from "./dom.ts";
@@ -36,13 +36,15 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
   let reading: AbortController | undefined;
   let snapshot: AbortController | undefined;
   let readable = false;
+  let previewTooLarge = false;
   let opening: symbol | undefined;
 
   function update(): void {
     const reason = resumeUnavailable();
     branch.disabled = !readable || opening !== undefined;
-    resume.disabled = branch.disabled || Boolean(reason);
-    notice(resumeStatus, opening ? tr("正在尝试打开同一会话…", "Opening the same session in Web…") : readable ? reason : "");
+    resume.disabled = (!readable && !previewTooLarge) || opening !== undefined || Boolean(reason);
+    refreshActivity.disabled = previewTooLarge || snapshot !== undefined;
+    notice(resumeStatus, opening ? tr("正在尝试打开同一会话…", "Opening the same session in Web…") : readable || previewTooLarge ? reason : "");
   }
 
   function renderList(): void {
@@ -95,13 +97,13 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
   async function loadActivity(row: HistoryRow): Promise<void> {
     snapshot?.abort();
     const request = snapshot = new AbortController();
+    update();
     const previousStatus = activity.querySelector("[data-activity-status]");
     previousStatus?.remove();
     const status = el("p", "small muted", tr("正在读取原生快照…", "Loading native snapshot…"));
     status.dataset.activityStatus = "";
     status.setAttribute("role", "status");
     activity.append(status);
-    refreshActivity.disabled = true;
     try {
       const data = await api.request(`${recordPath(row)}/activity`, undefined, request.signal);
       if (request.signal.aborted || !modal.open || selected !== row) return;
@@ -115,7 +117,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     } finally {
       if (snapshot === request) {
         snapshot = undefined;
-        refreshActivity.disabled = false;
+        update();
       }
     }
   }
@@ -131,6 +133,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       if (request.signal.aborted || !modal.open || selected !== row) return;
       const session = object(data.session);
       title.textContent = str(session.name) || row.name;
+      previewTooLarge = false;
       readable = true;
       update();
       const modified = time(num(session.updatedAt) ?? row.updatedAt);
@@ -142,7 +145,18 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
       transcript.render(entries, "", new Map());
       requestAnimationFrame(() => { if (!request.signal.aborted && modal.open && selected === row) modal.scrollTop = 0; });
     } catch (error) {
-      if (!request.signal.aborted && modal.open && selected === row) notice(box("cli-history-record-error"),
+      if (request.signal.aborted || !modal.open || selected !== row) return;
+      if (error instanceof RequestError && error.code === "history_too_large") {
+        previewTooLarge = true;
+        update();
+        title.textContent = row.name;
+        box("cli-history-record-meta").textContent = row.cwd;
+        notice(box("cli-history-record-error"),
+          tr("这条 CLI 历史记录过大，仅显示基本信息，无法预览完整对话。",
+            "This CLI history is too large to preview; only basic info is shown."));
+        return;
+      }
+      notice(box("cli-history-record-error"),
         tr(`无法读取这条记录：${errorText(error)}`, `Could not load this record: ${errorText(error)}`));
     } finally {
       if (reading === request) {
@@ -159,6 +173,7 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     snapshot = undefined;
     selected = undefined;
     readable = false;
+    previewTooLarge = false;
     opening = undefined;
     notice(resumeError);
     update();
@@ -177,13 +192,14 @@ export function cliHistory(api: Api, onClose: () => void, openBranch: (source: B
     box("cli-history-empty").hidden = true;
     title.focus({ preventScroll: true });
     modal.scrollTop = 0;
-    void loadRecord(row);
-    void loadActivity(row);
+    void loadRecord(row).then(() => {
+      if (selected === row && !previewTooLarge) void loadActivity(row);
+    });
   }
 
   filter.addEventListener("input", renderList);
   refresh.addEventListener("click", () => void loadList());
-  refreshActivity.addEventListener("click", () => { if (selected) void loadActivity(selected); });
+  refreshActivity.addEventListener("click", () => { if (selected && !previewTooLarge) void loadActivity(selected); });
   branch.addEventListener("click", () => {
     if (selected) openBranch({ kind: "history", id: selected.id, name: selected.name });
   });

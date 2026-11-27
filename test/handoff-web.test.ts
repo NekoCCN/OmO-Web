@@ -32,7 +32,8 @@ async function fixture(supported = true) {
   let resumed = false;
   const support = supported ? { supported: true } : unsupported;
   const gates: { history?: () => Promise<void>; release?: () => Promise<void>; held: boolean; busy: boolean;
-    unadopted: boolean } = { held: false, busy: false, unadopted: false };
+    unadopted: boolean; oversized?: boolean } = { held: false, busy: false, unadopted: false };
+  let activityRequests = 0;
   const sessions = () => ({ sessions: published ? [{ ...row, active }, other] : [other] });
   const snapshot = (session: typeof row) => Response.json({ session, state: { isStreaming: false, pendingDialogs: [], pendingQuestions: [] },
     messages: session.id === row.id ? [historyMessage, ...(resumed ? [{ ...historyMessage, content: "CLI 退出后保存的新消息" }] : [])] : [],
@@ -81,14 +82,20 @@ async function fixture(supported = true) {
     if (path === `/api/sessions/${otherId}`) return snapshot(other);
     if (path.startsWith("/api/sessions/") && path.endsWith("/options")) return Response.json({ models: [], levels: [], commands: [] });
     if (path === "/api/cli-history") return Response.json({ available: true, sessions: [{ ...record, adopted: !gates.unadopted }] });
-    if (path === `/api/cli-history/${historyId}`) return Response.json({ session: { ...record, adopted: !gates.unadopted }, messages: [historyMessage] });
-    if (path === `/api/cli-history/${historyId}/activity`) return Response.json({ status: "unavailable", reason: "no-agent-dir" });
+    if (path === `/api/cli-history/${historyId}`) {
+      if (gates.oversized) return Response.json({ code: "history_too_large", error: "预览受限" }, { status: 400 });
+      return Response.json({ session: { ...record, adopted: !gates.unadopted }, messages: [historyMessage] });
+    }
+    if (path === `/api/cli-history/${historyId}/activity`) {
+      activityRequests++;
+      return Response.json({ status: "unavailable", reason: "no-agent-dir" });
+    }
     if (path === "/api/cli-live") return Response.json({ available: false, sessions: [] });
     if (path === "/app.js") return new Response(script, { headers: { "Content-Type": "text/javascript" } });
     const asset = assets.get(path);
     return asset ? new Response(Bun.file(fromRoot(`public/${asset}`))) : new Response(null, { status: 404 });
   } });
-  return { url: server.url.href, gates, posted, close: () => server.stop(true) };
+  return { url: server.url.href, gates, posted, activityRequests: () => activityRequests, close: () => server.stop(true) };
 }
 
 function page(view: Bun.WebView, width: number) {
@@ -250,15 +257,42 @@ test.skipIf(!chromium)("an older host leaves history readable and handoff unavai
     await view.navigate(f.url);
     await p.history();
     await p.visible("#cli-history-resume:disabled", "在 Web 继续");
-    await p.visible("#cli-history-resume-status", "私有本机传输");
+    await p.visible("#cli-history-resume-status", "切换到 CLI 需要私有本机连接。");
     await p.click("#cli-history-dialog [data-close]");
     await p.select(otherId);
     await p.click("#manage-button");
     await p.visible("#manage-handoff:disabled", "转到 CLI");
-    await p.visible("#manage-handoff-status", "私有本机传输");
+    await p.visible("#manage-handoff-status", "切换到 CLI 需要私有本机连接。");
     expect(f.posted).toEqual([]);
   } finally { f.close(); }
 });
+
+test.skipIf(!chromium)("oversized history preview keeps explicit resume and preserves holder refusal", async () => {
+  if (!chromium) throw new Error("Set OMO_HANDOFF_CHROMIUM to an isolated Chromium executable.");
+  const f = await fixture();
+  f.gates.unadopted = true;
+  f.gates.oversized = true;
+  f.gates.held = true;
+  try {
+    using view = new Bun.WebView({ backend: { type: "chrome", url: false, path: chromium }, width: 1440 });
+    const p = page(view, 1440);
+    await view.navigate(f.url);
+    await p.visible("#cli-session-list button", record.name);
+    await p.click("#cli-session-list button");
+    await p.visible("#cli-history-record-error", "无法预览完整对话");
+    await p.visible("#cli-history-branch:disabled");
+    await p.visible("#cli-history-refresh-activity:disabled");
+    expect(await view.evaluate('document.querySelector("#cli-history-empty").hidden')).toBe(true);
+    expect(f.posted).toEqual([]);
+    await p.click("#cli-history-resume:not(:disabled)");
+    await p.visible("#cli-history-resume-error", held.error);
+    f.gates.held = false;
+    await p.click("#cli-history-resume:not(:disabled)");
+    await p.visible("#messages article", historyMessage.content);
+    expect(f.activityRequests()).toBe(0);
+    expect(f.posted).toEqual(Array.from({ length: 2 }, () => ({ path: `/api/cli-history/${historyId}/resume`, body: {} })));
+  } finally { f.close(); }
+}, 15000);
 
 test.skipIf(!chromium)("fresh page discovers unadopted CLI sessions in the sidebar", async () => {
   if (!chromium) throw new Error("Set OMO_HANDOFF_CHROMIUM to an isolated Chromium executable.");

@@ -136,3 +136,32 @@ test("omitting the profile disables CLI history", async () => {
   expect(response.status).toBe(200);
   expect(await response.json()).toEqual({ available: false, sessions: [] });
 });
+
+test("oversized CLI journals stay discoverable with capped preview and gated resume", async () => {
+  const { agent, cwd, get, post } = await launch();
+  const bigId = "cccccccc-3333-4333-8333-333333333333";
+  const dir = join(agent, "sessions", `--${cwd.slice(1).replace(/[/\\:]/g, "-")}--`);
+  const timestamp = new Date(updatedAt).toISOString();
+  const entries = [
+    { type: "session", version: 3, id: bigId, timestamp, cwd },
+    { type: "session_info", id: "s-big", parentId: null, timestamp, name: "Oversized synthetic history" },
+    { type: "message", id: "m-big", parentId: null, timestamp,
+      message: { role: "user", content: `filler ${"x".repeat(9 * 1024 * 1024)}`, timestamp: updatedAt } },
+  ];
+  await writeFile(join(dir, `private-${bigId}.jsonl`), `${entries.map(entry => JSON.stringify(entry)).join("\n")}\n`);
+  const listing = await get("/api/cli-history");
+  expect(listing.status).toBe(200);
+  const { sessions } = await listing.json();
+  const big = sessions.find((session: { name?: unknown }) => session.name === "Oversized synthetic history");
+  expect(big).toMatchObject({ name: "Oversized synthetic history", cwd });
+  expect(JSON.stringify(sessions)).not.toContain(bigId);
+  expect(JSON.stringify(sessions)).not.toContain("private-");
+  const preview = await get(`/api/cli-history/${big.id}`);
+  expect(preview.status).toBe(400);
+  expect(await preview.json()).toMatchObject({ code: "history_too_large" });
+  const activity = await get(`/api/cli-history/${big.id}/activity`);
+  expect(activity.status).toBe(400);
+  const resume = await post(`/api/cli-history/${big.id}/resume`, {});
+  expect(resume.status).toBe(503);
+  expect(await resume.json()).toMatchObject({ code: "engine_unavailable" });
+});
