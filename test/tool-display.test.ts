@@ -195,13 +195,70 @@ browserTest("Loading older calls moves the open tool back into source order with
   });
 });
 
+browserTest("Loading the originating turn groups the same open, focused call in place", async () => {
+  await withWorkbench(1440, [
+    { role: "user", content: "检查原始调用顺序。" },
+    assistant(call("first", "read", { path: "src/first.ts" }), call("second", "read", { path: "src/second.ts" })),
+    result("first", "read", false, "第一份读取结果"),
+    result("second", "read", false, "第二份读取结果"),
+    ...Array.from({ length: 77 }, (_, index) => ({ id: `tail-${index}`, role: "user", content: `合成历史 ${index}` })),
+  ], async browser => {
+    expect(await browser.evaluate(`document.querySelectorAll(".tool-group").length`)).toBe(0);
+    await browser.evaluate(`(() => {
+      document.querySelector("#transcript").scrollTop = 0;
+      window.historicalCall = document.querySelectorAll(".tool-details")[1];
+      window.historicalCall.querySelector("summary").focus({ preventScroll: true });
+    })()`);
+    await browser.press("Enter");
+    const regrouped = await browser.evaluate<{ topDelta: number }>(`(() => {
+      const call = window.historicalCall;
+      const summary = call.querySelector("summary");
+      const top = summary.getBoundingClientRect().top;
+      document.querySelector(".transcript-load").click();
+      const group = call.closest(".tool-group");
+      return {
+        original: group?.querySelectorAll(".tool-details")[1] === call,
+        focused: document.activeElement === summary,
+        disclosed: group?.open && call.open,
+        output: call.querySelector(".tool-output").innerText,
+        topDelta: summary.getBoundingClientRect().top - top,
+      };
+    })()`);
+    expect(regrouped).toMatchObject({ original: true, focused: true, disclosed: true, output: "第二份读取结果" });
+    expect(Math.abs(regrouped.topDelta)).toBeLessThanOrEqual(1);
+  });
+});
+
 browserTest("The tool trace focuses a visible group summary, and Tab reaches each original call after opening", async () => {
+  const members = [
+    call("source", "read", { path: "src/web/transcript.ts" }),
+    call("duplicate", "read", { path: "src/web/transcript.ts" }),
+    call("unsafe-path", "read", { path: "../../ghp_private-path" }),
+    call("tests", "find", { path: "test", pattern: "private-find-query" }),
+    call("third-path", "grep", { path: "docs/third-path.md", pattern: "private-grep-query" }),
+    call("script", "eval", { language: "js", code: "private-group-script" }),
+    call("web", "webfetch", { url: "https://example.org/private-group-url" }),
+  ];
   await withWorkbench(1440, [
     { role: "user", content: "检查源文件和测试。" },
-    assistant(call("source", "read", { path: "src/web/transcript.ts" }), call("tests", "find", { path: "test" })),
-    result("source", "read", false, "源文件输出"),
-    result("tests", "find", false, "测试文件输出"),
+    assistant(...members),
+    ...members.map(member => result(String(member.id), String(member.name), false, `private-group-result-${member.id}`)),
   ], async browser => {
+    const ledger = await browser.evaluate(`(() => {
+      const group = document.querySelector(".tool-group");
+      const head = group.firstElementChild;
+      const list = group.querySelector(":scope > ol");
+      return {
+        summary: head.innerText, open: group.open,
+        paths: [...head.querySelectorAll(".tool-group-path")].map(path => path.textContent),
+        states: [...(list?.children ?? [])].map(row => row.querySelector(".tool-details").dataset.state),
+        rows: [...(list?.children ?? [])].map(row => row.tagName),
+      };
+    })()`);
+    expect(ledger).toMatchObject({
+      open: false, paths: ["src/web/transcript.ts", "test"], states: Array(7).fill("success"), rows: Array(7).fill("LI"),
+      summary: expect.not.stringMatching(/private-|third-path|example\.org|JavaScript/),
+    });
     await browser.click("#trace-jump-tool");
     const groupFocused = await browser.evaluate(`document.activeElement.matches(".tool-group-summary")`);
     expect(groupFocused).toBe(true);
@@ -214,8 +271,19 @@ browserTest("The tool trace focuses a visible group summary, and Tab reaches eac
     await browser.press("Enter");
     await browser.press("Tab");
     const second = await browser.evaluate(`document.activeElement.querySelector(".tool-target")?.textContent`);
-    expect([first, second]).toEqual(["src/web/transcript.ts", "test"]);
+    await browser.press("Tab");
+    const third = await browser.evaluate(`document.activeElement.querySelector(".tool-target")?.textContent`);
+    await browser.press("Tab");
+    const fourth = await browser.evaluate(`document.activeElement.querySelector(".tool-target")?.textContent`);
+    await browser.press("Enter");
+    const fourthReceipt = await browser.evaluate(`document.activeElement.parentElement.querySelector(".tool-output").innerText`);
+    await browser.evaluate(`document.querySelector(".tool-group-body .tool-summary").focus()`);
+    await browser.press("Enter");
+    const openRows = await browser.evaluate(`Array.from(document.querySelectorAll(".tool-group .tool-details[open] .tool-output"), row => row.innerText)`);
+    expect([first, second, third, fourth]).toEqual(["src/web/transcript.ts", "src/web/transcript.ts", "", "test"]);
     expect(opened).toBe(true);
+    expect(fourthReceipt).toBe("private-group-result-tests");
+    expect(openRows).toEqual(["private-group-result-source", "private-group-result-tests"]);
   });
 });
 
@@ -252,10 +320,11 @@ browserTest("Mixed execution results group by outer tool and keep their focused 
   ], async (browser, emit) => {
     const groups = await browser.evaluate(`Array.from(document.querySelectorAll(".tool-group"), group => ({
       open: group.open,
-      label: group.querySelector(".tool-group-summary").textContent,
+      label: group.querySelector(".tool-group-summary").textContent.trim(),
       chips: Array.from(group.querySelectorAll(".tool-group-kind"), chip => chip.textContent),
     }))`);
-    expect(groups).toEqual([{ open: false, label: expect.stringContaining("2 项成功"), chips: ["Ctx Execute ×1", "Eval ×1"] }]);
+    expect(groups).toEqual([{ open: false, label: "工具调用 · 2 项成功 Ctx Execute ×1 Eval ×1",
+      chips: ["Ctx Execute ×1", "Eval ×1"] }]);
     await capture(browser, "desktop-light-mixed-ledger");
     await browser.click("#trace-jump-tool");
     await browser.press("Enter");
@@ -285,15 +354,17 @@ browserTest("Category rows expose only recognized operations and reserve the Bas
   const payloads = [
     ["memory", { command: "str_replace", file_path: "private-memory-path", new_string: "private-memory-data" }],
     ["bash", { command: "printf private-command" }],
-    ["todo", { op: "init", list: [{ phase: "private-phase", items: ["private-first", "private-second"] }] }],
+    ["todowrite", { op: "init", list: [{ phase: "private-phase", items: ["核对渲染", "保留草稿"] }] }],
     ["todo", { op: "private-unknown-op", items: ["private-don't-count"] }],
     ["read", { path: "src" }],
     ["apply_patch", { patch: "private-edit" }],
-    ["task", { task_summary: "private-agent-prompt" }],
+    ["task", { subagent_type: "delivery-worker", run_in_background: false, task_id: "private-task-identity",
+      task_summary: "private-agent-prompt" }],
     ["web_search", { query: "private-query" }],
     ["mcp_plugin:custom", { command: "private-plugin-value" }],
     ["shell", { command: "private-shell-command" }],
     ["powershell", { command: "private-powershell-command" }],
+    ["todowrite", { todos: [{ content: "private-alternate-title", status: "completed" }] }],
   ] as const;
   await withWorkbench(390, [
     { role: "user", content: "检查工具类别" },
@@ -322,18 +393,22 @@ browserTest("Category rows expose only recognized operations and reserve the Bas
         folded: rows.every(row => !row.open),
       };
     })()`);
-    expect(view.categories).toEqual(["memory", "terminal", "todo", "todo", "inspect", "modify", "agent", "web", "unknown", "terminal", "terminal"]);
+    expect(view.categories).toEqual(["memory", "terminal", "todo", "todo", "inspect", "modify", "agent", "web", "unknown", "terminal", "terminal", "todo"]);
     expect(view.operations.slice(0, 4)).toEqual(["替换", "运行命令", "初始化 · 2 项", ""]);
-    expect(view.operations.slice(-2)).toEqual(["运行命令", "运行命令"]);
+    expect(view.operations.slice(-3)).toEqual(["运行命令", "运行命令", ""]);
     expect(new Set(view.glyphs).size).toBe(8);
     expect(view.glyphs.every(Boolean)).toBe(true);
     expect(view.forced && view.folded).toBe(true);
     expect(view.summaries.join(" ")).not.toMatch(/private-/);
+    expect(view.summaries[2]).toContain("核对渲染");
+    expect(view.summaries[2]).not.toContain("保留草稿");
+    expect(view.summaries[6]).toMatch(/delivery-worker.*前台/s);
     expect(view.summaries[1]).toContain("失败");
     expect(view.summaries[1]).toContain("Bash");
     expect(view.summaries[8]).toContain("mcp_plugin:custom");
     expect(view.summaries[9]).toContain("Shell");
     expect(view.summaries[10]).toContain("PowerShell");
+    expect(view.summaries[11]).toMatch(/^Todo\s*成功$/u);
     await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="terminal"][data-state="error"] > summary').focus()`);
     await browser.press("Enter");
     await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="terminal"][open] .tool-raw-args > summary').focus()`);
@@ -351,22 +426,36 @@ browserTest("Category rows expose only recognized operations and reserve the Bas
       font: expect.stringContaining("monospace"), inside: true, rawCommand: "printf private-command", output: "private-result", overflow: 0 });
     await browser.press("Enter");
     await capture(browser, "phone-forced-colors-terminal");
+    await browser.evaluate(`Array.from(document.querySelectorAll(".tool-summary")).at(-1).focus()`);
+    await browser.press("Enter");
+    await browser.press("Tab");
+    expect(await browser.evaluate(`document.activeElement.matches(".tool-todo-receipt > summary")`)).toBe(true);
+    await browser.press("Enter");
+    const alternate = await browser.evaluate(`(() => {
+      const card = document.activeElement.closest(".tool-details");
+      return { receipt: card.querySelector(".tool-output").innerText, shows: card.innerText,
+        items: card.querySelectorAll(".tool-todo-board li").length };
+    })()`);
+    expect(alternate).toMatchObject({ receipt: "private-result", items: 0,
+      shows: expect.not.stringMatching(/private-alternate-title|completed/) });
   });
 });
 
 browserTest("Todo separates the submitted list from the receipt; Memory disclosures stay opt-in", async () => {
   await withWorkbench(390, [
     { role: "user", content: "检查工具回执" },
-    assistant(call("todo-detail", "todo", { op: "init", list: [{ phase: "检查", items: ["核对渲染", "保留草稿"] }] }),
+    assistant(call("todo-detail", "todo", { op: "init", list: [{ phase: "检查", items: ["核对渲染", "保留草稿"] },
+      { phase: "验收", items: ["记录检查结论"] }] }),
       call("memory-detail", "memory", { command: "update_description", file_path: "private-project.md", description: "private-description" })),
     result("todo-detail", "todo", false, "原生待办回执"),
     result("memory-detail", "memory", false, "原生记忆回执"),
   ], async browser => {
-    const read = (kind: string) => browser.evaluate<{ submitted: string[]; hasReceipt: boolean; rawVisible: boolean; shown: string }>(`(() => {
+    const read = (kind: string) => browser.evaluate<{ submitted: string[]; starts: number[]; hasReceipt: boolean; rawVisible: boolean; shown: string }>(`(() => {
       const fold = document.querySelector('.tool-details[data-tool-kind="${kind}"]');
       const args = fold.querySelector('.tool-raw-args');
       return { submitted: [...fold.querySelectorAll('.tool-todo-list li')].map(item => item.innerText),
-        hasReceipt: fold.querySelector('.tool-output').innerText.includes("原生"),
+        starts: [...fold.querySelectorAll('.tool-todo-list ol')].map(list => list.start),
+        hasReceipt: fold.innerText.includes("原生"),
         rawVisible: !!args?.querySelector('pre').getClientRects().length,
         shown: fold.innerText };
     })()`);
@@ -374,19 +463,166 @@ browserTest("Todo separates the submitted list from the receipt; Memory disclosu
       await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="${kind}"] > summary').focus()`);
       await browser.press("Enter");
       const opened = await read(kind);
-      expect(opened).toMatchObject({ submitted: kind === "todo" ? ["核对渲染", "保留草稿"] : [], hasReceipt: kind === "todo", rawVisible: false });
+      expect(opened).toMatchObject({
+        submitted: kind === "todo" ? ["核对渲染", "保留草稿", "记录检查结论"] : [],
+        starts: kind === "todo" ? [1, 3] : [], hasReceipt: false, rawVisible: false,
+      });
       expect(opened.shown).not.toMatch(/private-|\"items\"/);
-      if (kind === "memory") {
-        await browser.evaluate(`document.querySelector('.tool-memory-receipt > summary').focus()`);
-        await browser.press("Enter");
-        const receipt = await read(kind);
-        expect(receipt).toMatchObject({ hasReceipt: true, rawVisible: false });
-        expect(receipt.shown).toContain("原生记忆回执");
-      }
+      await browser.press("Tab");
+      expect(await browser.evaluate(`document.activeElement.matches('.tool-${kind}-receipt > summary') &&
+        document.activeElement.innerText.includes('原始回执')`)).toBe(true);
+      await browser.press("Enter");
+      const receipt = await read(kind);
+      expect(receipt).toMatchObject({ hasReceipt: true, rawVisible: false });
+      expect(receipt.shown).toContain(kind === "todo" ? "原生待办回执" : "原生记忆回执");
       await browser.evaluate(`document.querySelector('.tool-details[data-tool-kind="${kind}"] .tool-raw-args > summary').focus()`);
       await browser.press("Enter");
       expect(await read(kind)).toMatchObject({ rawVisible: true });
     }
+  });
+});
+
+browserTest("Todo recap projects one recognizable title, never a private payload or inferred progress", async () => {
+  const privateTitles = [
+    "ghp_ExampleCredential", "API token CedarValue", "/home/demo/notes.md",
+    "cat secrets", "printf hidden", "echo attic", "aVeryLongUngroupedOpaqueCredential123", "l".repeat(72),
+  ];
+  const invalidTitles = ["路径\u202e伪装", "核对\n隐私", 42];
+  const batches: readonly (readonly [Wire, RegExp])[] = [
+    [{ op: "init", list: [{ phase: "未公开阶段", items: ["核对主题配色", "记录验收结果"] }, { phase: "交付", items: ["整理截图"] }] },
+      /初始化.*3 项.*核对主题配色.*另 2 项/s],
+    [{ op: "append", items: ["Audit mobile spacing", "记录宽屏结果"] }, /追加.*2 项.*Audit mobile spacing.*另 1 项/s],
+    [{ op: "init", items: privateTitles }, /^Todo\s*初始化 · 8 项\s*未见结果$/u],
+    [{ op: "init", items: [] }, /^Todo\s*初始化 · 0 项\s*未见结果$/u],
+    ...privateTitles.map(item => [{ op: "append", items: [item] }, /^Todo\s*追加 · 1 项\s*未见结果$/u] as const),
+    ...invalidTitles.map(item => [{ op: "append", items: [item] }, /^Todo\s*追加\s*未见结果$/u] as const),
+  ];
+  const requests: readonly (readonly [Wire, RegExp])[] = [
+    [{ op: "start", task: "核对测试结果" }, /^Todo\s*请求开始\s*核对测试结果\s*成功$/u],
+    [{ op: "done", task: "整理交付清单" }, /^Todo\s*请求完成\s*整理交付清单\s*成功$/u],
+    [{ op: "drop", task: "Review temporary drafts" }, /^Todo\s*请求放弃\s*Review temporary drafts\s*成功$/u],
+    [{ op: "rm", task: "核对旧版说明" }, /^Todo\s*请求移除\s*核对旧版说明\s*成功$/u],
+    [{ op: "start", phase: "切换阶段" }, /^Todo\s*请求开始\s*成功$/u],
+    [{ op: "done", task: privateTitles[0] }, /^Todo\s*请求完成\s*成功$/u],
+    [{ op: "drop", task: "\nAudit mobile spacing" }, /^Todo\s*请求放弃\s*成功$/u],
+    [{ op: "rm", task: { title: "查看所有档案" } }, /^Todo\s*请求移除\s*成功$/u],
+    [{ op: "start", task: "记录项目改动", phase: "切换阶段" }, /^Todo\s*请求开始\s*成功$/u],
+  ];
+  const cases = [...batches, ...requests];
+  await withWorkbench(390, [
+    { role: "user", content: "检查待办投影。" },
+    assistant(...cases.map(([args], index) => call(`todo-${index}`, "todo", args))),
+    ...requests.map((_, index) => result(`todo-${batches.length + index}`, "todo", false, "回执中的文字不代表进度")),
+  ], async browser => {
+    const summaries = await browser.evaluate<string[]>(`Array.from(document.querySelectorAll(".tool-summary"), row => row.innerText)`);
+    expect(summaries).toEqual(cases.map(([, recap]) => expect.stringMatching(recap)));
+    expect(summaries.join(" ")).not.toMatch(/未公开阶段|记录验收结果|整理截图|记录宽屏结果|切换阶段|回执中的文字/);
+    const requested = await browser.evaluate(`Array.from(document.querySelectorAll(".tool-details")).slice(${batches.length}).map(row => {
+      row.open = true;
+      return { text: row.querySelector(".fold-body").innerText, items: row.querySelectorAll(".tool-todo-board li, input[type=checkbox]").length };
+    })`);
+    expect(requested).toEqual(Array(requests.length).fill({ text: expect.stringContaining("非当前进度"), items: 0 }));
+  });
+});
+
+browserTest("Ctx and Agent batches show only validated submission counts, independently of the receipt", async () => {
+  const commands = ["printf private-command-one", "printf private-command-two"];
+  const queries = ["private-query-one", "private-query-two", "private-query-three"];
+  const task = { prompt: "private-task-prompt", name: "private-task-name", task_summary: "private-task-caption" };
+  const tasks = [{ ...task, category: "quick" }, { ...task, subagent_type: "delivery-worker" }];
+  const cases: readonly (readonly [string, Wire, string, string])[] = [
+    ["ctx_batch", { commands, queries }, "批量查询", "提交 2 条命令 · 3 条查询"],
+    ["ctx_batch", { commands, queries: [{ query: "private-query-object" }] }, "批量查询", ""],
+    ["ctx_batch", { commands: [], queries }, "批量查询", ""],
+    ["ctx_batch", { commands: Array(25).fill(commands[0]), queries }, "批量查询", ""],
+    ["ctx_batch", { input: { commands, queries } }, "批量查询", ""],
+    ["task", { tasks, run_in_background: true }, "派发任务", "提交 2 项任务"],
+    ["task", { tasks: [task], category: "quick" }, "派发任务", "提交 1 项任务"],
+    ["task", { tasks, prompt: "private-mixed-prompt", category: "quick" }, "派发任务", ""],
+    ["task", { tasks: [{ category: "quick" }] }, "派发任务", ""],
+    ["task", { tasks: [{ ...task, category: "quick", subagent_type: "delivery-worker" }] }, "派发任务", ""],
+    ["task", { tasks: Array(25).fill(tasks[0]) }, "派发任务", ""],
+    ["task", { input: { tasks } }, "派发任务", ""],
+  ];
+  await withWorkbench(1440, [
+    { role: "user", content: "查看提交批次和实际工具回执。" },
+    assistant(...cases.flatMap(([name, args], index) => [call(`batch-${index}`, name, args), text("下一条记录。")])),
+    ...cases.map(([name], index) => result(`batch-${index}`, name, false, `批次回执 ${index}：未报告子项状态`)),
+  ], async browser => {
+    const shown = await browser.evaluate<{ inputs: string[][]; details: string[]; receipts: string[] }>(`(() => {
+      const rows = [...document.querySelectorAll(".tool-details")];
+      const inputs = rows.map(row => [row.querySelector(".tool-operation").innerText, row.querySelector(".tool-preview").textContent]);
+      rows.forEach(row => row.open = true);
+      return { inputs, details: rows.map(row => row.innerText),
+        receipts: rows.map(row => row.querySelector(".tool-output").innerText) };
+    })()`);
+    expect(shown.inputs).toEqual(cases.map(([, , operation, preview]) => [operation, preview]));
+    expect(shown.details.join(" ")).not.toMatch(/private-|后台|quick|delivery-worker/);
+    expect(shown.receipts).toEqual(cases.map((_, index) => `批次回执 ${index}：未报告子项状态`));
+  });
+});
+
+browserTest("Opaque or markup-shaped plugin names do not replace the generic evidence label", async () => {
+  const names = ["mcp_addon:inspect", "mcp_addon:ghp_ExampleCredential", "<img src=x onerror=alert(1)>"];
+  await withWorkbench(390, [
+    { role: "user", content: "检查扩展证据。" },
+    assistant(...names.map((name, index) => call(`plugin-${index}`, name, { value: `plugin evidence ${index}` }))),
+    ...names.map((name, index) => result(`plugin-${index}`, name, false, `plugin output ${index}`)),
+  ], async browser => {
+    const recaps = await browser.evaluate(`Array.from(document.querySelectorAll(".tool-summary"), row => row.innerText)`);
+    expect(recaps).toEqual([
+      expect.stringMatching(/mcp_addon:inspect.*成功/s),
+      expect.stringMatching(/工具调用.*成功/s),
+      expect.stringMatching(/工具调用.*成功/s),
+    ]);
+    const opened = await browser.evaluate<{ text: string; injected: boolean; customScene: boolean }[]>(`Array.from(document.querySelectorAll(".tool-details"), row => {
+      row.open = true;
+      return { text: row.innerText, injected: !!row.querySelector("img, a"), customScene: !!row.querySelector(".tool-scene") };
+    })`);
+    expect(opened).toEqual(names.map((_, index) => ({
+      text: expect.stringMatching(new RegExp("plugin evidence " + index + ".*plugin output " + index, "s")),
+      injected: false, customScene: false,
+    })));
+    expect(opened.map(row => row.text).join(" ")).not.toMatch(/ExampleCredential|<img/);
+  });
+});
+
+browserTest("Web read exposes a validated hostname as text and keeps URLs and queries in evidence", async () => {
+  const addresses = [
+    "HTTPS://Docs.Example.org:8443/private-address?token=hidden#private-fragment",
+    "https://owner:password@private-credentials.example/",
+    "https://@private-empty-user.example/",
+    "file://private-local.example/read",
+    "//private-relative.example/path",
+    "https:private-repaired.example/path",
+    "https://private-ambiguous.example\\route",
+    "https://private-control.example/\nfragment",
+  ];
+  await withWorkbench(1440, [
+    { role: "user", content: "核对网页证据。" },
+    assistant(...addresses.map((url, index) => call(`web-${index}`, "webfetch", { url })),
+      call("search-web", "web_search", { query: "private-search-query" })),
+    result("web-0", "webfetch", false, "网页读取原文"),
+    result("search-web", "web_search", false, "网页查询原文"),
+  ], async browser => {
+    const recap = await browser.evaluate(`Array.from(document.querySelectorAll(".tool-summary"), row => row.innerText)`);
+    expect(recap).toEqual([
+      expect.stringMatching(/读取网页.*docs\.example\.org.*成功/s),
+      ...addresses.slice(1).map(() => expect.stringMatching(/^Web\s*读取网页\s*未见结果$/u)),
+      expect.stringMatching(/^Web\s*网页搜索\s*成功$/u),
+    ]);
+    const before = await browser.evaluate(`location.href`);
+    await browser.evaluate(`document.querySelector(".tool-summary").focus()`);
+    await browser.press("Enter");
+    const opened = await browser.evaluate(`(() => {
+      const card = document.querySelector(".tool-details[open]");
+      return { link: !!card.querySelector("a"), scene: card.querySelector(".tool-web")?.innerText,
+        rawVisible: !!card.querySelector(".tool-raw-args pre")?.getClientRects().length, address: location.href };
+    })()`);
+    expect(opened).toEqual({ link: false, scene: expect.stringContaining("网页读取原文"), rawVisible: false, address: before });
+    await browser.evaluate(`document.querySelector(".tool-details[open] .tool-raw-args > summary").focus()`);
+    await browser.press("Enter");
+    expect(await browser.evaluate(`JSON.parse(document.querySelector(".tool-raw-args[open] pre").innerText).url`)).toBe(addresses[0]);
   });
 });
 
@@ -454,25 +690,33 @@ browserTest("Tool scenes render the connected wire as distinct workspaces withou
             commands: [bash, ps].map(row => row.querySelector(".tool-command-preview code")?.textContent),
             terminalOutput: [bash, ps].map(row => attached(row, ".tool-terminal .tool-output")),
             phases: [...todo.querySelectorAll(".tool-todo-board ol")].map(lane => [...lane.children].map(item => item.innerText)),
-            todoReceipt: visible(todo, "待办工具回执") && visible(todo, "2 · 原生工具输出"),
-            memoryAudit: attached(memory, ".tool-memory-audit") && visible(memory, "替换"),
+            todoReceipt: !visible(todo, "2 · 原生工具输出") && attached(todo, ".tool-todo-receipt > summary"),
+            memoryAudit: attached(memory, ".tool-memory-audit") && attached(memory, ".tool-memory-receipt > summary"),
             memoryHidden: !visible(memory, "private-memory") && !attached(memory, ".tool-output"),
-            execution: [evaluate, ctx].map(row => row.querySelector(".tool-code-desk .tool-scene-meta")?.innerText),
+            execution: [evaluate, ctx].map(row => row.querySelector(".tool-summary").innerText),
             codeHidden: [evaluate, ctx].every(row => !visible(row, "-source") && !attached(row, ".tool-source pre")),
-            file: file.querySelector(".tool-file-target code")?.innerText,
-            agent: agent.querySelector(".tool-agent-routing")?.innerText,
+            file: [file.querySelector(".tool-target")?.innerText, file.querySelector(".tool-result > p")?.innerText],
+            agent: agent.querySelector(".tool-summary")?.innerText,
             agentOutput: visible(agent, "7 · 原生工具输出"),
+            repeatedLabels: [bash, ps, todo, memory, evaluate, ctx, file, agent].some(row => {
+              const scene = row.querySelector(".tool-scene");
+              return [".tool-label", ".tool-operation", ".tool-target", ".tool-preview"].some(selector => {
+                const title = row.querySelector(".tool-summary " + selector)?.textContent;
+                return title && scene.innerText.includes(title);
+              });
+            }),
             extraHidden: ![evaluate, ctx, file, agent, plugin].some(row => /private-/.test(row.innerText)),
             generic: !plugin.querySelector(".tool-scene") && visible(plugin, "generic-call-args") && visible(plugin, "8 · 原生工具输出"),
           };
         })()`);
         expect(shown).toMatchObject({
-          summaries: expect.not.stringMatching(/private-|printf|Write-Output|核对主题|quick|原生工具输出/),
+          summaries: expect.not.stringMatching(/private-|printf|Write-Output|核对输出|记录截图|原生工具输出/),
           commands: ["printf first\nprintf second", "Write-Output fixture-shell"],
           terminalOutput: [true, true], phases: [["核对主题", "核对输出"], ["记录截图"]],
           todoReceipt: true, memoryAudit: true, memoryHidden: true,
           execution: [expect.stringContaining("JavaScript"), expect.stringContaining("Python")], codeHidden: true,
-          file: "src/界面/工具.ts", agent: expect.stringContaining("quick"), agentOutput: true, extraHidden: true, generic: true,
+          file: ["src/界面/工具.ts", "文件变更回执"], agent: expect.stringMatching(/quick.*后台/s), agentOutput: true,
+          repeatedLabels: false, extraHidden: true, generic: true,
         });
         for (const [selector, token] of [
           ['[data-tool-kind="memory"] .tool-memory-receipt > summary', "private-memory-output"],

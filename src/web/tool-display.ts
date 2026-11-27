@@ -1,6 +1,7 @@
-import { codeBlock, el, list, object, pretty, str } from "./dom.ts";
+import { codeBlock, el, list, notice, object, pretty, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
-import { createToolScene } from "./tool-scenes.ts";
+import { ToolGroupView } from "./tool-group-view.ts";
+import { createToolScene, toolOutputLabels } from "./tool-scenes.ts";
 import { recapTool, toolGlyphs } from "./tool-semantics.ts";
 import type { TranscriptEntry } from "./transcript.ts";
 
@@ -48,9 +49,11 @@ export class ToolDisplay {
   private readonly label = el("span", "tool-label");
   private readonly target = el("span", "tool-target path");
   private readonly operation = el("span", "tool-operation small muted");
+  private readonly preview = el("span", "tool-preview small muted");
   private readonly status = el("span", "tool-state-text");
   private readonly icon = document.createElementNS("http://www.w3.org/2000/svg", "path");
   private readonly kindIcon = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  private readonly identity = el("p", "tool-name small muted", "工具名：");
   private readonly name = el("code");
   private readonly args = codeBlock("");
   private readonly argsSection = el("div", "stack stack--tight");
@@ -64,7 +67,7 @@ export class ToolDisplay {
   private lastName?: string;
   private lastArgs?: unknown;
   private lastOutput?: unknown;
-  private group?: { readonly node: HTMLDetailsElement; readonly count: HTMLElement; readonly kinds: HTMLElement; readonly body: HTMLElement };
+  private group?: ToolGroupView;
 
   constructor(private readonly renderOutputPart: RenderOutputPart) {
     const summary = el("summary", "tool-summary");
@@ -73,20 +76,19 @@ export class ToolDisplay {
     const subject = el("span", "tool-subject");
     const kind = glyph(this.kindIcon);
     kind.classList.add("tool-kind-icon");
-    subject.append(kind, this.label, this.operation, this.target);
+    subject.append(kind, this.label, this.operation, this.target, this.preview);
     const state = el("span", "tool-state");
     state.append(glyph(this.icon), this.status);
     summary.append(chevron, subject, state);
 
-    const name = el("p", "tool-name small muted", "工具名：");
-    name.append(this.name);
+    this.identity.append(this.name);
     this.rawArgs.append(el("summary", "", "原始参数"));
     this.argsSection.append(el("p", "small muted", "调用参数"));
     this.output.tabIndex = 0;
     this.output.setAttribute("role", "region");
     this.output.setAttribute("aria-label", "工具输出");
     this.outputSection.append(this.outputLabel, this.output, this.empty);
-    this.body.append(name);
+    this.body.append(this.identity);
     this.details.append(summary, this.body);
     this.node.append(this.details);
   }
@@ -95,47 +97,8 @@ export class ToolDisplay {
   set open(value: boolean) { this.details.open = value; }
 
   groupWith(members: readonly HTMLElement[]): HTMLDetailsElement {
-    if (!this.group) {
-      const node = el("details", "tool-group");
-      const summary = el("summary", "tool-group-summary");
-      const body = el("div", "tool-group-body");
-      const count = el("span", "tool-group-count");
-      const kinds = el("span", "tool-group-kinds");
-      summary.append(count, " ", kinds);
-      node.append(summary, body);
-      this.group = { node, count, kinds, body };
-    }
-    const { node, count, kinds, body } = this.group;
-    const totals = new Map<string, number>();
-    let inspectOnly = true;
-    let next = body.firstElementChild;
-    for (const member of members) {
-      const details = member.firstElementChild;
-      if (details instanceof HTMLElement) {
-        const name = details.dataset.groupTool;
-        if (name) totals.set(name, (totals.get(name) ?? 0) + 1);
-        inspectOnly &&= details.dataset.toolKind === "inspect";
-      }
-      if (member.parentElement !== body && (member.contains(document.activeElement) || member.querySelector(".tool-details[open]"))) {
-        node.open = true;
-      }
-      if (member !== next) body.insertBefore(member, next);
-      next = member.nextElementSibling;
-    }
-    while (next) {
-      const remaining = next.nextElementSibling;
-      next.remove();
-      next = remaining;
-    }
-    const label = `${inspectOnly ? "探查工具" : "工具调用"} · ${members.length} 项成功`;
-    if (count.textContent !== label) count.textContent = label;
-    const labels = [...totals].map(([name, total]) => `${name} ×${total}`);
-    if (kinds.textContent !== labels.join(" ")) {
-      kinds.replaceChildren(...labels.flatMap((value, index) => [
-        ...(index ? [" "] : []), el("span", "tool-group-kind", value),
-      ]));
-    }
-    return node;
+    this.group ??= new ToolGroupView();
+    return this.group.update(members);
   }
 
   update(call?: Wire, trace?: ToolTrace, result?: Wire): void {
@@ -145,13 +108,12 @@ export class ToolDisplay {
     const state = toolState(call, trace, result);
     const stateLabel = state === "unknown" && result ? "状态未知" : states[state].label;
     const recap = recapTool(name, args);
-    const { kind, label, operation, target, group } = recap;
+    const { kind, label, operation, target, preview, group } = recap;
     const kindChanged = this.details.dataset.toolKind !== kind;
     if (kindChanged) {
       this.details.dataset.toolKind = kind;
       this.kindIcon.setAttribute("d", toolGlyphs[kind]);
-      const outputLabel = kind === "memory" ? "记忆工具回执" : kind === "todo" ? "待办工具回执" :
-        kind === "agent" ? "任务工具输出" : kind === "terminal" ? "终端输出" : "输出";
+      const outputLabel = toolOutputLabels[kind];
       this.outputLabel.textContent = outputLabel;
       this.output.setAttribute("aria-label", outputLabel === "输出" ? "工具输出" : outputLabel);
       this.scene?.node.remove();
@@ -159,6 +121,7 @@ export class ToolDisplay {
       this.argsSection.remove();
       this.rawArgs.remove();
       this.scene = createToolScene(kind, this.outputSection);
+      this.body.classList.toggle("tool-generic", !this.scene);
       if (this.scene) {
         this.rawArgs.append(this.args);
         this.body.append(this.scene.node, this.rawArgs);
@@ -181,14 +144,14 @@ export class ToolDisplay {
     }
     if (this.status.textContent !== stateLabel) this.status.textContent = stateLabel;
     if (this.label.textContent !== label) this.label.textContent = label;
-    if (this.operation.textContent !== (operation ?? "")) this.operation.textContent = operation ?? "";
-    this.operation.hidden = !operation;
-    if (this.target.textContent !== (target ?? "")) this.target.textContent = target ?? "";
-    this.target.hidden = !target;
-    if (this.name.textContent !== (name || "未命名工具")) this.name.textContent = name || "未命名工具";
+    notice(this.operation, operation);
+    notice(this.target, target);
+    notice(this.preview, preview);
+    notice(this.name, kind === "unknown" || name.toLowerCase() === label.toLowerCase() ? "" : name);
+    this.identity.hidden = this.name.hidden;
 
     if (kindChanged || this.lastArgs !== args || this.lastName !== name) {
-      this.scene?.update(recap, name, args);
+      this.scene?.update?.(recap);
       this.argsSection.hidden = this.rawArgs.hidden = args === undefined;
       const code = this.args.firstElementChild;
       const formatted = pretty(args);

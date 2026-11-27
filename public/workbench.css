@@ -145,29 +145,8 @@ button.workspace-entry { color: var(--accent); }
 :is(#messages, #cli-follow-messages) > .message:is(.message--tool, .message--tool-only) { padding-block: 0; }
 #messages > .message--tool > details { grid-column: 2; }
 #messages > .message--tool-only > .message-body { grid-column: 2; }
-.message .tool-group, .message .tool-details { border-color: transparent; }
-.message .tool-group-body .tool-details,
-#messages .tool-details {
-  border-block-end-color: var(--line);
-  border-radius: 0;
-  background: transparent;
-}
-#messages .tool-group { border-color: var(--line); background: var(--rail); }
-.tool-group-summary { border-radius: inherit; font-size: var(--small); font-weight: 550; }
-.tool-group-summary::marker { color: var(--muted); }
-.tool-group-body { display: grid; gap: var(--s1); padding: 0 var(--s2) var(--s2); }
-.message .tool-summary, .message .tool-group-summary {
-  min-block-size: var(--ledger-control, var(--control));
-  padding-inline: var(--s2);
-}
 #messages .tool-details[data-state] .tool-summary {
   --trace-arrival: var(--tool-state-tint, var(--inset));
-}
-.message .tool-state {
-  min-block-size: var(--s5);
-  padding-inline: var(--s1);
-  border-radius: var(--pill);
-  background: var(--tool-state-tint, var(--inset));
 }
 #messages [id^="trace-entry-"]:focus, #trace-entry-request:focus, .request-form[data-method="question"]:focus {
   outline: var(--focus) solid var(--accent);
@@ -326,7 +305,7 @@ button.workspace-entry { color: var(--accent); }
   }
   .request-form { outline: var(--stroke) solid CanvasText; outline-offset: calc(-1 * var(--stroke)); }
   .message:has(> header):not(:is(#messages, #cli-follow-messages) > *),
-  .message :is(.tool-group, .tool-details), .metric-tile {
+  .metric-tile {
     outline: var(--stroke) solid CanvasText;
     outline-offset: calc(-1 * var(--stroke));
   }
