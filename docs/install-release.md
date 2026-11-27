@@ -21,6 +21,8 @@ Web 启动一个私有的本机 stdio 引擎子进程（`omo --mode rpc --multi-
 
 ## 用户：源码安装
 
+私有仓库的 HTTPS 克隆需要已配置 Git 凭据，且对应 GitHub 账户有仓库访问权限。
+
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
 cd OmO-Web
@@ -36,15 +38,13 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 ## 用户：发行包安装
 
-把 `VERSION` 换成实际版本号（如 `0.1.0`），把 `TAG` 换成与其对应的 Git tag（如 `v0.1.0`）。若对应 tag 尚无资产（下载 404），回退到源码安装。
+把 `VERSION` 和 `TAG` 换成实际发布的版本和标签。可在已登录的 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 页面下载两个文件，也可在有仓库访问权限的账户上登录 `gh` 后执行下例。若该版本尚未上传发行资产，可用源码安装。
 
 ```sh
 VERSION="0.1.0"
 TAG="v0.1.0"
 ARCHIVE="omo-web-$VERSION.tar.gz"
-BASE="https://github.com/NekoCCN/OmO-Web/releases/download/$TAG"
-curl -fLO "$BASE/$ARCHIVE" &&
-  curl -fLO "$BASE/$ARCHIVE.sha256" &&
+gh release download "$TAG" --repo NekoCCN/OmO-Web --pattern "$ARCHIVE" --pattern "$ARCHIVE.sha256" &&
   sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
   OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun --no-env-file "$PWD/omo-web-$VERSION/dist/server.js"
@@ -87,7 +87,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
   bun run release:pack
   tar tzf "dist/$ARCHIVE"
   (cd dist && sha256sum -c "$ARCHIVE.sha256")
-  gh release create "$TAG" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" --draft --verify-tag
+  gh release create "$TAG" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" --repo NekoCCN/OmO-Web --draft --verify-tag
 )
 ```
 

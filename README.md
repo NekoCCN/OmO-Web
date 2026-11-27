@@ -22,7 +22,7 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 ### 方式 B：发行包解压运行
 
-从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`（版本号如 `0.1.0`；若该版本尚无资产，回退到方式 A 源码安装），校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
+登录有仓库访问权限的 GitHub 账户，从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`（版本号如 `0.1.0`；若该版本尚无资产，回退到方式 A 源码安装）。校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
 
 ```sh
 VERSION="0.1.0"
