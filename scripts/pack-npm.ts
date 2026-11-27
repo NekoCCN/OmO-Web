@@ -20,6 +20,8 @@ try {
   await Promise.all([
     copyFile(join(root, "packaging/npm/omo-web.js"), bin),
     copyFile(join(root, "packaging/npm/tui.js"), join(packageDir, "bin", "tui.js")),
+    copyFile(join(root, "packaging/npm/locale.js"), join(packageDir, "bin", "locale.js")),
+    copyFile(join(root, "packaging/npm/windows-password.js"), join(packageDir, "bin", "windows-password.js")),
     copyFile(join(root, "packaging/npm/README.md"), join(packageDir, "README.md")),
     Bun.write(join(packageDir, "package.json"), `${JSON.stringify({ ...manifest, version }, null, 2)}\n`),
   ]);

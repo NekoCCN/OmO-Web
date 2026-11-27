@@ -121,8 +121,11 @@
         </div>
       </nav>
       <div id="banner" class="banner" hidden>
-        <p id="banner-text" class="error small" role="alert"></p>
-        <button type="button" class="button button--quiet" id="retry" data-en="Reconnect">重新连接</button>
+        <div class="stack stack--tight">
+          <p id="access-warning" class="small" role="alert" hidden data-en="No password: anyone who can reach this address can read sessions and run tools through OmO. Use a restricted private network.">未设密码：能访问此地址的人都能读取会话并通过 OmO 运行工具。请仅在受限私网中使用。</p>
+          <p id="banner-text" class="error small" role="alert" hidden></p>
+        </div>
+        <button type="button" class="button button--quiet" id="retry" data-en="Reconnect" hidden>重新连接</button>
       </div>
       <div class="transcript" id="transcript" tabindex="0" aria-label="对话记录" data-en-aria-label="Conversation transcript">
         <div class="conversation">

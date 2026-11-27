@@ -1,16 +1,24 @@
 // allow: SIZE_OK — The npm package ships this indivisible terminal session as one module.
 import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
-import { delimiter, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
+import { stripVTControlCharacters } from "node:util";
+import { cliTr } from "./locale.js";
 
 const CSI = "\x1b[";
 const HOME_CLEAR = `${CSI}H${CSI}2J`;
 const SHOW_CURSOR = `${CSI}?25h`;
 const HIDE_CURSOR = `${CSI}?25l`;
 const MAX_RECEIPT = 4096;
+const CONFIG_PREFIX = "OmO Web config: ";
 const START_MS = 30_000;
 const STOP_MS = 4_000;
+const REMOTE_WARNING = cliTr("警告：无密码保护", "Warning: No password protection");
+const REMOTE_RISK = [
+  cliTr("0.0.0.0 无密码访问", "0.0.0.0 without a password"),
+  cliTr("能连上的人可访问 OmO 和工作目录。", "Anyone who connects can access OmO and your working directories."),
+];
 const windows = process.platform === "win32";
 const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 const controls = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
@@ -18,6 +26,7 @@ const safeText = value => value.replace(controls, " ");
 const glyphs = text => Array.from(segmenter.segment(text), ({ segment }) => segment);
 // Reserve two cells for non-ASCII graphemes so wide paths cannot wrap at the edge.
 const cells = glyph => /^[\x20-\x7e]+$/.test(glyph) ? glyph.length : 2;
+const textWidth = text => glyphs(text).reduce((sum, glyph) => sum + cells(glyph), 0);
 
 function fold(text, width) {
   const lines = [""];
@@ -67,7 +76,7 @@ function editorLine(draft, width) {
   return `${left}${CSI}s${right}`;
 }
 
-function receiveListener(stream, onUrl) {
+function receiveLines(stream, onLine) {
   let pending = "";
   stream.setEncoding("utf8");
   stream.on("data", chunk => {
@@ -79,23 +88,42 @@ function receiveListener(stream, onUrl) {
       if (index === pieces.length - 1) break;
       const line = pending?.replace(/\r$/, "");
       pending = "";
-      // Match the actual stdout receipt as a whole line, not its sanitized display.
-      const receipt = line?.match(/^OmO Web: (https?:\/\/[^\s\\\p{Cc}\p{Cf}]+)$/u);
-      if (!receipt || receipt[0] !== line) continue;
-      try {
-        const parsed = new URL(receipt[1]);
-        if (!parsed.username && !parsed.password) onUrl(receipt[1]);
-      } catch (error) {
-        if (!(error instanceof TypeError)) throw error;
-      }
+      if (line !== undefined) onLine(line);
     }
   });
 }
 
+function receiveListener(stream, onUrl) {
+  receiveLines(stream, line => {
+    // Match the actual stdout receipt as a whole line, not its sanitized display.
+    const receipt = line.match(/^OmO Web: (https?:\/\/[^\s\\\p{Cc}\p{Cf}]+)$/u);
+    if (!receipt || receipt[0] !== line) return;
+    try {
+      const parsed = new URL(receipt[1]);
+      if (!parsed.username && !parsed.password) onUrl(receipt[1]);
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+    }
+  });
+}
+
+// Windows signals sent through Node terminate only the direct child.
+// Stop the owned server process tree so a native engine cannot outlive it.
+export function stopWindowsServer(child) {
+  if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  const taskkill = join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
+  const killer = spawn(taskkill, ["/PID", String(child.pid), "/T", "/F"], {
+    stdio: "ignore", windowsHide: true,
+  });
+  const fallback = () => {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  };
+  killer.once("error", fallback);
+  killer.once("exit", code => { if (code !== 0) fallback(); });
+}
+
 function killServerGroup(child) {
-  if (windows) {
-    child.kill("SIGKILL");
-  } else if (child.pid !== undefined) {
+  if (!windows && child.pid !== undefined) {
     try {
       process.kill(-child.pid, "SIGKILL");
     } catch (error) {
@@ -111,6 +139,8 @@ export async function startTui({ entry, version }) {
   const color = process.env.NO_COLOR === undefined;
   const ink = (sgr, text) => color ? `${CSI}${sgr}m${text}${CSI}0m` : text;
   const cwd = process.cwd();
+  const unprotected = process.env.OMO_WEB_HOST === "0.0.0.0" && !process.env.OMO_WEB_PASSWORD_FILE;
+  const optedIn = process.env.OMO_WEB_ALLOW_UNAUTHENTICATED === "1";
   let workspaces;
   let draft;
   let pasting = false;
@@ -125,28 +155,44 @@ export async function startTui({ entry, version }) {
   let paint;
   const finished = new Promise(resolve => { settle = resolve; });
 
+  const directoriesLabel = cliTr("工作目录", "Working directories");
+  const quitAction = [cliTr("退出", "Quit"), () => quit(0)];
+  const stopAction = [cliTr("停止服务", "Stop web"), stopWeb];
   const menus = {
-    idle: [["Start web", startWeb], ["Working directories", editWorkspaces], ["Quit", () => quit(0)]],
-    starting: [["Stop web", stopWeb], ["Quit", () => quit(0)]],
-    ready: [["Open browser", openBrowser], ["Stop web", stopWeb], ["Quit", () => quit(0)]],
-    stopping: [["Quit", () => quit(0)]],
+    idle: [[cliTr("启动服务", "Start web"), requestStart], [directoriesLabel, editWorkspaces], quitAction],
+    confirming: [
+      [cliTr("返回", "Back"), backFromConfirmation],
+      [cliTr("仅本次无密码启动", "Start once without a password"), () => startWeb(true)],
+    ],
+    starting: [stopAction, quitAction],
+    ready: [[cliTr("打开浏览器", "Open browser"), openBrowser], stopAction, quitAction],
+    stopping: [quitAction],
   };
   const status = {
-    idle: [() => notice ? "Idle / see notice" : stopped ? "Stopped" : "Idle", "36"],
-    starting: [() => "Starting", "33;1"],
-    ready: [() => "Listening", "32;1"],
-    stopping: [() => "Stopping", "33;1"],
+    idle: [() => notice ? cliTr("待机 / 见提示", "Idle / see notice")
+      : stopped ? cliTr("已停止", "Stopped") : cliTr("待机", "Idle"), "36"],
+    confirming: [() => cliTr("确认远程访问", "Confirm remote access"), "33;1"],
+    starting: [() => cliTr("启动中", "Starting"), "33;1"],
+    ready: [() => cliTr("监听中", "Listening"), "32;1"],
+    stopping: [() => cliTr("停止中", "Stopping"), "33;1"],
   };
   const configured = () => workspaces ?? process.env.OMO_WEB_WORKSPACES;
   const activePaths = () => configured()
     ? configured().split(delimiter).filter(Boolean).map(path => resolve(cwd, path))
     : [cwd];
+  const viewport = () => ({
+    width: Math.min(72, (output.columns || 80) - 4),
+    height: Math.max(1, (output.rows || 24) - 1),
+  });
+  const riskLines = width => REMOTE_RISK.flatMap(line => fold(line, width));
+  const confirmationFits = ({ width, height }) => width >= 32 && riskLines(width).length + 2 <= height;
+  const activeMenu = dimensions => phase === "confirming" && !confirmationFits(dimensions)
+    ? menus.confirming.slice(0, 1) : menus[phase];
 
   function render() {
     paint = undefined;
-    const columns = output.columns || 80;
-    const width = Math.min(72, columns - 4);
-    const height = Math.max(1, (output.rows || 24) - 1);
+    const dimensions = viewport();
+    const { width, height } = dimensions;
     if (width < 2) {
       output.write(HIDE_CURSOR + HOME_CLEAR);
       return;
@@ -154,9 +200,9 @@ export async function startTui({ entry, version }) {
     const [state, tone] = status[phase];
     const label = state();
     const build = fold(`v${version}`, 20)[0];
-    const title = " WEB LISTENER  ";
+    const title = cliTr(" Web 监听  ", " WEB LISTENER  ");
     const brand = "-- OmO Web ";
-    const gap = width - title.length - label.length - build.length - 1;
+    const gap = width - textWidth(title) - textWidth(label) - textWidth(build) - 1;
     const boxed = width >= 44 && gap >= 2;
     const header = boxed ? [
       ink("36;1", `+${brand}${"-".repeat(width - brand.length)}+`),
@@ -164,38 +210,58 @@ export async function startTui({ entry, version }) {
       ink("36", `+${"-".repeat(width)}+`),
     ] : fold(`OmO Web / ${label}`, width).map(line => ink(tone, line));
     const short = text => fold(text, width)[0];
-    const editorTitle = ink("1", short("Edit directories"));
-    const actions = menus[phase].map(([action], index) => index === selected
+    const editorTitle = ink("1", short(cliTr("编辑目录", "Edit directories")));
+    const menu = activeMenu(dimensions);
+    const focus = Math.min(selected, menu.length - 1);
+    const actions = menu.map(([action], index) => index === focus
       ? ink("7;1", short(`> ${action} `)) : short(`  ${action}`));
     const message = notice ? fold(notice, width).slice(0, 2).map(line => ink("33;1", line)) : [];
+    const warning = unprotected && (optedIn || server) && phase !== "confirming"
+      ? fold(REMOTE_WARNING, width).map(line => ink("33;1", line)) : [];
+    const risk = phase === "confirming" && menu.length > 1
+      ? riskLines(width).map(line => ink("33;1", line)) : [];
     let editor;
     let lines;
     if (draft) {
       editor = editorLine(draft, Math.max(2, width - 2));
       lines = [...header, "", editorTitle, `> ${editor}`, "",
-        ...fold(`Separate paths with "${delimiter}". Empty uses the launch directory.`, width),
-        ...message, "", ...fold("Enter confirm / Esc cancel / Ctrl+U clear", width)];
+        ...fold(cliTr(`用 "${delimiter}" 分隔路径，留空使用启动目录。`,
+          `Separate paths with "${delimiter}". Empty uses the launch directory.`), width),
+        ...message, "", ...fold(cliTr("Enter 确认 / Esc 取消 / Ctrl+U 清空", "Enter confirm / Esc cancel / Ctrl+U clear"), width)];
+    } else if (phase === "confirming") {
+      lines = [...header, "", ...risk, "", ...actions, "",
+        ...fold(menu.length > 1
+          ? cliTr("↑/↓ 移动 / Enter 选择 / Esc 返回", "Up/Down move / Enter select / Esc back")
+          : cliTr("请放大终端以查看风险提示。", "Enlarge the terminal to review the risk."), width)];
     } else {
       const paths = activePaths();
       const urlRows = url ? fold(url, Math.max(2, width - 2)) : [];
       const pathCount = height >= 23 ? 4 : 2;
-      const details = url ? [ink("1", short("Browser URL")), ...urlRows.slice(0, 2).map(line => `  ${line}`),
+      const details = url ? [ink("1", short(cliTr("浏览器地址", "Browser URL"))), ...urlRows.slice(0, 2).map(line => `  ${line}`),
         ...(urlRows.length > 2 ? ["  ..."] : []), ""] : [];
       const directories = paths.length ? paths.slice(0, pathCount).map(path => `  ${pathLabel(path, width - 2)}`)
-        : [short("  (none configured)")];
-      if (paths.length > pathCount) directories.push(short(`  +${paths.length - pathCount} more`));
-      lines = [...header, "", ...details, ink("1", short("Working directories")), ...directories,
-        "", ...actions, ...message, "", ...fold("Up/Down move / Enter select / Q quit", width)];
+        : [short(cliTr("  （未配置）", "  (none configured)"))];
+      if (paths.length > pathCount) directories.push(short(cliTr(`  另有 ${paths.length - pathCount} 个`, `  +${paths.length - pathCount} more`)));
+      lines = [...header, ...warning, "", ...details, ink("1", short(directoriesLabel)), ...directories,
+        "", ...actions, ...message, "", ...fold(cliTr("↑/↓ 移动 / Enter 选择 / Q 退出", "Up/Down move / Enter select / Q quit"), width)];
     }
     for (let blank = lines.lastIndexOf(""); lines.length > height && blank >= 0; blank = lines.lastIndexOf("")) {
       lines.splice(blank, 1);
     }
     // On very short terminals, prioritize the active control (or the draft).
-    if (lines.length > height) lines = draft ? [
-      ...(height > 1 ? [editorTitle] : []),
-      "> " + editor, ...message, short("Enter confirm / Esc cancel"),
-    ]
-      : [...actions, ...message, ...header];
+    if (lines.length > height) {
+      if (draft) {
+        lines = [...(height > 1 ? [editorTitle] : []), "> " + editor, ...message,
+          short(cliTr("Enter 确认 / Esc 取消", "Enter confirm / Esc cancel"))];
+      } else if (phase === "confirming") {
+        lines = [...risk, ...actions];
+      } else {
+        const compactStatus = ink(tone, short(`OmO Web / ${label}`));
+        lines = warning.length && height > 1
+          ? [compactStatus, ...warning.slice(0, Math.max(1, height - 2)), actions[focus]]
+          : [...actions, ...message, compactStatus];
+      }
+    }
     output.write(HIDE_CURSOR + HOME_CLEAR + lines.slice(0, height).map(line => ` ${line}`).join("\r\n")
       + (editor ? `${CSI}u${SHOW_CURSOR}` : ""));
   }
@@ -219,10 +285,11 @@ export async function startTui({ entry, version }) {
       for (const path of paths) {
         try {
           if (statSync(path, { throwIfNoEntry: false })?.isDirectory()) continue;
-          notice = `Not a directory: ${path}`;
+          notice = cliTr(`不是目录：${path}`, `Not a directory: ${path}`);
         } catch (error) {
           if (!(error instanceof Error)) throw error;
-          notice = `Cannot use directory (${error.code ?? "error"}): ${path}`;
+          notice = cliTr(`无法使用目录 (${error.code ?? "?"})：${path}`,
+            `Cannot use directory (${error.code ?? "?"}): ${path}`);
         }
         return;
       }
@@ -249,18 +316,36 @@ export async function startTui({ entry, version }) {
     }
   }
 
-  function startWeb() {
+  function requestStart() {
+    if (unprotected && !optedIn) {
+      phase = "confirming";
+      selected = 0;
+    } else startWeb();
+  }
+
+  function backFromConfirmation() {
+    phase = "idle";
+    selected = 0;
+  }
+
+  function startWeb(confirmed = false) {
     phase = "starting";
     selected = 0;
     notice = "";
     redraw();
-    const env = workspaces === undefined ? process.env : { ...process.env, OMO_WEB_WORKSPACES: workspaces };
+    const env = {
+      ...process.env,
+      ...(workspaces === undefined ? {} : { OMO_WEB_WORKSPACES: workspaces }),
+      ...(confirmed ? { OMO_WEB_ALLOW_UNAUTHENTICATED: "1" } : {}),
+    };
     const child = spawn("bun", ["--no-env-file", entry], {
       env, stdio: ["ignore", "pipe", "pipe"], detached: !windows, windowsHide: true,
     });
     let errorMessage;
+    let configMessage;
     const startup = setTimeout(() => {
-      errorMessage = "No listener receipt. Retry or run omo-web serve for details.";
+      errorMessage = cliTr("未收到监听地址。请重试或运行 omo-web serve 查看详情。",
+        "No listener receipt. Retry or run omo-web serve for details.");
       stopWeb();
     }, START_MS);
     server = { child, startup, killTimer: undefined };
@@ -272,10 +357,14 @@ export async function startTui({ entry, version }) {
       selected = 0;
       redraw();
     });
-    child.stderr.resume();
+    receiveLines(child.stderr, line => {
+      if (phase !== "starting" || configMessage || !line.startsWith(CONFIG_PREFIX)) return;
+      configMessage = safeText(stripVTControlCharacters(line.slice(CONFIG_PREFIX.length))).trim();
+    });
     child.once("error", error => {
-      errorMessage = error.code === "ENOENT" ? "Bun was not found on PATH. Install it from bun.sh."
-        : `Could not run Bun (${error.code ?? "error"}).`;
+      errorMessage = error.code === "ENOENT"
+        ? cliTr("PATH 中找不到 Bun。请从 bun.sh 安装。", "Bun was not found on PATH. Install it from bun.sh.")
+        : cliTr(`无法运行 Bun (${error.code ?? "?"})。`, `Could not run Bun (${error.code ?? "?"}).`);
     });
     child.once("exit", () => {
       clearTimeout(server.killTimer);
@@ -291,8 +380,8 @@ export async function startTui({ entry, version }) {
         return;
       }
       stopped = phase === "stopping" && !errorMessage;
-      notice = errorMessage ?? (stopped ? "" :
-        `Web exited (${signal ?? code}). Retry or run omo-web serve.`);
+      notice = stopped ? "" : (configMessage || errorMessage || cliTr(`Web 服务已退出 (${signal ?? code})。请重试或运行 omo-web serve。`,
+        `Web exited (${signal ?? code}). Retry or run omo-web serve.`));
       server = undefined;
       phase = "idle";
       url = undefined;
@@ -309,8 +398,15 @@ export async function startTui({ entry, version }) {
     notice = "";
     const { child, startup } = server;
     clearTimeout(startup);
-    child.kill("SIGTERM");
-    server.killTimer = setTimeout(() => killServerGroup(child), STOP_MS);
+    if (windows) {
+      stopWindowsServer(child);
+      server.killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }, STOP_MS);
+    } else {
+      child.kill("SIGTERM");
+      server.killTimer = setTimeout(() => killServerGroup(child), STOP_MS);
+    }
     redraw();
   }
 
@@ -324,7 +420,7 @@ export async function startTui({ entry, version }) {
     const browser = spawn(command, args, { stdio: "ignore", windowsHide: true, detached: !windows });
     const failed = () => {
       if (server !== current || phase !== "ready" || exitCode !== undefined) return;
-      notice = "Could not open a browser. Open the URL above.";
+      notice = cliTr("无法打开浏览器。请手动打开上方地址。", "Could not open a browser. Open the URL above.");
       redraw();
     };
     browser.once("error", failed);
@@ -350,11 +446,15 @@ export async function startTui({ entry, version }) {
     }
     if (draft) editKey(text, key);
     else if (pasting) return;
+    else if (key.name === "escape" && phase === "confirming") backFromConfirmation();
     else if (key.name === "q" || key.name === "escape") return quit(0);
-    else if (key.name === "return" || key.name === "enter") menus[phase][selected][1]();
-    else if (key.name === "up" || key.name === "down") {
-      const size = menus[phase].length;
-      selected = (selected + (key.name === "up" ? -1 : 1) + size) % size;
+    else {
+      const menu = activeMenu(viewport());
+      selected = Math.min(selected, menu.length - 1);
+      if (key.name === "return" || key.name === "enter") menu[selected][1]();
+      else if (key.name === "up" || key.name === "down") {
+        selected = (selected + (key.name === "up" ? -1 : 1) + menu.length) % menu.length;
+      }
     }
     redraw();
   }

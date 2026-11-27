@@ -1,0 +1,72 @@
+name: Remote access and launcher
+
+on:
+  push:
+    paths:
+      - ".github/workflows/remote-access.yml"
+      - "packaging/npm/**"
+      - "public/**"
+      - "scripts/pack-*.ts"
+      - "src/**"
+      - "test/web-access.test.ts"
+      - "test/windows-password.test.ts"
+      - "test/npm-tui.test.ts"
+      - "package.json"
+      - "bun.lock"
+  pull_request:
+    paths:
+      - ".github/workflows/remote-access.yml"
+      - "packaging/npm/**"
+      - "public/**"
+      - "scripts/pack-*.ts"
+      - "src/**"
+      - "test/web-access.test.ts"
+      - "test/windows-password.test.ts"
+      - "test/npm-tui.test.ts"
+      - "package.json"
+      - "bun.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  access:
+    name: Remote access (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.5"
+      - run: bun install --frozen-lockfile
+      - run: bun run check
+      - name: Test direct HTTPS, password handling and launcher
+        shell: pwsh
+        run: |
+          if ($IsWindows) { $env:Path += ';C:\Program Files\Git\usr\bin' }
+          if ($IsWindows) { $env:MSYS2_ARG_CONV_EXCL = '*' }
+          $env:OMO_WEB_TEST_TLS = '1'
+          bun test ./test/web-access.test.ts ./test/windows-password.test.ts ./test/npm-tui.test.ts --timeout 30000
+          exit $LASTEXITCODE
+      - name: Install npm candidate and run CLI
+        shell: pwsh
+        run: |
+          bun run npm:pack
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = bun -p 'require("./package.json").version'
+          $prefix = Join-Path $env:RUNNER_TEMP 'omo-web-npm'
+          npm install --global --prefix $prefix --offline --ignore-scripts --no-audit --no-fund "./dist/npm/omo-web-$version.tgz"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $launcher = if ($IsWindows) { Join-Path $prefix 'omo-web.cmd' } else { Join-Path $prefix 'bin/omo-web' }
+          $detected = & $launcher --version
+          if ($LASTEXITCODE -ne 0 -or $detected -ne $version) { throw 'Installed omo-web version did not match' }
+          $path = Join-Path $env:RUNNER_TEMP 'private password.txt'
+          & $launcher password-file $path
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $path)) { throw 'Installed omo-web failed to create its password file' }

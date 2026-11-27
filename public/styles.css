@@ -298,6 +298,8 @@ legend { padding-inline: var(--s1); font-size: var(--small); color: var(--muted)
 .workspace-actions .action-label { min-inline-size: 0; overflow: hidden; text-overflow: ellipsis; }
 .banner { grid-row: 3; display: flex; align-items: center; justify-content: space-between; gap: var(--s2); padding: var(--s1) var(--s6); background: var(--error-tint); }
 .banner button { flex: none; }
+.banner[data-unprotected] { background: var(--warning-tint); }
+#access-warning { color: var(--warning); font-weight: 650; }
 .transcript { grid-row: 4; min-width: 0; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: var(--s8) var(--s6); }
 .transcript:focus-visible { outline-offset: calc(-1 * var(--focus)); }
 .conversation { max-width: var(--measure); min-height: 100%; margin-inline: auto; display: grid; align-items: start; }

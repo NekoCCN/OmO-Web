@@ -120,6 +120,7 @@ let connection: "connecting" | "online" | "offline" = "connecting";
 let transport: "waiting" | "open" | "lost" = "waiting";
 let recovering = false;
 let bootstrapped = false;
+let unprotected = false;
 let bootError = "";
 let listError = "";
 let sessions = new Map<string, Session>();
@@ -385,7 +386,9 @@ function updateConnection(): void {
   const message = bootError || (engine.online === false ? str(engine.error) || tr("Senpi 引擎未连接。检查引擎后再重连。",
     "The Senpi engine is offline. Check it and reconnect.")
     : transport === "lost" ? tr("实时连接已断开。正在重连，草稿会保留。", "Connection lost. Reconnecting; your drafts are kept.") : listError);
-  box("banner").hidden = !message;
+  box("banner").toggleAttribute("data-unprotected", unprotected);
+  box("access-warning").hidden = !unprotected;
+  btn("retry").hidden = !message;
   notice(box("banner-text"), message);
   const available = connection === "online" && Boolean(workspaces.length);
   btn("new-sidebar").disabled = !available;
@@ -563,6 +566,7 @@ async function bootstrap(reconcile = false): Promise<void> {
     const tokenChanged = token !== api.token;
     api.token = token;
     engine = object(data.engine);
+    unprotected = data.unprotected === true;
     handoffSupport = object(data.handoff);
     const fileBrowser = object(data.fileBrowser);
     windowsWorkspaceLabels = fileBrowser.platform === "win32";
@@ -810,7 +814,7 @@ function renderView(): void {
   box("transcript").hidden = following;
   btn("cli-follow-stop").hidden = !following;
   btn("cli-follow-button").setAttribute("aria-pressed", String(following));
-  box("banner").hidden = following || !box("banner-text").textContent;
+  box("banner").hidden = !unprotected && (following || !box("banner-text").textContent);
   if (following) {
     if (current) current.consideredDesktopDock = false;
     completion.reset();

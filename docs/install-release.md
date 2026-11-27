@@ -6,7 +6,7 @@
 
 - **Bun**：`package.json` 要求 `>=1.3.0`；本机实测 `1.4.5`；安装见 https://bun.sh。Bun 负责跑 Web 服务。
 - **OmO CLI**：运行会话需要已安装并配置模型凭据的 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)（默认 `OMO_WEB_BIN=omo`）。本机实测 `omo 5.1.83`（Senpi 2026.11.23）。这里的 `omo` 是 Native CLI，不是旧版 OpenCode 插件。
-- **平台**：完整链路在 Linux 实测；Windows 单独验证了文件浏览与目录授权，不代表完整 CLI 会话可用；macOS 尚未验证。密码文件与 `0.0.0.0` 监听仅 POSIX 实现。
+- **平台**：源码与新打包产物支持 Linux 和 Windows 的本地/远程 Web 监听；已发布旧版本的覆盖范围见其发行说明。Windows 的原生 CLI 实时控制与交接不在本次兼容范围；macOS 尚未实机复验。
 
 ## 三个位置不要混淆
 
@@ -61,15 +61,15 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 完整表见 [使用详解](usage.md#环境变量)，密码与远程访问见 [使用详解](usage.md#密码与远程访问)，禁区摘要见 [README](../README.md)；这里只记安装相关的默认值：
 
-- 默认本机免密（`127.0.0.1`）；仅本机加密码时设置 `OMO_WEB_PASSWORD_FILE`（`0600` 独立文件，用户名固定 `omo`，20–128 个可打印 ASCII，允许一个末尾换行）。
-- 对外访问必须同时配密码与 HTTPS（`OMO_WEB_HOST=0.0.0.0` + `OMO_WEB_ORIGIN` + `OMO_WEB_TLS_CERT/KEY`），服务直接终止 TLS，不支持反向代理代终止；配置不完整拒绝启动，不回退明文。
-- 单操作者工作台：拿到密码即全部控制面，无登录限流，不建议直挂互联网。
+- 默认本机免密（`127.0.0.1`）。可以用 `omo-web password-file <路径>` 生成私有密码文件，再设置 `OMO_WEB_PASSWORD_FILE`，登录用户名为 `omo`。
+- 全接口需要直接 HTTPS（`OMO_WEB_HOST=0.0.0.0`、`OMO_WEB_ORIGIN` 和证书/私钥）；配置不完整不回退到明文。优先配置密码，无密码只在确认风险后用于受限私网。
+- 单操作者工作台：密码或 HTTPS 本身都不是多用户权限系统。完整 Linux 与 PowerShell 示例见[远程配置](usage.md#密码与远程访问)。
 
 ## npm 候选包：终端启动器
 
 从源码执行 `bun run npm:pack` 后，可在本机用 `npm install --global ./dist/npm/omo-web-0.1.0.tgz` 安装。它不是已经上架的 npm 包。启动器需要 Node；Web 服务仍需要 Bun 和 OmO Native。
 
-在实际项目目录运行 `omo-web`。用方向键移动、Enter 选择工作目录或启动。服务启动后可以打开浏览器、停止服务或退出；目录编辑只影响本次启动。`omo-web serve` 不进入交互界面，适合脚本；没有交互终端时，`omo-web` 也直接启动。
+在实际项目目录运行 `omo-web`。用方向键移动、Enter 选择工作目录或启动。服务启动后可以打开浏览器、停止服务或退出；目录编辑只影响本次启动。`omo-web serve` 不进入交互界面，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
 
 ## 维护者：发版
 

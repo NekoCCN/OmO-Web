@@ -54,8 +54,9 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 | --- | --- | --- |
 | `OMO_WEB_WORKSPACES` | 启动目录 | 允许新建和恢复会话的工作目录 |
 | `OMO_WEB_PORT` | `4317` | 非 TLS 模式可用 `0` 分配随机端口 |
-| `OMO_WEB_HOST` | `127.0.0.1` | 仅接受 `127.0.0.1` 或 `0.0.0.0`；全接口监听必须同时配置密码和 HTTPS |
-| `OMO_WEB_PASSWORD_FILE` | 未设置 | 启用密码；仅属主可访问的常规文件，用户名固定为 `omo` |
+| `OMO_WEB_HOST` | `127.0.0.1` | `0.0.0.0` 表示监听所有 IPv4 接口，需要 HTTPS 和密码，或显式选择无密码 |
+| `OMO_WEB_PASSWORD_FILE` | 未设置 | 私有密码文件，用户名固定为 `omo`；推荐用 `omo-web password-file` 创建 |
+| `OMO_WEB_ALLOW_UNAUTHENTICATED` | 未设置 | 只有 `1` 允许在未配置密码文件时监听所有接口；仍要求 HTTPS，有密码时不会禁用认证 |
 | `OMO_WEB_ORIGIN` | 未设置 | 启用 TLS 时必填；无路径、尾部斜杠或凭据的 HTTPS 访问地址，端口与监听端口一致 |
 | `OMO_WEB_TLS_CERT` / `OMO_WEB_TLS_KEY` | 未设置 | 与访问地址匹配且被浏览器信任的 PEM 证书，以及对应的未加密 PEM 私钥 |
 | `OMO_WEB_BIN` | `omo` | 对应的 Native CLI 可执行文件 |
@@ -64,9 +65,21 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 ## 密码与远程访问
 
-默认仍为本机免密。仅给本机加密码时，启动前设置 `OMO_WEB_PASSWORD_FILE="$HOME/.omo-web-password"` 即可。建议用密码管理器生成并保存随机密码，再写入权限为 `0600` 的独立文件；不要放进项目、URL 或启动命令。密码为 20–128 个可打印 ASCII 字符，允许一个末尾换行。
+默认只监听本机，不要求密码。只给本机加密码时，设置 `OMO_WEB_PASSWORD_FILE` 即可；从外地访问时还需要下面的 HTTPS 设置。
 
-要从另一台设备访问，准备与实际访问域名或 IP 匹配、被浏览器信任的证书，再启动：
+### 生成密码文件
+
+安装 npm 版启动器后，运行 `omo-web password-file <路径>`。例如 Linux/macOS 用 `omo-web password-file "$HOME/.omo-web-password"`，Windows PowerShell 用 `omo-web password-file "$HOME\.omo-web-password"`。命令不显示密码，也不覆盖已有文件。先在本机打开文件，把该密码存进密码管理器，不要把文件放进要给 OmO 操作的项目，也不要把密码写进启动命令或 URL。
+
+自己准备文件也可以。密码为 20–128 个可打印 ASCII 字符，可带一个末尾换行。POSIX 文件应是 `0600`；Windows 使用仅当前用户可访问的 ACL，校验同时允许 Windows 系统和管理员账户。不要用 `chmod` 模拟 Windows ACL。
+
+### 从外地用 HTTPS 访问
+
+先确保两台设备之间有网络路径。推荐通过 VPN 或私有网络放行所选 TCP 端口；如果通过公网访问，应设置密码，并用防火墙限制能连接的地址。`0.0.0.0` 只改变监听地址，不会帮你配置公网 DNS、防火墙、NAT 或端口转发。
+
+准备浏览器信任、且覆盖最终访问域名或 IP 的 PEM 证书和对应私钥。用 Tailscale 时，可以按[官方说明签发 HTTPS 证书](https://tailscale.com/docs/how-to/set-up-https-certificates)，用完整的 `.ts.net` 名称访问，而不是裸主机名或 Tailscale IP；证书文件更新后要重启 OmO Web。
+
+**Linux / macOS：**
 
 ```sh
 OMO_WEB_HOST=0.0.0.0 \
@@ -79,9 +92,28 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" \
 bun start
 ```
 
-替换示例域名和文件路径。在浏览器打开 `OMO_WEB_ORIGIN` 指定的地址，**不要访问 `0.0.0.0`**；在浏览器原生登录提示里输入用户名 `omo` 和配置的密码。启用密码后，网页、静态资源、API 和 SSE 都要求同一凭据；写入仍需同源及页面 token。服务直接终止 TLS，不依赖 `X-Forwarded-*`，未实现反向代理代为终止 TLS 的部署模式。配置不完整时拒绝启动，不会回退到明文。修改密码或证书需要重启；Basic 凭据由浏览器缓存，没有应用内登出。
+**Windows PowerShell：**
 
-**这是单操作者工作台，不是多用户权限系统。** 拿到密码就能使用整个控制面，包含读取会话和经 OmO 操作工作区、运行命令。没有应用级登录限流，不建议直接暴露到互联网；优先用私有网络、VPN 或入站 IP 白名单，并使用专用 OS 账号、最小工作区授权。POSIX 只检查密码文件的模式位，部署者还需保证 ACL 和目录访问权限。密码和全接口监听目前仅在 POSIX 实现，实测为 Linux；Windows 仍保留默认本机模式。
+```powershell
+$env:OMO_WEB_HOST = '0.0.0.0'
+$env:OMO_WEB_PORT = '8443'
+$env:OMO_WEB_ORIGIN = 'https://omo.example.net:8443'
+$env:OMO_WEB_PASSWORD_FILE = "$HOME\.omo-web-password"
+$env:OMO_WEB_TLS_CERT = "$HOME\.omo-web-cert.pem"
+$env:OMO_WEB_TLS_KEY = "$HOME\.omo-web-key.pem"
+$env:OMO_WEB_WORKSPACES = "$HOME\Projects\your-project"
+omo-web
+```
+
+两组命令都需替换域名和文件路径。用 npm 包可把 `bun start` 换成 `omo-web`；源码检出可把 PowerShell 里的 `omo-web` 换成 `bun start`。浏览器打开 `OMO_WEB_ORIGIN`，**不要打开 `0.0.0.0`**。出现登录框时使用用户名 `omo`。确认能在本机用同一个 HTTPS 地址访问后，再到另一台设备验网络路径。
+
+启用密码时，网页、静态资源、API 和 SSE 都需要凭据；远程监听会暂时限制同一连接地址的连续错误密码请求。服务直接终止 TLS，不信任 `X-Forwarded-*`，不支持代理代为终止 TLS。配置不完整会拒绝启动，不会回退明文。修改密码或证书需重启；Basic 登录由浏览器缓存，无应用内登出。
+
+### 私网内不设密码
+
+省略 `OMO_WEB_PASSWORD_FILE`。在 TUI 选择启动后，确认无密码警告；脚本启动时用 `OMO_WEB_ALLOW_UNAUTHENTICATED=1` 表示同样的确认（PowerShell 用 `$env:OMO_WEB_ALLOW_UNAUTHENTICATED = '1'`）。如果环境变量里已有旧的 `OMO_WEB_PASSWORD_FILE`，先取消设置：这个开关不会关闭已经配置的密码。HTTPS、同源检查与写入 token 仍然有效，**但不能替代密码**。
+
+**这是单操作者工作台。** 无密码时，任何能访问端口的人都能读取会话，并通过 OmO 操作该机器。仅在客户端范围可控的私网或 VPN 内使用；不能做到就配置密码和入站限制。无论哪种模式，都建议使用专用 OS 账户和最小工作目录权限。
 
 ## 会话、执行与模型
 

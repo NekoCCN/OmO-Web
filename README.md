@@ -82,7 +82,8 @@ Web 和 CLI 使用同一个 OmO profile 时，可以接着同一份会话日志�
 | --- | --- |
 | `OMO_WEB_WORKSPACES` | 可用项目目录，默认启动目录 |
 | `OMO_WEB_PORT` | 监听端口，默认 `4317` |
-| `OMO_WEB_PASSWORD_FILE` | 密码文件，`0600` 独立文件，用户名固定为 `omo` |
+| `OMO_WEB_PASSWORD_FILE` | 密码文件（POSIX `0600` / Windows 私有 ACL），用户名 `omo` |
+| `OMO_WEB_ALLOW_UNAUTHENTICATED` | 显式接受全接口无密码模式；仍要求 HTTPS |
 | `OMO_WEB_DATA` | Web 会话索引与私有日志，默认 `~/.omo-web` |
 | `OMO_WEB_CLI_AGENT_DIR` | 与 CLI 共用的 OmO profile 目录 |
 | `OMO_WEB_BIN` | Native CLI 可执行文件，默认 `omo` |
@@ -94,7 +95,7 @@ dirs="$HOME/code/api:$HOME/code/ui"
 OMO_WEB_WORKSPACES="$dirs" bun start
 ```
 
-跨设备访问时，同时配置密码和 HTTPS，建议通过私有网络或 VPN 连接。这个服务为单人使用设计，工具权限由本机 OmO 处理。参见[完整环境变量](docs/usage.md#环境变量)和[远程访问设置](docs/usage.md#密码与远程访问)。
+在外地访问时，用 `0.0.0.0` 监听并配置 HTTPS；建议通过 VPN 连接并设置密码。受限私网可以显式选择无密码，启动器和网页会提示风险。见 [Linux 与 Windows 的远程配置](docs/usage.md#密码与远程访问)。
 
 ## 常见问题
 

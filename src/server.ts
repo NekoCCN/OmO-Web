@@ -128,7 +128,7 @@ export async function startApp(settings: AppSettings) {
 
   const fetch = async (request: Request, listener?: Bun.Server<undefined>): Promise<Response> => {
     try {
-      const challenge = access.authorize(request, url, tokenBytes);
+      const challenge = access.authorize(request, url, tokenBytes, listener?.requestIP(request)?.address);
       if (challenge) return challenge;
       // Native compact can take up to 180 s. Rejected requests keep the short listener default.
       listener?.timeout(request, 240);
@@ -145,7 +145,7 @@ export async function startApp(settings: AppSettings) {
             if (!(error instanceof WebError)) throw error;
           }
           return json({ token: secret, engine: engine.status, workspaces: await workspaces.paths(), sessions: await sessions.scopedList(),
-            handoff: sessions.handoffSupport(), fileBrowser: { platform: workspacePlatform } });
+            handoff: sessions.handoffSupport(), fileBrowser: { platform: workspacePlatform }, unprotected: access.unprotected });
         }
         if (pathname === "/api/sessions") return json({ sessions: await sessions.scopedList() });
         if (pathname === "/api/cli-follow") return json(await terminals.follow());
@@ -320,6 +320,7 @@ export async function startApp(settings: AppSettings) {
   let closing: Promise<void> | undefined;
   return {
     url: new URL(url),
+    unprotected: access.unprotected,
     fetch,
     stop() {
       closing ??= (async () => {
