@@ -9,11 +9,6 @@ import type { GenerationSpeed } from "../stream-speed.ts";
 import { tr, uiLocale } from "./locale.ts";
 
 type Controls = {
-  readonly canWrite: boolean;
-  readonly canNavigate: boolean;
-  readonly queueCount?: number;
-  readonly clearQueue: () => void;
-  readonly navigate: (id: string | null) => void;
   readonly insertCommand: (value: string) => void;
 };
 
@@ -197,11 +192,10 @@ function activity(data: Wire, state: Wire, speed?: GenerationSpeed): HTMLElement
   return section;
 }
 
-function queuePanel(queue: Wire, controls: Controls): HTMLElement {
-  const active = new Set(["held", "queued", "sending", "pending", "accepted"]);
-  const inputs = list(queue.inputs).map(object).filter(item => !item.state || active.has(str(item.state)));
+function queueItems(inputs: readonly unknown[]): HTMLElement {
   const items = el("ul", "inline-list");
-  for (const input of inputs) {
+  for (const value of inputs) {
+    const input = object(value);
     const mode = str(input.requestedMode);
     const state = ({ queued: tr("排队中", "Queued"), sending: tr("正在发送", "Sending"), held: tr("等待中", "Waiting"),
       pending: tr("等待中", "Waiting"), accepted: tr("已接收", "Accepted") })[str(input.state)] || "";
@@ -211,17 +205,85 @@ function queuePanel(queue: Wire, controls: Controls): HTMLElement {
     entry.append(el("p", "plain", str(input.text) || tr("（无文本）", "(No text)")));
     items.append(entry);
   }
-  const clear = button(tr("清空队列", "Clear queue"), controls.clearQueue, "button--danger");
-  clear.disabled = !controls.canWrite || !((controls.queueCount ?? 0) > 0 || inputs.length > 0);
+  return items;
+}
+
+export function createDetailsQueue(api: Api, path: string, visible: () => boolean, canWrite: () => boolean, clearQueue: () => void) {
+  const count = el("p", "small muted");
+  const status = el("p", "small muted");
+  status.setAttribute("role", "status");
+  const content = el("div", "stack stack--tight");
+  const preview = overviewFold("queue", tr("预览待处理输入", "Preview pending inputs"), status, content);
+  const clear = button(tr("清空队列", "Clear queue"), clearQueue, "button--danger");
   clear.dataset.overviewFocus = "queue:clear";
   clear.dataset.write = "";
-  if (clear.disabled && controls.canWrite) clear.dataset.unavailable = "";
   const actions = el("div", "row");
   actions.append(clear);
-  const count = controls.queueCount ?? inputs.length;
-  return part(tr("输入队列", "Input queue"), el("p", "small muted", count
-    ? tr(`${number.format(count)} 条待处理输入`, `${number.format(count)} pending ${count === 1 ? "input" : "inputs"}`)
-    : tr("没有排队的输入。", "No queued inputs.")), ...(inputs.length ? [items] : []), actions);
+  const root = part(tr("输入队列", "Input queue"), count, actions, preview);
+  let pendingCount: number | undefined;
+  let request: AbortController | undefined;
+  let attempted = false;
+  let hasInputs = false;
+  const syncClear = () => {
+    const unavailable = !(pendingCount !== undefined && pendingCount > 0) && !hasInputs;
+    clear.toggleAttribute("data-unavailable", unavailable);
+    clear.disabled = unavailable || !canWrite();
+  };
+  const replace = (message = "", ...children: Node[]) => {
+    if (content.contains(document.activeElement)) preview.querySelector("summary")?.focus({ preventScroll: true });
+    notice(status, message);
+    content.replaceChildren(...children);
+  };
+  const deactivate = () => {
+    if (!attempted) return;
+    request?.abort();
+    request = undefined;
+    attempted = hasInputs = false;
+    replace();
+    syncClear();
+  };
+  const shown = () => root.isConnected && preview.open && visible();
+  const activate = (refresh = false) => {
+    if (!shown()) return;
+    if (attempted && !refresh) return;
+    request?.abort();
+    const read = request = new AbortController();
+    attempted = true;
+    hasInputs = false;
+    syncClear();
+    replace(tr("正在读取待处理输入…", "Loading pending inputs…"));
+    const current = () => request === read && shown();
+    const failed = (tooLarge = false) => {
+      replace(tooLarge
+        ? tr("队列响应超出读取上限。", "The queue response exceeded the read limit.")
+        : tr("无法读取待处理输入。", "Couldn't load pending inputs."),
+      button(tr("重试队列预览", "Retry queue preview"), () => activate(true), "button--quiet"));
+    };
+    void api.request(`${path}/queue`, undefined, read.signal).then(data => {
+      if (!current()) return;
+      if (!Array.isArray(data.inputs)) { failed(); return; }
+      hasInputs = data.inputs.length > 0;
+      syncClear();
+      replace(data.truncated === true
+        ? tr("预览已截断，仅显示部分队列内容。", "Preview truncated. Only part of the queue is shown.")
+        : hasInputs ? "" : tr("没有可预览的待处理输入。", "No pending inputs to preview."),
+      ...(hasInputs ? [queueItems(data.inputs)] : []));
+    }, (error: unknown) => {
+      if (current()) failed(error instanceof RequestError && error.code === "queue_too_large");
+    }).finally(() => {
+      if (request === read) request = undefined;
+    });
+  };
+  preview.addEventListener("toggle", () => { if (preview.open) activate(); else deactivate(); });
+  return { root, activate, deactivate, update(value: number | undefined) {
+    pendingCount = value;
+    count.textContent = value === undefined
+      ? tr("待处理输入数量未知。", "Pending input count unknown.")
+      : value > 0
+        ? tr(`${number.format(value)} 条待处理输入`, `${number.format(value)} pending ${value === 1 ? "input" : "inputs"}`)
+        : tr("没有排队的输入。", "No queued inputs.");
+    syncClear();
+  } };
 }
 
 function commandPanel(options: Wire, controls: Controls): HTMLElement {
@@ -248,70 +310,6 @@ function commandPanel(options: Wire, controls: Controls): HTMLElement {
   return section;
 }
 
-function entryTitle(node: Wire): string {
-  const entry = object(node.entry);
-  const message = object(entry.message);
-  const content = message.content;
-  const summary = (str(content) || list(content).map(object).filter(block => block.type === "text").map(block => str(block.text)).join(" ")).replace(/\s+/g, " ").trim();
-  const role = str(message.role);
-  const type = str(entry.type);
-  const label = str(node.label) || str(entry.label);
-  const titles: Readonly<Record<string, string>> = {
-    user: tr("你", "You"), assistant: tr("助手", "Assistant"), toolResult: tr("工具结果", "Tool result"),
-    bashExecution: tr("命令输出", "Command output"), message: tr("消息", "Message"), compaction: tr("上下文压缩", "Context compaction"),
-    branch_summary: tr("分支摘要", "Branch summary"), model_change: tr("模型变更", "Model change"),
-    thinking_level_change: tr("思考档变更", "Thinking level change"), custom: tr("会话记录", "Session entry"), session_info: tr("会话信息", "Session info"),
-  };
-  const id = str(entry.id);
-  const name = Object.hasOwn(titles, role || type) ? titles[role || type] : role || type || tr("节点", "Node");
-  return `${label || name}${summary ? ` · ${summary.slice(0, 88)}` : id ? ` · ${id.slice(0, 12)}` : ""}`;
-}
-
-function treePanel(data: Wire, controls: Controls): HTMLElement {
-  const leaf = str(data.leafId);
-  const roots = list(data.tree);
-  const table = el("ul", "tree");
-  const stack = [...roots].reverse().map(node => ({ raw: node, list: table, depth: 0 }));
-  while (stack.length) {
-    const task = stack.pop();
-    if (!task) break;
-    const node = object(task.raw);
-    const id = str(object(node.entry).id);
-    const children = list(node.children);
-    const item = el("li");
-    if (id) {
-      const action = button(entryTitle(node), () => controls.navigate(id), "button--quiet");
-      action.disabled = !controls.canNavigate;
-      action.dataset.overviewFocus = `tree-node:${id}`;
-      action.dataset.write = "";
-      action.dataset.idle = "";
-      if (leaf === id) action.setAttribute("aria-current", "true");
-      item.append(action);
-    } else item.append(el("span", "small muted break", entryTitle(node)));
-    task.list.append(item);
-    if (children.length) {
-      // After the first few levels, keep the rest readable instead of narrowing to zero.
-      const target = task.depth === 4 ? task.list : el("ul", "tree");
-      if (target !== task.list) item.append(target);
-      for (let i = children.length - 1; i >= 0; i--) stack.push({ raw: children[i], list: target, depth: Math.min(4, task.depth + 1) });
-    }
-  }
-  const clear = button(tr("切换到空上下文", "Switch to an empty context"), () => controls.navigate(null));
-  clear.disabled = !controls.canNavigate || !leaf;
-  clear.dataset.overviewFocus = "tree:empty";
-  clear.dataset.write = "";
-  clear.dataset.idle = "";
-  if (!leaf) clear.dataset.unavailable = "";
-  const actionBar = el("div", "row");
-  actionBar.append(clear);
-  const body = table.childElementCount ? overviewFold("tree", tr("查看会话节点", "View session nodes"), el("p", "small muted",
-    tr("选择历史用户消息可将其载入输入框；不会自动发送。", "Select a past user message to load it into the input box without sending it.")), table, actionBar)
-    : el("p", "small muted", tr("没有可导航的会话节点。", "No session nodes to navigate."));
-  const section = part(tr("会话树", "Session tree"), body);
-  section.id = "runtime-tree";
-  return section;
-}
-
 const todoStatusText: Readonly<Record<string, string>> = {
   pending: tr("待办", "Pending"),
   in_progress: tr("进行中", "In progress"),
@@ -326,11 +324,22 @@ const runtimeInvalidReason: Readonly<Record<string, string>> = {
   "duplicate-id": tr("会话树有重复标识", "The session tree contains duplicate IDs."),
   "broken-ancestry": tr("分支链断裂或指向其他分支", "The branch chain is broken or points to another branch."),
   "tree-budget": tr("会话树超出读取上限，可能不完整", "The session tree exceeds the read limit and may be incomplete."),
+  "incomplete": tr("历史超出分支读取上限", "The branch history exceeds the read limit."),
+  "ownership_changed": tr("会话或活动分支已变化", "The session or active branch changed."),
+  "binding_unverified": tr("无法确认会话归属", "The session binding could not be verified."),
+  "unsupported": tr("当前宿主不支持有界分支读取", "The current host does not support bounded branch reads."),
+  "malformed": tr("原生返回的分支数据格式无效", "The native host returned invalid branch data."),
 };
 
 function runtimeBranchPanel(runtime: Wire): HTMLElement {
   const section = el("section", "subpanel stack stack--tight");
   section.append(el("h3", "", tr("待办 · 当前活动分支", "Todo · Active branch")));
+  if (runtime.status === "loading") {
+    const status = el("p", "small muted", tr("正在读取当前分支…", "Loading the active branch…"));
+    status.setAttribute("role", "status");
+    section.append(status);
+    return section;
+  }
   if (str(runtime.status) === "invalid") {
     const reason = runtimeInvalidReason[str(runtime.reason)] ?? tr("未知原因", "Unknown reason.");
     section.append(el("p", "small muted", tr(`无法确认活动分支（${reason}），不显示待办，以免混入其他分支。`,
@@ -338,11 +347,14 @@ function runtimeBranchPanel(runtime: Wire): HTMLElement {
     return section;
   }
   if (str(runtime.status) !== "ok") {
-    section.append(el("p", "small muted", tr("分支投影不可用，没有可显示的待办。", "Branch data is unavailable, so Todo cannot be shown.")));
+    const reason = runtimeInvalidReason[str(runtime.reason)];
+    section.append(el("p", "small muted", reason
+      ? tr(`分支数据不可用（${reason}），待办数量未知。`, `Branch data is unavailable. ${reason} The Todo count is unknown.`)
+      : tr("分支数据不可用，待办数量未知。可刷新重试。", "Branch data is unavailable. The Todo count is unknown. Refresh to try again.")));
     return section;
   }
   const leaf = str(runtime.leafId);
-  section.append(el("p", "small muted", leaf ? tr(`活动分支：${leaf}`, `Active branch: ${leaf}`) : tr("原生返回空树，无活动分支。", "The native host returned an empty tree. No branch is active.")));
+  section.append(el("p", "small muted", leaf ? tr(`活动分支：${leaf}`, `Active branch: ${leaf}`) : tr("当前没有活动分支。", "No branch is active.")));
   const todo = object(runtime.todo);
   if (str(todo.status) === "ok") {
     const phases = list(todo.phases).map(object);
@@ -377,6 +389,7 @@ function runtimeBranchPanel(runtime: Wire): HTMLElement {
 }
 
 function branchMemory(runtime: Wire): Node[] {
+  if (runtime.status === "loading") return [el("p", "small muted", tr("正在读取当前分支…", "Loading the active branch…"))];
   if (runtime.status !== "ok") return [el("p", "small muted", tr("无法确认当前分支，未显示长期记忆计数。", "Could not verify the active branch, so long-term memory counts are hidden."))];
   const memory = object(runtime.memory);
   if (str(memory.status) !== "ok") {
@@ -417,17 +430,27 @@ export function refreshDetailsActivity(data: Wire, state: Wire, speed?: Generati
   if (focusKey) next.querySelector<HTMLElement>(`[data-overview-focus="${CSS.escape(focusKey)}"]`)?.focus({ preventScroll: true });
 }
 
-export function renderDetails(data: Wire, state: Wire, options: Wire, controls: Controls, speed?: GenerationSpeed): void {
+export function renderDetails(data: Wire, state: Wire, options: Wire, controls: Controls, tree: HTMLElement, queue: HTMLElement, speed?: GenerationSpeed): void {
   const metrics = byId("runtime-metrics", HTMLElement);
-  const todo = byId("runtime-todo", HTMLElement);
   const focused = document.activeElement;
   const focusKey = focused instanceof HTMLElement && metrics.contains(focused) ? focused.dataset.overviewFocus : undefined;
   const openedOverview = new Set([...metrics.querySelectorAll<HTMLDetailsElement>("details[open]")].map(node => node.dataset.overviewDisclosure));
-  metrics.replaceChildren(
-    activity(data, state, speed),
-    queuePanel(object(data.queue), controls), commandPanel(options, controls), treePanel(object(data.tree), controls),
-  );
-  const runtime = object(data.runtime);
+  for (const child of [...metrics.children]) if (child !== tree && child !== queue) child.remove();
+  if (queue.parentElement !== metrics) metrics.prepend(queue);
+  metrics.prepend(activity(data, state, speed));
+  queue.after(commandPanel(options, controls));
+  metrics.querySelectorAll<HTMLDetailsElement>("details[data-overview-disclosure]").forEach(node => {
+    node.open = openedOverview.has(node.dataset.overviewDisclosure);
+  });
+  if (focusKey !== undefined && document.activeElement !== focused) {
+    const next = metrics.querySelector<HTMLElement>(`[data-overview-focus="${CSS.escape(focusKey)}"]:not(:disabled)`);
+    (next?.getClientRects().length ? next : metrics).focus({ preventScroll: true });
+  }
+}
+
+export function renderDetailsBranch(runtime: Wire): void {
+  const todo = byId("runtime-todo", HTMLElement);
+  const focused = document.activeElement;
   const branch = runtimeBranchPanel(runtime);
   const oldBranch = todo.querySelector("[data-runtime-branch]");
   const previousTodo = oldBranch?.querySelector("details");
@@ -439,13 +462,6 @@ export function renderDetails(data: Wire, state: Wire, options: Wire, controls: 
   else todo.prepend(branch);
   byId("runtime-memory-branch-content", HTMLElement).replaceChildren(...branchMemory(runtime));
   if (focusTodo) (nextTodo?.querySelector("summary") ?? todo).focus({ preventScroll: true });
-  metrics.querySelectorAll<HTMLDetailsElement>("details[data-overview-disclosure]").forEach(node => {
-    node.open = openedOverview.has(node.dataset.overviewDisclosure);
-  });
-  if (focusKey !== undefined) {
-    const next = metrics.querySelector<HTMLElement>(`[data-overview-focus="${CSS.escape(focusKey)}"]:not(:disabled)`);
-    (next?.getClientRects().length ? next : metrics).focus({ preventScroll: true });
-  }
 }
 
 export function showNativeActivity(host: HTMLElement, data: Wire): void {

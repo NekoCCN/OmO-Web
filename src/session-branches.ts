@@ -6,6 +6,8 @@ import { CLI_HISTORY_LIMITS } from "./cli-history.ts";
 import type { Engine } from "./engine.ts";
 import { WebError, array, record } from "./protocol.ts";
 import type { WireObject } from "./protocol.ts";
+import { readNativeLeaf } from "./session-entry-pages.ts";
+import type { EntryReadScope } from "./session-entry-pages.ts";
 
 const entryKey = z.string().min(1).max(200).regex(/^[a-zA-Z0-9_-]+$/);
 export const branchSelection = z.discriminatedUnion("kind", [
@@ -60,6 +62,26 @@ export const nativeBranchError = (error: unknown): never => {
   throw new WebError(error.status, error.status >= 500 ? "branch_engine_unavailable" : "branch_engine_refused",
     "OmO 未能完成分支操作，请刷新会话并重试。");
 };
+
+export async function readBranchLeaf(scope: EntryReadScope, invalidLeaf: () => WebError): Promise<string | null> {
+  if (scope.engine.capabilities.has("entries_tail")) {
+    try { return await readNativeLeaf(scope, 15_000); }
+    catch (error) {
+      if (error instanceof WebError) {
+        if (error.code === "tree_stale") throw staleBranch();
+        if (error.code === "tree_reply_invalid") throw invalidLeaf();
+      }
+      return nativeBranchError(error);
+    }
+  }
+  // Only legacy hosts that did not advertise paging use the old read.
+  const { leafId } = await scope.engine.requestExisting("get_tree", { sessionId: scope.target.route }, 15_000)
+    .catch(nativeBranchError);
+  if (leafId === null) return null;
+  const parsed = entryKey.safeParse(leafId);
+  if (!parsed.success) throw invalidLeaf();
+  return parsed.data;
+}
 
 function fsCode(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && error.code === code;
@@ -249,15 +271,16 @@ export class SessionBranches {
       if (typeof opened.sessionId !== "string" || !opened.sessionId || opened.attached === true ||
         this.isWebRoute(opened.sessionId) || initial.sessionFile !== sessionPath ||
         initial.sessionId !== scratchId || initial.cwd !== source.cwd) throw invalidOutput();
-      route = opened.sessionId;
+      const scratchRoute = opened.sessionId;
+      route = scratchRoute;
       if (opened.permissionPreset !== "ask" || opened.permissionPresetStatus !== "applied") {
         throw new WebError(409, "permission_mode_unconfirmed", "OmO 未确认分支的 ask 权限模式。");
       }
       const request = (method: string, fields: WireObject = {}) =>
-        this.engine.requestExisting(method, { ...fields, sessionId: route }, 15_000).catch(nativeBranchError);
-      const tree = await request("get_tree");
-      if (tree.leafId !== null && !entryKey.safeParse(tree.leafId).success) throw invalidOutput();
-      const actualLeaf = typeof tree.leafId === "string" ? tree.leafId : null;
+        this.engine.requestExisting(method, { ...fields, sessionId: scratchRoute }, 15_000).catch(nativeBranchError);
+      const host = this.engine.status;
+      const actualLeaf = await readBranchLeaf({ engine: this.engine, target: { route: scratchRoute },
+        isCurrent: () => this.engine.status === host && !this.isWebRoute(scratchRoute) }, invalidOutput);
       const leafId = source.leafId === undefined ? transcript.lastEntry : source.leafId;
       if (leafId !== null && leafId !== actualLeaf) {
         const moved = await request("navigate_tree", { targetId: leafId, intent: "resume", expectedLeafId: actualLeaf });

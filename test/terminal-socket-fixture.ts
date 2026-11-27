@@ -14,6 +14,27 @@ const commands = [
   "attach_session", "release_attachment", "prompt", "steer", "follow_up", "interrupt",
 ];
 
+export const transcriptPadding = Buffer.alloc(64 * 1024, "x");
+
+export async function writeTerminalBytes(peer: Socket, bytes: Buffer | string): Promise<void> {
+  await new Promise<void>((resolve, reject) => peer.write(bytes, error => error ? reject(error) : resolve()));
+}
+
+export async function writeLargeTerminalTranscript(peer: Socket, id: unknown, chunks = 40): Promise<void> {
+  // Native puts id first. Write a large valid row without assembling its source.
+  await writeTerminalBytes(peer, `{"id":${JSON.stringify(id)},"type":"response","command":"get_messages","success":true,"data":{"messages":[{"role":"user","content":"omitted-old-`);
+  for (let i = 0; i < chunks; i++) await writeTerminalBytes(peer, transcriptPadding);
+  const latest = Buffer.from(`"},{"role":"assistant","content":[{"type":"thinking","thinking":"fixture-private"},{"type":"text","text":"近况 🐋"}],"timestamp":42}]}}\n`);
+  const split = latest.indexOf(Buffer.from("🐋")) + 2;
+  await writeTerminalBytes(peer, latest.subarray(0, split));
+  await writeTerminalBytes(peer, latest.subarray(split));
+}
+
+export async function refuseTerminalTranscript(peer: Socket, id: unknown): Promise<void> {
+  await writeTerminalBytes(peer, JSON.stringify({ type: "response", id, command: "get_messages", success: false,
+    errorCode: "response_too_large", error: "fixture-private" }) + "\n");
+}
+
 export async function terminalFixture(options: { readonly fallback?: boolean } = {}) {
   const root = await mkdtemp(join(tmpdir(), "ow-t-"));
   const agentDir = options.fallback ? join(root, "p".repeat(85)) : join(root, "profile");
@@ -53,6 +74,7 @@ export async function terminalFixture(options: { readonly fallback?: boolean } =
     unstableLeaf: false,
     messages: [] as unknown[],
     beforeMessagesReply: undefined as (() => Promise<void>) | undefined,
+    messagesReply: undefined as ((peer: Socket, id: unknown) => Promise<void>) | undefined,
     acceptedSecrets: 0,
     interrupted: 0,
   };
@@ -111,7 +133,8 @@ export async function terminalFixture(options: { readonly fallback?: boolean } =
             break;
           case "get_messages": {
             const messages = state.messages;
-            if (state.oversized) peer.write(Buffer.alloc(2_200_000, 65));
+            if (state.messagesReply) void state.messagesReply(peer, id).catch(() => peer.destroy());
+            else if (state.oversized) peer.write(Buffer.alloc(2_200_000, 65));
             else if (state.beforeMessagesReply) {
               void state.beforeMessagesReply().then(() => ok({ messages }), () => peer.destroy());
             } else ok({ messages });

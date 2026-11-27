@@ -3,9 +3,12 @@ import { z } from "zod";
 import type { Engine } from "./engine.ts";
 import { boundedRows, count, dagReply, identity, projectDagRow, projectDagSnapshot,
   RUNTIME_LIST_LIMIT, taskDisplayFields, timestamp } from "./native-runtime-projection.ts";
-import { WebError } from "./protocol.ts";
-import type { WireObject } from "./protocol.ts";
-import { projectRuntimeBranch } from "./runtime-branch.ts";
+import { array, entryId, WebError } from "./protocol.ts";
+import type { Action, WireObject } from "./protocol.ts";
+import { projectPagedRuntimeBranch } from "./runtime-branch.ts";
+import type { RuntimeBranchView } from "./runtime-branch.ts";
+import { previewEntries, readEntryPage, readNativeLeaf, staleTree } from "./session-entry-pages.ts";
+import type { TreeCursors } from "./session-entry-pages.ts";
 
 const TIMEOUT = 6000;
 const taskStatus = z.enum(["pending", "running", "paused", "completed", "error", "cancelled", "interrupted", "lost"]);
@@ -137,7 +140,7 @@ export type RuntimeReadScope = {
   readonly verifyWorkspace: () => Promise<unknown>;
 };
 
-async function sameBinding({ engine, target, isCurrent, verifyWorkspace }: RuntimeReadScope): Promise<Failure | undefined> {
+async function bindingState({ engine, target, isCurrent, verifyWorkspace }: RuntimeReadScope): Promise<{ state: WireObject } | Failure> {
   if (!isCurrent()) return ownershipChanged;
   await verifyWorkspace();
   if (!isCurrent()) return ownershipChanged;
@@ -153,7 +156,12 @@ async function sameBinding({ engine, target, isCurrent, verifyWorkspace }: Runti
   if (current.data.archived === true || current.data.sessionId !== target.sessionId ||
     current.data.cwd !== target.cwd || current.data.sessionFile !== target.sessionFile) return ownershipChanged;
   await verifyWorkspace();
-  return isCurrent() ? undefined : ownershipChanged;
+  return isCurrent() ? { state: raw } : ownershipChanged;
+}
+
+async function sameBinding(scope: RuntimeReadScope): Promise<Failure | undefined> {
+  const bound = await bindingState(scope);
+  return "status" in bound ? bound : undefined;
 }
 
 async function withinBinding<T>(scope: RuntimeReadScope, read: () => Promise<T>): Promise<T | Failure> {
@@ -225,28 +233,140 @@ export async function readNativeDag(scope: RuntimeReadScope | RuntimeInactiveRea
   });
 }
 
-type WorkbenchStatus = Empty | { readonly status: "unavailable";
-  readonly reason: UnavailableReason | "ownership_changed" | "malformed" | "incomplete" } |
+const BRANCH_PAGE_LIMIT = 4;
+const WORKBENCH_PAGE_LIMIT = 1;
+type Incomplete = { readonly status: "unavailable"; readonly reason: "incomplete" };
+const incomplete: Incomplete = { status: "unavailable", reason: "incomplete" };
+type HistoryFailure = Failure | Incomplete;
+
+function entryFailure(error: unknown): HistoryFailure {
+  if (!(error instanceof WebError)) throw error;
+  switch (error.code) {
+    case "tree_stale": return ownershipChanged;
+    case "tree_reply_invalid": return malformed;
+    case "unknown_command": return unavailable("unsupported");
+    case "response_too_large":
+    case "tree_budget": return incomplete;
+    default: return fault(error);
+  }
+}
+
+function treeFailure(result: HistoryFailure): WebError {
+  if (result.status === "ownership_changed") return staleTree();
+  if (result.status === "malformed") return new WebError(502, "tree_reply_invalid", "OmO 返回了无效的会话分页。");
+  switch (result.reason) {
+    case "engine_unavailable": return new WebError(503, "engine_unavailable", "OmO 引擎尚不可用。");
+    case "inactive": return new WebError(409, "session_not_open", "请先恢复未归档的会话。");
+    case "binding_unverified": return staleTree();
+    case "incomplete": return new WebError(409, "tree_budget", "会话历史超过读取预算。");
+    case "unsupported": return new WebError(409, "unsupported", "此 OmO 连接不支持有界会话历史。");
+    case "native_unavailable": return new WebError(409, "tree_unavailable", "OmO 无法读取会话历史，请重新加载。");
+  }
+}
+
+export async function readSessionTree(scope: RuntimeReadScope | RuntimeInactiveReason, cursors: TreeCursors, key?: string) {
+  if (typeof scope === "string") throw key === undefined ? treeFailure(unavailable(scope)) : staleTree();
+  const cursor = key === undefined ? undefined : cursors.get(scope, key);
+  const result = await withinBinding(scope, async () => {
+    try {
+      return await readEntryPage(scope, { position: cursor?.position, expectedLeafId: cursor?.leafId,
+        acceptLargeSingleton: true });
+    } catch (error) {
+      if (cursor && error instanceof WebError && error.code === "not_found") return ownershipChanged;
+      return entryFailure(error);
+    }
+  });
+  if ("status" in result) throw treeFailure(result);
+  if (!scope.isCurrent()) throw staleTree();
+  const nextCursor = result.next && cursors.put(scope, result.leafId, result.next);
+  return { nodes: previewEntries(result.entries), leafId: result.leafId,
+    ...(nextCursor === undefined ? {} : { nextCursor }) };
+}
+
+export async function navigateSessionTree(scope: RuntimeReadScope | RuntimeInactiveReason,
+  action: Extract<Action, { action: "navigate" }>, beforeWrite: (target: NativeRuntimeBinding) => void,
+  isBusy: () => boolean) {
+  if (typeof scope === "string") throw treeFailure(unavailable(scope));
+  const busy = () => new WebError(409, "session_busy", "请等会话空闲且队列清空后再切换分支。");
+  const checkReady = async () => {
+    const bound = await bindingState(scope);
+    if ("status" in bound) throw treeFailure(bound);
+    const { state } = bound;
+    if (!scope.isCurrent()) throw staleTree();
+    if (isBusy() || state.isStreaming === true || state.isCompacting === true ||
+        (typeof state.pendingMessageCount === "number" && state.pendingMessageCount > 0) ||
+        array(state.pendingDialogs).length > 0 || array(state.pendingQuestions).length > 0) throw busy();
+  };
+  await checkReady();
+  let expectedLeafId = action.expectedLeafId;
+  if (expectedLeafId === undefined) {
+    try { expectedLeafId = await readNativeLeaf(scope); }
+    catch (error) { throw treeFailure(entryFailure(error)); }
+    await checkReady();
+  }
+  if (!scope.isCurrent()) throw staleTree();
+  if (isBusy()) throw busy();
+  beforeWrite(scope.target);
+  let result: WireObject;
+  try {
+    result = await scope.engine.requestExisting("navigate_tree", {
+      sessionId: scope.target.route, targetId: action.targetId, expectedLeafId,
+    });
+  } catch (error) {
+    if (!(error instanceof WebError)) throw error;
+    if (error.code === "stale_leaf" || error.code === "not_found" || !scope.isCurrent()) throw staleTree();
+    if (error.code === "streaming") throw busy();
+    throw treeFailure(entryFailure(error));
+  }
+  const after = await sameBinding(scope);
+  if (after) throw treeFailure(after);
+  if (!scope.isCurrent()) throw staleTree();
+  const leaf = entryId.nullable().safeParse(result.leafId);
+  if (!leaf.success || typeof result.cancelled !== "boolean") throw treeFailure(malformed);
+  return { cancelled: result.cancelled, leafId: leaf.data,
+    ...(typeof result.editorText === "string" && Buffer.byteLength(result.editorText, "utf8") <= 200_000
+      ? { editorText: result.editorText } : {}) };
+}
+
+type BranchFailure = { readonly status: "unavailable";
+  readonly reason: UnavailableReason | "ownership_changed" | "malformed" | "incomplete" };
+type WorkbenchStatus = Empty | BranchFailure |
   { readonly status: "ok"; readonly currentTodo?: string; readonly pendingTodo: number };
 
-export async function readWorkbenchStatus(scope: RuntimeReadScope | RuntimeInactiveReason): Promise<WorkbenchStatus> {
+export async function readBranchRuntime(scope: RuntimeReadScope | RuntimeInactiveReason, passive = false):
+  Promise<Extract<RuntimeBranchView, { status: "ok" }> | BranchFailure> {
   if (typeof scope === "string") return { status: "unavailable", reason: scope };
   const result = await withinBinding(scope, async () => {
-    let tree: WireObject;
-    try {
-      tree = await scope.engine.requestExisting("get_tree", { sessionId: scope.target.route }, TIMEOUT);
-    } catch (error) {
-      return fault(error);
+    const pages: Awaited<ReturnType<typeof readEntryPage>>[] = [];
+    const limit = passive ? WORKBENCH_PAGE_LIMIT : BRANCH_PAGE_LIMIT;
+    for (let i = 0; i < limit; i++) {
+      let page;
+      const position = pages.at(-1)?.next;
+      if (position) await scope.verifyWorkspace();
+      try { page = await readEntryPage(scope, { position, expectedLeafId: pages[0]?.leafId }); }
+      catch (error) {
+        if (position && error instanceof WebError && error.code === "not_found") return ownershipChanged;
+        return entryFailure(error);
+      }
+      pages.push(page);
+      if (!page.next) {
+        const view = projectPagedRuntimeBranch(pages.toReversed().flatMap(page => page.entries), page.leafId);
+        if (view.status === "invalid") return view.reason === "tree-budget" ? incomplete : malformed;
+        return view.incomplete ? incomplete : view;
+      }
     }
-    const view = projectRuntimeBranch(tree);
-    if (view.status === "invalid") return malformed;
-    if (view.incomplete) return { status: "unavailable", reason: "incomplete" } as const;
-    if (view.todo.status === "none") return empty;
-    const tasks = view.todo.phases.flatMap(phase => phase.tasks);
-    const current = tasks.find(task => task.status === "in_progress");
-    return { status: "ok", pendingTodo: tasks.filter(task => task.status === "pending").length,
-      ...(current === undefined ? {} : { currentTodo: current.content }) } as const;
+    return incomplete;
   });
   return result.status === "malformed" || result.status === "ownership_changed"
-    ? { status: "unavailable", reason: result.status } : result;
+    ? { status: "unavailable", reason: result.status } as const : result;
+}
+
+export async function readWorkbenchStatus(scope: RuntimeReadScope | RuntimeInactiveReason): Promise<WorkbenchStatus> {
+  const view = await readBranchRuntime(scope, true);
+  if (view.status === "unavailable") return view;
+  if (view.todo.status === "none") return empty;
+  const tasks = view.todo.phases.flatMap(phase => phase.tasks);
+  const current = tasks.find(task => task.status === "in_progress");
+  return { status: "ok", pendingTodo: tasks.filter(task => task.status === "pending").length,
+    ...(current === undefined ? {} : { currentTodo: current.content }) };
 }

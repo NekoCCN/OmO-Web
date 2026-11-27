@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmod, mkdir, rename, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { TerminalSessions } from "../src/terminal-sessions.ts";
-import { terminalFixture } from "./terminal-socket-fixture.ts";
+import { terminalFixture, transcriptPadding, writeLargeTerminalTranscript, writeTerminalBytes } from "./terminal-socket-fixture.ts";
 
 const cleanups: (() => void | Promise<void>)[] = [];
 afterEach(async () => {
@@ -282,6 +282,118 @@ test("bounds untrusted registry and wire reads and degrades when no profile is c
   expect((await f.adapter.list()).sessions).toEqual([]);
   expect(f.state.acceptedSecrets).toBe(2);
 });
+
+test("attaches across a valid native-like transcript over the generic limit", async () => {
+  const f = await setup();
+  const { id } = await f.discover();
+  f.state.messagesReply = writeLargeTerminalTranscript;
+  const snapshot = await f.adapter.attach(id);
+  expect(snapshot.session.attached).toBe(true);
+  expect(snapshot.transcript).toEqual({ status: "truncated" });
+  expect(snapshot.messages).toEqual([{ role: "assistant", content: "近况 🐋", timestamp: 42 }]);
+  expect(f.trace.filter(row => row.type === "get_messages")).toHaveLength(1);
+});
+
+test("reports rows trimmed to make room for verified live text and never splits a surrogate pair", async () => {
+  const f = await setup();
+  const { id } = await f.discover();
+  f.state.running = true;
+  f.state.messages = Array.from({ length: 100 }, (_, i) => ({ role: "user", content: `row ${i}` }));
+  const initial = await f.adapter.attach(id);
+  expect(initial.transcript).toBeUndefined();
+  expect(initial.messages).toHaveLength(100);
+  const changed = f.nextChange();
+  f.emit("message_update", { message: { role: "assistant", content: "live 🐋", timestamp: 1 } });
+  await changed;
+  const live = await f.adapter.snapshot(id);
+  expect(live.transcript).toEqual({ status: "truncated" });
+  expect(live.messages).toHaveLength(100);
+  expect(live.messages[0]?.content).toBe("row 1");
+  expect(live.messages.at(-1)).toMatchObject({ content: "live 🐋", streaming: true });
+
+  f.state.running = false;
+  f.state.messages = [{ role: "assistant", content: `${"x".repeat(15_999)}🐋` }];
+  const settled = await f.adapter.snapshot(id);
+  expect(settled.transcript).toEqual({ status: "truncated" });
+  expect(settled.messages[0]?.content).toBe("x".repeat(15_999));
+});
+
+test("drains the known transcript past the parser byte ceiling and sends one explicit input on the same attachment", async () => {
+  const f = await setup();
+  const { id } = await f.discover();
+  f.state.messagesReply = (peer, requestId) => writeLargeTerminalTranscript(peer, requestId, 1024);
+  expect(await f.adapter.attach(id)).toMatchObject({
+    session: { attached: true }, state: { running: false }, transcript: { status: "unavailable" }, messages: [],
+  });
+  const input = { message: "明示输入 🐋", mode: "prompt", clientMessageId: "after-read-cap" } as const;
+  expect(await f.adapter.input(id, input)).toEqual({ disposition: "started", clientMessageId: input.clientMessageId, duplicate: false });
+  expect(await f.adapter.input(id, input)).toEqual({ disposition: "started", clientMessageId: input.clientMessageId, duplicate: true });
+  expect(f.delivered.map(row => row.message)).toEqual([input.message]);
+  expect(f.trace.filter(row => ["get_messages", "attach_session", "prompt"].includes(String(row.type))).map(row => row.type))
+    .toEqual(["attach_session", "get_messages", "prompt"]);
+  expect(f.state.acceptedSecrets).toBe(2); // One discovery observer, one attached control peer.
+});
+
+test.each([
+  ["foreign large response", "terminal_read_limit"],
+  ["oversized event", "terminal_read_limit"],
+  ["wrong command with matching id", "terminal_protocol"],
+  ["wrong command before the transcript work limit", "terminal_protocol"],
+  ["duplicate id", "terminal_protocol"],
+  ["closed during a matched frame", "terminal_offline"],
+] as const)("preserves fail-closed behavior for a %s", async (caseName, code) => {
+  const f = await setup();
+  const { id } = await f.discover();
+  await f.adapter.attach(id);
+  f.state.messagesReply = async (peer, requestId) => {
+    if (caseName === "foreign large response") return writeLargeTerminalTranscript(peer, "foreign");
+    if (caseName === "oversized event") {
+      await writeTerminalBytes(peer, '{"type":"message_update","payload":"');
+      for (let i = 0; i < 35; i++) await writeTerminalBytes(peer, transcriptPadding);
+      await writeTerminalBytes(peer, '"}\n');
+      return;
+    }
+    const prefix = `{"type":"response","id":${JSON.stringify(requestId)},`;
+    if (caseName === "closed during a matched frame") {
+      await writeTerminalBytes(peer, prefix + `"command":"get_messages","success":true,"data":{"messages":[`);
+      peer.end();
+    } else if (caseName === "wrong command with matching id") {
+      await writeTerminalBytes(peer, prefix + `"command":"get_state","success":true,"data":{"messages":[]}}\n`);
+    } else if (caseName === "wrong command before the transcript work limit") {
+      await writeTerminalBytes(peer, prefix + `"command":"get_state","success":true,"data":${"[".repeat(70)}0${"]".repeat(70)}}\n`);
+    } else {
+      await writeTerminalBytes(peer, prefix + `"id":"foreign","command":"get_messages","success":true,"data":{"messages":[]}}\n`);
+    }
+  };
+  await expect(f.adapter.snapshot(id)).rejects.toMatchObject({ code });
+  await expect(f.adapter.input(id, { message: "not sent", mode: "prompt", clientMessageId: "closed" }))
+    .rejects.toMatchObject({ code: "terminal_not_attached" });
+  expect(f.delivered).toEqual([]);
+  expect(f.state.acceptedSecrets).toBe(2);
+});
+
+test("keeps a draining read pending beyond the generic timeout and rejects a drain that never realigns", async () => {
+  const f = await setup();
+  const { id } = await f.discover();
+  await f.adapter.attach(id);
+  const started = Promise.withResolvers<void>();
+  f.state.messagesReply = async (peer, requestId) => {
+    await writeTerminalBytes(peer, `{"id":${JSON.stringify(requestId)},"type":"response","command":"get_messages","data":${"[".repeat(70)}`);
+    started.resolve();
+  };
+  const read = f.adapter.snapshot(id);
+  let settled = false;
+  const markSettled = () => { settled = true; };
+  void read.then(markSettled, markSettled);
+  await started.promise;
+  await Bun.sleep(1_650);
+  expect(settled).toBe(false);
+  const control = expect(f.adapter.input(id, { message: "not sent", mode: "prompt", clientMessageId: "draining" }))
+    .rejects.toMatchObject({ code: "terminal_offline" });
+  await expect(read).rejects.toMatchObject({ code: "terminal_timeout" });
+  await control;
+  expect(f.trace.filter(row => ["attach_session", "prompt"].includes(String(row.type))).map(row => row.type)).toEqual(["attach_session"]);
+}, 7_000);
 
 test("rejects command and attachment input instead of expanding the native RPC allowlist", async () => {
   const f = await setup();

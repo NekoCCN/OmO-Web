@@ -426,6 +426,16 @@ class HandoffEngine extends Engine {
         const { entries } = await this.readJournal(runtime.path);
         return { tree: [], leafId: runtime.leaf ?? this.leafOf(entries) };
       }
+      case "get_entries": {
+        if (fields.tail !== 1 || fields.maxBytes !== 262_144 || Object.keys(fields).length !== 3) {
+          throw new WebError(409, "invalid_argument", "Expected a bounded leaf read.");
+        }
+        const { entries } = await this.readJournal(runtime.path);
+        const tail = entries.slice(-1);
+        const hasMore = entries.length > 1;
+        return { entries: tail, leafId: runtime.leaf ?? this.leafOf(entries), hasMore,
+          ...(hasMore ? { next_before: tail[0].id } : {}) };
+      }
       case "get_fork_messages": {
         const { entries } = await this.readJournal(runtime.path);
         return { messages: entries
@@ -474,6 +484,9 @@ class HandoffEngine extends Engine {
       }
       case "navigate_tree": {
         const { entries } = await this.readJournal(runtime.path);
+        if (fields.expectedLeafId !== (runtime.leaf ?? this.leafOf(entries))) {
+          throw new WebError(409, "stale_leaf", "Stale.");
+        }
         if (!entries.some(entry => entry.id === fields.targetId)) throw new WebError(409, "stale_branch", "Stale.");
         runtime.leaf = typeof fields.targetId === "string" ? fields.targetId : null;
         return { leafId: runtime.leaf, cancelled: false };

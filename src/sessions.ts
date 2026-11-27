@@ -1,22 +1,25 @@
 import { link, lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
+import { MessagesFrameError } from "./bounded-messages.ts";
 import { composeMessage, projectCommands, refuseRuntimeCommandRelay, resolveCommand } from "./commands.ts";
 import { modelProfile, registeredModel } from "./model-options.ts";
 import type { ModelTarget } from "./model-options.ts";
-import { bindNativeRuntime, readNativeDag, readNativeRuntime, readWorkbenchStatus, unavailableNativeRuntime } from "./native-runtime.ts";
+import { bindNativeRuntime, navigateSessionTree, readBranchRuntime, readNativeDag, readNativeRuntime, readSessionTree,
+  readWorkbenchStatus, unavailableNativeRuntime } from "./native-runtime.ts";
 import type { NativeRuntimeBinding, RuntimeInactiveReason, RuntimeReadScope } from "./native-runtime.ts";
 import { readNativeSurfaces } from "./native-surfaces.ts";
-import { WebError, array, browserEvent, model, pick, record, sessionKey, state, transcriptMessage, transcriptTree } from "./protocol.ts";
+import { WebError, array, browserEvent, model, pick, record, sessionKey, state } from "./protocol.ts";
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
 import type { Engine } from "./engine.ts";
 import { readOwnedJournalHeader, sessionDirName } from "./cli-history.ts";
 import type { ScopedBranchSource } from "./cli-history.ts";
-import { projectRuntimeBranch } from "./runtime-branch.ts";
 import { projectSessionMemory } from "./runtime-metrics.ts";
-import { branchBusy, loadBranchSource, loadSavedWebBranch, nativeBranchError, SessionBranches, staleBranch } from "./session-branches.ts";
+import { TreeCursors } from "./session-entry-pages.ts";
+import { branchBusy, loadBranchSource, loadSavedWebBranch, nativeBranchError, readBranchLeaf, SessionBranches, staleBranch } from "./session-branches.ts";
 import type { BranchOptions, BranchSelection, LoadedBranchSource, PreparedBranch } from "./session-branches.ts";
 import { StreamSpeed } from "./stream-speed.ts";
+import { jsonBytes, snapshotStateTooLarge, TranscriptCache, TRANSCRIPT_PAGE_BYTES } from "./transcript-pages.ts";
 import { WorkspaceAccess } from "./workspace-access.ts";
 
 const savedSession = z.strictObject({
@@ -36,6 +39,11 @@ const savedSession = z.strictObject({
 type SavedSession = Readonly<z.infer<typeof savedSession>>;
 const INSTRUCTIONS_FILE = "AGENTS.md";
 const INSTRUCTIONS_MAX_BYTES = 64 * 1024;
+const QUEUE_PREVIEW_ROWS = 30;
+const QUEUE_PREVIEW_TEXT = 240;
+const QUEUE_SCAN_ROWS = QUEUE_PREVIEW_ROWS * 4;
+const activeQueueStates = new Set(["held", "queued", "sending", "pending", "accepted"]);
+const queueModes = new Set(["prompt", "steer", "followUp", "follow_up"]);
 const instructionsReply = z.discriminatedUnion("exists", [
   z.object({ cwd: z.string(), path: z.string(), exists: z.literal(true), content: z.string() }),
   z.object({ cwd: z.string(), path: z.string(), exists: z.literal(false), content: z.null() }),
@@ -49,24 +57,55 @@ export type CliResumeSource = { readonly cwd: string; readonly nativeSessionId: 
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`;
 export type BranchResult = { readonly cancelled: true; readonly session?: never; readonly editorText?: never } |
   { readonly session: SessionView; readonly editorText?: string; readonly cancelled?: false };
+type Snapshot = {
+  session: SessionView;
+  state: WireObject;
+  messages: WireObject[];
+  page?: { id: string; olderCursor?: string };
+  transcript?: { status: "truncated" | "unavailable" };
+  handoff: { eligible: boolean; reason?: string };
+  generationSpeed?: WireObject;
+};
+type SnapshotScope = {
+  route: string;
+  isCurrent: () => boolean;
+  check: () => void;
+  verifyWorkspace: () => Promise<void>;
+  identify: (raw: WireObject) => void;
+  verifySource: () => Promise<void>;
+};
+type PendingSnapshot = {
+  scope: SnapshotScope;
+  abort: AbortController;
+  result: Promise<Snapshot>;
+  waiters: number;
+};
+const sessionChanged = () => new WebError(409, "session_changed", "会话连接已切换，请重新读取。");
+const snapshotAborted = () => new WebError(408, "snapshot_aborted", "本次会话读取已取消。");
 
 export class Sessions {
   readonly #rows = new Map<SessionKey, SavedSession>();
   readonly #live = new Map<SessionKey, { readonly route: string; readonly runtime?: NativeRuntimeBinding;
-    readonly speed?: StreamSpeed; running: boolean }>();
+    readonly speed?: StreamSpeed; running: boolean; transcriptRevision?: number }>();
   readonly #opening = new Map<SessionKey, Promise<void>>();
   readonly #writes = new Map<SessionKey, Promise<unknown>>();
   readonly #releasing = new Set<SessionKey>();
   readonly #modelWrites = new Set<SessionKey>();
+  readonly #treeCursors = new TreeCursors();
+  readonly #treeWrites = new WeakMap<NativeRuntimeBinding, { pending: boolean }>();
+  readonly #transcripts: TranscriptCache;
+  readonly #snapshots = new Map<SessionKey, PendingSnapshot>();
   readonly #cliOpening = new Map<string, Promise<SessionView>>();
   readonly #directory: string;
   readonly #branches: SessionBranches;
+  #stopping = false;
 
   constructor(dataDir: string, readonly workspaces: readonly string[] | WorkspaceAccess, readonly engine: Engine,
     readonly fanout: (value: WireObject) => void,
     readonly resolveCli?: (nativeSessionId: string, cwd: string) => Promise<{ sourcePath: string }>,
     readonly hostGuard?: { sameProfile: boolean; profileDir?: string }) {
     this.#directory = resolve(dataDir, "sessions");
+    this.#transcripts = new TranscriptCache();
     this.#branches = new SessionBranches(engine, route => [...this.#live.values()].some(live => live.route === route));
   }
 
@@ -302,6 +341,7 @@ export class Sessions {
       route, cwd: row.cwd, sessionFile: opts.nativePlaced === undefined ? sessionPath : initial.sessionFile,
       durableId: bound ?? row.nativeId,
     });
+    this.#transcripts.invalidate(row.id);
     this.#live.set(row.id, { route, runtime, speed: new StreamSpeed(initial.isCompacting === true),
       running: initial.isStreaming === true });
     if (opts.publishName && initial.sessionName !== row.name) {
@@ -483,6 +523,13 @@ export class Sessions {
 
   disconnected() {
     this.#live.clear();
+    this.#transcripts.invalidate();
+  }
+
+  stop() {
+    this.#stopping = true;
+    for (const pending of this.#snapshots.values()) pending.abort.abort();
+    this.#transcripts.stop();
   }
 
   event(frame: WireObject) {
@@ -497,11 +544,18 @@ export class Sessions {
     // the session row stays, but the next enter must reopen against the holder.
     if (frame.type === "session_closed" || frame.type === "session_parked" || frame.type === "session_released") {
       this.#live.delete(sessionId);
+      this.#transcripts.invalidate(sessionId);
       this.fanout({ type: "sessions" });
     }
     if (frame.type === "session_replaced") {
       // A stable route is not proof of a stable native journal.
       this.#live.set(sessionId, { route: live.route, running: live.running });
+      this.#transcripts.invalidate(sessionId);
+    }
+    if (frame.type === "compaction_end" && frame.aborted !== true && frame.success !== false &&
+        !frame.errorMessage && !frame.error) {
+      live.transcriptRevision = (live.transcriptRevision ?? 0) + 1;
+      this.#transcripts.invalidate(sessionId);
     }
     const event = browserEvent(frame);
     if (event) this.fanout({ ...event, sessionId });
@@ -511,17 +565,161 @@ export class Sessions {
     }
   }
 
-  async snapshot(id: SessionKey) {
+  #snapshotScope(id: SessionKey): SnapshotScope {
+    const row = this.#row(id);
     const live = this.#binding(id);
-    const [rawState, history] = await Promise.all([
-      this.engine.requestExisting("get_state", { sessionId: live.route }),
-      this.engine.requestExisting("get_messages", { sessionId: live.route }),
-    ]);
-    const session = this.#view(this.#row(id));
-    const generationSpeed = this.#live.get(id) === live ? live.speed?.latest : undefined;
-    return { session, state: { ...state(rawState), isStreaming: session.running || rawState.isStreaming === true },
-      messages: array(history.messages).flatMap(m => transcriptMessage(m) ?? []),
-      handoff: this.#handoffEligibility(record(rawState)), ...(generationSpeed === undefined ? {} : { generationSpeed }) };
+    const host = this.engine.status;
+    const revision = live.transcriptRevision;
+    const treeWrite = () => live.runtime && this.#treeWrites.get(live.runtime);
+    const navigation = treeWrite();
+    const isCurrent = () => {
+      const current = this.#rows.get(id);
+      return !this.#stopping && this.engine.status === host && host.online && this.#live.get(id) === live &&
+        current?.cwd === row.cwd && current.workspaceKey === row.workspaceKey && current.nativeId === row.nativeId &&
+        !this.#opening.has(id) && !this.#releasing.has(id) && live.transcriptRevision === revision &&
+        !navigation?.pending && treeWrite() === navigation &&
+        ![...this.#live].some(([other, candidate]) => other !== id && candidate.route === live.route);
+    };
+    const check = () => { if (!isCurrent()) throw sessionChanged(); };
+    let workspace: { key?: string } | undefined;
+    const verifyWorkspace = async () => {
+      check();
+      const key = await this.#requireRowWorkspace(row);
+      if (workspace && workspace.key !== key) throw sessionChanged();
+      workspace ??= { key };
+      check();
+    };
+    // Modern peers expose the exact active source in get_state. Old hosts
+    // without these fields are fenced by their route, open incarnation and events.
+    const runtime = live.runtime;
+    let source = runtime && { sessionId: runtime.sessionId, sessionFile: runtime.sessionFile };
+    const matches = (raw: WireObject) => !source ||
+      (raw.cwd === row.cwd && raw.sessionId === source.sessionId && raw.sessionFile === source.sessionFile);
+    const identify = (raw: WireObject) => {
+      check();
+      if (!matches(raw) || (typeof raw.cwd === "string" && raw.cwd !== row.cwd)) throw sessionChanged();
+      if (raw.cwd === row.cwd && typeof raw.sessionId === "string" && raw.sessionId &&
+          typeof raw.sessionFile === "string" && raw.sessionFile) {
+        source = { sessionId: raw.sessionId, sessionFile: raw.sessionFile };
+      }
+    };
+    const verifySource = async () => {
+      await verifyWorkspace();
+      if (source) {
+        const raw = await this.engine.requestExisting("get_state", { sessionId: live.route }, 5000).catch(error => {
+          if (!(error instanceof WebError)) throw error;
+          throw sessionChanged();
+        });
+        if (!matches(raw)) throw sessionChanged();
+        await verifyWorkspace();
+      }
+      check();
+    };
+    return { route: live.route, check, isCurrent, verifyWorkspace, identify, verifySource };
+  }
+
+  async snapshot(id: SessionKey, signal?: AbortSignal): Promise<Snapshot> {
+    if (signal?.aborted) throw snapshotAborted();
+    let pending = this.#snapshots.get(id);
+    if (!pending?.scope.isCurrent() || pending.abort.signal.aborted) {
+      const scope = this.#snapshotScope(id);
+      scope.check();
+      const abort = new AbortController();
+      const attempt: PendingSnapshot = { scope, abort, waiters: 0,
+        result: this.#readSnapshot(id, scope, abort.signal).finally(() => {
+          if (this.#snapshots.get(id) === attempt) this.#snapshots.delete(id);
+        }) };
+      this.#snapshots.set(id, attempt);
+      pending = attempt;
+    }
+    pending.waiters++;
+    let onAbort: (() => void) | undefined;
+    try {
+      const result = signal === undefined ? await pending.result : await Promise.race([
+        pending.result,
+        new Promise<never>((_, reject) => {
+          onAbort = () => reject(snapshotAborted());
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+      ]);
+      if (signal?.aborted) throw snapshotAborted();
+      pending.scope.check();
+      return result;
+    } finally {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
+      if (--pending.waiters === 0 && this.#snapshots.get(id) === pending) pending.abort.abort();
+    }
+  }
+
+  async #readSnapshot(id: SessionKey, scope: SnapshotScope, signal: AbortSignal): Promise<Snapshot> {
+    const check = () => {
+      if (signal.aborted) throw snapshotAborted();
+      scope.check();
+    };
+    await scope.verifyWorkspace();
+    check();
+    const capture = this.#transcripts.begin(id, scope.check, scope.verifySource);
+    const onAbort = () => this.#transcripts.drop(capture);
+    signal.addEventListener("abort", onAbort, { once: true });
+    let committed = false;
+    try {
+      const [rawState, history] = await Promise.all([
+        this.engine.requestExisting("get_state", { sessionId: scope.route }),
+        this.engine.requestExisting("get_messages", { sessionId: scope.route }, undefined, row => capture.append(row)).catch(error => {
+          // Only a locally proven read limit may return the interaction state
+          // without history. Native refusals and malformed receipts publish nothing.
+          if (!(error instanceof MessagesFrameError) || error.reason === "malformed") throw error;
+          return undefined;
+        }),
+      ]);
+      check();
+      scope.identify(rawState);
+      await scope.verifySource();
+      check();
+      const session = this.#view(this.#row(id));
+      const generationSpeed = this.#live.get(id)?.speed?.latest;
+      const base = { session, state: { ...state(rawState), isStreaming: session.running || rawState.isStreaming === true },
+        handoff: this.#handoffEligibility(rawState), ...(generationSpeed === undefined ? {} : { generationSpeed }) };
+      if (!history) {
+        this.#transcripts.invalidate(id);
+        const result = { ...base, messages: [], transcript: { status: "unavailable" as const } };
+        if (jsonBytes(result) > TRANSCRIPT_PAGE_BYTES) throw snapshotStateTooLarge();
+        return result;
+      }
+      if (!capture.seen) {
+        if (!Array.isArray(history.messages)) throw new MessagesFrameError("malformed");
+        for (const row of history.messages) capture.append(record(row), true);
+        if (history.historyTruncated === true) capture.markOmitted();
+      }
+      if (history.historyOmitted === true) capture.markOmitted();
+      const result = capture.page(undefined, base);
+      await scope.verifySource();
+      check();
+      this.#transcripts.commit(capture);
+      committed = true;
+      return result;
+    } finally {
+      signal.removeEventListener("abort", onAbort);
+      if (!committed) this.#transcripts.drop(capture);
+    }
+  }
+
+  async transcript(id: SessionKey, token: string, content: boolean) {
+    const capture = this.#transcripts.current(id);
+    const cursor = capture.cursor(token, content);
+    try {
+      await capture.verify();
+      this.#transcripts.assertCurrent(capture);
+      const result = content ? capture.content(cursor) : capture.page(cursor.row);
+      await capture.verify();
+      this.#transcripts.assertCurrent(capture);
+      capture.check();
+      return result;
+    } catch (error) {
+      if (error instanceof WebError && ["history_capture_failed", "session_changed", "workspace_refused", "unknown_session",
+        "session_not_attached"].includes(error.code)) this.#transcripts.drop(capture);
+      throw error;
+    }
   }
 
   #runtimeRead(id: SessionKey): RuntimeReadScope | RuntimeInactiveReason {
@@ -597,7 +795,39 @@ export class Sessions {
   }
 
   workbenchStatus(id: SessionKey) {
-    return readWorkbenchStatus(this.#runtimeRead(id));
+    return readWorkbenchStatus(this.#historyRead(id));
+  }
+
+  #historyRead(id: SessionKey): RuntimeReadScope | RuntimeInactiveReason {
+    const scope = this.#runtimeRead(id);
+    if (typeof scope === "string") return scope;
+    const write = this.#treeWrites.get(scope.target);
+    if (write?.pending) return "inactive";
+    return { ...scope, isCurrent: () => scope.isCurrent() && this.#treeWrites.get(scope.target) === write };
+  }
+
+  tree(id: SessionKey, cursor?: string) {
+    return readSessionTree(this.#historyRead(id), this.#treeCursors, cursor);
+  }
+
+  branchRuntime(id: SessionKey) {
+    return readBranchRuntime(this.#historyRead(id));
+  }
+
+  async #navigate(id: SessionKey, action: Extract<Action, { action: "navigate" }>) {
+    const scope = this.#runtimeRead(id);
+    let write: { pending: boolean } | undefined;
+    try {
+      return await navigateSessionTree(scope, action, target => {
+        write = { pending: true };
+        this.#treeWrites.set(target, write);
+        this.#treeCursors.invalidate(target);
+        this.#transcripts.invalidate(id);
+      }, () => this.#live.get(id)?.running === true || this.#modelWrites.has(id) ||
+        (typeof scope !== "string" && this.#treeWrites.get(scope.target)?.pending === true));
+    } finally {
+      if (write) write.pending = false;
+    }
   }
 
   nativeDag(id: SessionKey, key: string) {
@@ -637,6 +867,7 @@ export class Sessions {
       throw new WebError(409, "handoff_in_progress", "交接正在进行，请稍后再试。");
     }
     this.#releasing.add(id);
+    this.#transcripts.invalidate(id);
     try {
       await this.#requirePrivateHost("handoff_unsupported");
       let expectedPath = join(this.#directory, `${id}.jsonl`);
@@ -716,7 +947,10 @@ export class Sessions {
       return record(await this.engine.requestExisting("get_state", { sessionId: route }));
     } catch (error) {
       if (error instanceof WebError && error.code === "unknown_session") {
-        if (this.#live.get(id)?.route === route) this.#live.delete(id);
+        if (this.#live.get(id)?.route === route) {
+          this.#live.delete(id);
+          this.#transcripts.invalidate(id);
+        }
         this.fanout({ type: "sessions" });
         throw new WebError(409, "session_not_open", "会话已不在引擎中，请重新恢复会话。");
       }
@@ -768,7 +1002,7 @@ export class Sessions {
     return { eligible: true };
   }
 
-  /** Web source; active sources use the native get_tree leaf, not the last line on disk.
+  /** Web source; active sources use the authoritative native leaf, not the last line on disk.
    * Options are browser-safe. A clone with no current entry is not available. */
   async webBranchOptions(id: SessionKey): Promise<BranchOptions> {
     const loaded = await this.#webBranchSource(id);
@@ -823,8 +1057,8 @@ export class Sessions {
       bookmarked = row.nativeId;
       sourcePath = (await this.resolveCli(row.nativeId, cwd)).sourcePath;
     }
-    const route = this.#live.get(id)?.route;
-    if (!route) {
+    const live = this.#live.get(id);
+    if (!live) {
       if (this.#opening.has(id)) throw branchBusy();
       const saved = bookmarked === undefined
         ? await loadSavedWebBranch(cwd, sourcePath)
@@ -832,18 +1066,21 @@ export class Sessions {
       if (this.#live.has(id) || this.#opening.has(id)) throw branchBusy();
       return saved;
     }
+    const host = this.engine.status;
+    const { route } = live;
+    const isCurrent = () => this.engine.status === host && this.#live.get(id) === live;
     const readSource = async () => {
-      const live = this.#live.get(id);
-      if (live?.route !== route) throw staleBranch();
+      if (!isCurrent()) throw staleBranch();
       if (live.running) throw branchBusy();
-      const request = (name: string) => this.engine.requestExisting(name, { sessionId: route }, 15_000).catch(nativeBranchError);
-      const [source, tree] = await Promise.all([request("get_state"), request("get_tree")]);
+      const [source, leafId] = await Promise.all([
+        this.engine.requestExisting("get_state", { sessionId: route }, 15_000).catch(nativeBranchError),
+        readBranchLeaf({ engine: this.engine, target: { route }, isCurrent }, staleBranch),
+      ]);
       if (live.running || source.isStreaming === true || source.isCompacting === true ||
         source.isBashRunning === true || source.runPaused === true) throw branchBusy();
-      if (this.#live.get(id) !== live || source.cwd !== cwd || source.sessionFile !== sourcePath ||
-        typeof source.sessionId !== "string" || (bookmarked !== undefined && source.sessionId !== bookmarked) ||
-        (tree.leafId !== null && typeof tree.leafId !== "string")) throw staleBranch();
-      return { cwd, sourcePath, nativeSessionId: source.sessionId, leafId: tree.leafId };
+      if (!isCurrent() || source.cwd !== cwd || source.sessionFile !== sourcePath ||
+        typeof source.sessionId !== "string" || (bookmarked !== undefined && source.sessionId !== bookmarked)) throw staleBranch();
+      return { cwd, sourcePath, nativeSessionId: source.sessionId, leafId };
     };
     const source = await readSource();
     const loaded = await loadBranchSource(source, true);
@@ -1005,33 +1242,69 @@ export class Sessions {
   async details(id: SessionKey) {
     const live = this.#binding(id);
     const params = { sessionId: live.route };
-    // Runtime visibility is read-only: the raw tree feeds both the transcript
-    // view and the active-branch Todo/memory projection; state and the
-    // per-route list_sessions row feed labeled usage/memory panels. Both are
-    // best-effort and surface as explicit unavailable, never fake zeros.
-    const [stats, queue, rawTree, rawState, listing] = await Promise.all([
+    // Optional queue text, history, and branch panels do not gate the overview.
+    const [stats, rawState, listing] = await Promise.all([
       this.engine.requestExisting("get_session_stats", params),
-      this.engine.requestExisting("get_pending_inputs", params),
-      this.engine.requestExisting("get_tree", params),
       this.engine.requestExisting("get_state", params).catch(() => undefined),
       this.engine.requestExisting("list_sessions").catch(() => undefined),
     ]);
     const safeState = rawState && state(rawState);
+    const pendingCount = safeState?.pendingMessageCount;
     const generationSpeed = this.#live.get(id) === live ? live.speed?.latest : undefined;
     return {
       stats: pick(stats, ["userMessages", "assistantMessages", "toolCalls", "toolResults", "totalMessages", "tokens", "cost", "contextUsage", "failures"]),
-      queue: pick(queue, ["lifetimeId", "throughCursor", "inputs", "outcomes"]),
-      tree: transcriptTree(rawTree),
-      runtime: projectRuntimeBranch(rawTree),
       state: safeState && {
         ...pick(safeState, ["model", "thinkingLevel", "thinkingLevelSource", "fastMode", "autoCompactionEnabled",
           "permissionPreset", "effectivePermissionPreset"]),
+        ...(typeof pendingCount === "number" && Number.isSafeInteger(pendingCount) && pendingCount >= 0
+          ? { pendingMessageCount: pendingCount } : {}),
         contextUsage: pick(safeState.contextUsage, ["tokens", "contextWindow", "percent"]),
         usageTotals: pick(safeState.usageTotals, ["input", "output", "cacheRead", "cacheWrite", "latestCacheHitRate"]),
       },
       sessionMemory: projectSessionMemory(listing, params.sessionId),
       ...(generationSpeed === undefined ? {} : { generationSpeed }),
     };
+  }
+
+  async queue(id: SessionKey) {
+    const row = this.#row(id);
+    const live = this.#binding(id);
+    const host = this.engine.status;
+    const verify = async () => {
+      await this.#requireRowWorkspace(row);
+      if (this.engine.status !== host || this.#live.get(id) !== live || this.#opening.has(id) || this.#releasing.has(id)) {
+        throw new WebError(409, "session_changed", "会话连接已切换，请重新读取。");
+      }
+    };
+    await verify();
+    const queue = await this.engine.requestExisting("get_pending_inputs", { sessionId: live.route }, 8_000).catch(error => {
+      if (!(error instanceof WebError)) throw error;
+      if (error.status === 502 && error.code === "engine_frame_too_large") {
+        throw new WebError(502, "queue_too_large", "原生队列响应超过读取上限。");
+      }
+      throw new WebError(502, "queue_read_failed", "无法读取待处理输入。");
+    });
+    await verify();
+    if (!Array.isArray(queue.inputs)) throw new WebError(502, "queue_read_failed", "无法读取待处理输入。");
+    const inputs: { readonly text: string; readonly state?: string; readonly requestedMode?: string }[] = [];
+    let truncated = queue.inputs.length > QUEUE_SCAN_ROWS;
+    for (const row of queue.inputs.slice(0, QUEUE_SCAN_ROWS)) {
+      const input = record(row);
+      if (input.state != null && (typeof input.state !== "string" || !activeQueueStates.has(input.state))) continue;
+      if (inputs.length === QUEUE_PREVIEW_ROWS) {
+        truncated = true;
+        break;
+      }
+      const text = typeof input.text === "string" ? input.text : "";
+      if (text.length > QUEUE_PREVIEW_TEXT) truncated = true;
+      inputs.push({
+        text: text.slice(0, QUEUE_PREVIEW_TEXT).replace(/[\uD800-\uDBFF]$/u, ""),
+        ...(typeof input.state === "string" ? { state: input.state } : {}),
+        ...(typeof input.requestedMode === "string" && queueModes.has(input.requestedMode)
+          ? { requestedMode: input.requestedMode } : {}),
+      });
+    }
+    return { inputs, truncated };
   }
 
   async action(id: SessionKey, action: Action): Promise<{ result: WireObject; session: SessionView }> {
@@ -1041,6 +1314,10 @@ export class Sessions {
     if (action.action === "resume") {
       await this.#resume(row);
       return { result: {}, session: this.#view(this.#row(id)) };
+    }
+    if (action.action === "navigate") {
+      const result = await this.#navigate(id, action);
+      return { result, session: this.#view(this.#row(id)) };
     }
     if (this.workspaces instanceof WorkspaceAccess && action.action !== "abort") {
       await this.#requireRowWorkspace(row);
@@ -1120,16 +1397,19 @@ export class Sessions {
           (typeof current.pendingMessageCount === "number" && current.pendingMessageCount > 0) || this.#live.get(id)?.running) {
           throw new WebError(409, "session_busy", "请等会话空闲且队列清空后再压缩，或先取消归档。");
         }
-        await request("compact", { customInstructions: action.instructions }, 180_000);
+        const live = this.#live.get(id);
+        const revision = live?.transcriptRevision;
+        const result = await request("compact", { customInstructions: action.instructions }, 180_000);
+        // Some compatible peers acknowledge a successful explicit compaction
+        // without a compaction_end event.
+        if (live && this.#live.get(id) === live && live.transcriptRevision === revision &&
+            result.success !== false && result.aborted !== true && !result.error && !result.errorMessage) {
+          live.transcriptRevision = (revision ?? 0) + 1;
+          this.#transcripts.invalidate(id);
+        }
         break;
       }
       case "clearQueue": await request("clear_queue"); break;
-      case "navigate": {
-        const current = await request("get_tree");
-        result = pick(await request("navigate_tree", { targetId: action.targetId, expectedLeafId: current.leafId }),
-          ["cancelled", "editorText", "leafId"]);
-        break;
-      }
       case "answer": {
         const pending = state(await request("get_state"));
         const entry = [...array(pending.pendingQuestions), ...array(pending.pendingDialogs)].map(record).find(d => d.id === action.requestId);

@@ -2,7 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 import { z } from "zod";
 import { WebError } from "./protocol.ts";
-import { TERMINAL_COMMANDS, terminalProtocol } from "./terminal-wire.ts";
+import { TERMINAL_COMMANDS, TerminalRefusal, TerminalTranscriptUnavailable, terminalProtocol } from "./terminal-wire.ts";
 import type { TerminalPeer } from "./terminal-wire.ts";
 
 const nativeId = z.string().min(1).max(256);
@@ -42,10 +42,13 @@ export type TerminalSession = {
   readonly attached: boolean;
   readonly running: boolean;
 };
-export type TerminalSnapshot = {
+export type TerminalTranscript = {
+  readonly messages: readonly TerminalMessage[];
+  readonly transcript?: { readonly status: "truncated" | "unavailable" };
+};
+export type TerminalSnapshot = TerminalTranscript & {
   readonly session: TerminalSession;
   readonly state: TerminalState;
-  readonly messages: readonly TerminalMessage[];
 };
 export type TerminalBranchIdentity = {
   readonly cwd: string;
@@ -119,7 +122,7 @@ export function projectState(state: z.infer<typeof stateSchema>): TerminalState 
 
 // Keep only plain visible text: no thinking, images, tool payloads, sender
 // metadata, questions, dialog fields or native transcript/source identities.
-const messagesSchema = z.object({ messages: z.array(z.unknown()) });
+const messagesSchema = z.object({ messages: z.array(z.unknown()), historyTruncated: z.literal(true).optional().catch(undefined) });
 const messageSchema = z.object({
   role: z.enum(["user", "assistant", "custom"]), content: z.unknown(),
   timestamp: z.number().nonnegative().optional(),
@@ -147,27 +150,74 @@ export function displayText(value: string, limit: number): string {
 }
 
 export function projectMessages(data: unknown): readonly TerminalMessage[] {
-  const { messages } = parse(messagesSchema, data);
+  return projectHistory(data).messages;
+}
+
+const HISTORY_ROWS = 100;
+const HISTORY_TEXT = 128_000;
+const MESSAGE_TEXT = 16_000;
+
+function projectHistory(data: unknown): TerminalTranscript {
+  const { messages, historyTruncated } = parse(messagesSchema, data);
   const visible: TerminalMessage[] = [];
-  let remaining = 128_000;
-  for (let index = messages.length - 1; index >= 0 && visible.length < 100 && remaining > 0; index--) {
-    const message = projectMessage(messages[index], Math.min(16_000, remaining));
-    if (!message) continue;
-    remaining -= message.content.length;
-    visible.push(message);
+  let truncated = historyTruncated === true;
+  let remaining = HISTORY_TEXT;
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const value = projectMessage(messages[index], MESSAGE_TEXT);
+    if (!value) continue;
+    if (visible.length === HISTORY_ROWS || remaining === 0) {
+      truncated = true;
+      break;
+    }
+    const { message, clipped } = value;
+    const content = clipText(message.content, remaining);
+    truncated ||= clipped || content !== message.content;
+    if (content.trim() === "") continue;
+    remaining -= content.length;
+    visible.push({ ...message, content });
   }
-  return visible.reverse();
+  return { messages: visible.reverse(), ...(truncated ? { transcript: { status: "truncated" } } : {}) };
+}
+
+export async function readTerminalTranscript(peer: TerminalPeer): Promise<TerminalTranscript> {
+  try { return projectHistory(await peer.request({ type: "get_messages", observe: true })); }
+  catch (error) {
+    if (peer.closed || !(error instanceof TerminalTranscriptUnavailable ||
+        (error instanceof TerminalRefusal && error.code === "terminal_read_limit"))) throw error;
+    return { messages: [], transcript: { status: "unavailable" } };
+  }
+}
+
+export function withStreamingMessage(history: TerminalTranscript, partial: TerminalMessage): TerminalTranscript {
+  const last = history.messages.at(-1);
+  if (last?.role === "assistant" && last.timestamp === partial.timestamp && last.content.startsWith(partial.content)) return history;
+  const messages = [...history.messages, partial];
+  let start = 0;
+  let text = messages.reduce((total, row) => total + row.content.length, 0);
+  while (messages.length - start > HISTORY_ROWS || text > HISTORY_TEXT) text -= messages[start++]!.content.length;
+  return {
+    ...history, messages: messages.slice(start),
+    ...(start && !history.transcript ? { transcript: { status: "truncated" } } : {}),
+  };
 }
 
 export const isAssistant = (value: unknown): boolean => assistantRole.safeParse(value).success;
 
 export function projectStreamingAssistant(value: unknown): TerminalMessage | undefined {
   if (!isAssistant(value)) return;
-  const message = projectMessage(value, 16_000);
-  if (message) return { ...message, streaming: true };
+  const projected = projectMessage(value, MESSAGE_TEXT);
+  if (projected) return { ...projected.message, streaming: true };
 }
 
-function projectMessage(value: unknown, max: number): TerminalMessage | undefined {
+function clipText(text: string, limit: number): string {
+  if (text.length <= limit) return text;
+  const before = text.charCodeAt(limit - 1);
+  const after = text.charCodeAt(limit);
+  const splitsPair = before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+  return text.slice(0, splitsPair ? limit - 1 : limit);
+}
+
+function projectMessage(value: unknown, max: number): { message: TerminalMessage; clipped: boolean } | undefined {
   const raw = messageSchema.safeParse(value);
   if (!raw.success) return;
   const { role, content, timestamp } = raw.data;
@@ -175,21 +225,26 @@ function projectMessage(value: unknown, max: number): TerminalMessage | undefine
   const details = role === "custom" ? deliveryDetails.safeParse(raw.data.details) : undefined;
   const excerpt = details?.success && (details.data.sender || details.data.remote_origin) ? details.data.display_text : undefined;
   let text = "";
+  let clipped = false;
   if (excerpt !== undefined || typeof content === "string") {
-    text = displayText(excerpt ?? String(content), max);
+    const plain = displayText(excerpt ?? String(content), Infinity);
+    text = clipText(plain, max);
+    clipped = text !== plain;
   } else if (Array.isArray(content)) {
     for (const value of content) {
       const block = textBlock.safeParse(value);
       if (!block.success) continue;
+      const plain = displayText(block.data.text, Infinity);
+      if (!plain) continue;
       const separator = text ? "\n" : "";
-      if (text.length + separator.length >= max) break;
-      const part = displayText(block.data.text, max - text.length - separator.length);
+      const part = clipText(plain, Math.max(0, max - text.length - separator.length));
       if (part) text += `${separator}${part}`;
+      if (part !== plain) { clipped = true; break; }
     }
   }
   if (text.trim() === "") return;
-  return {
+  return { clipped, message: {
     role, content: text, ...(role === "custom" ? { customType } : {}),
     ...(timestamp === undefined ? {} : { timestamp }),
-  };
+  } };
 }

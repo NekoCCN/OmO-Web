@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { record } from "../src/protocol.ts";
 import { startApp } from "../src/server.ts";
-import { terminalFixture } from "./terminal-socket-fixture.ts";
+import { refuseTerminalTranscript, terminalFixture, writeLargeTerminalTranscript } from "./terminal-socket-fixture.ts";
 
 const engine = fileURLToPath(new URL("./engine-fixture.ts", import.meta.url));
 const cleanups: (() => Promise<void>)[] = [];
@@ -78,6 +78,64 @@ test("CLI follow distinguishes an empty registry from a disabled profile", async
   expect(await (await setup(false)).follow()).toEqual({ status: "unavailable" });
 });
 
+test("CLI follow exposes only bounded projected text or verified unavailability and does not write", async () => {
+  const f = await setup();
+  f.state.running = true;
+  f.state.messagesReply = writeLargeTerminalTranscript;
+  const first = await f.follow();
+  expect(first).toMatchObject({ status: "ok", session: { running: true }, transcript: { status: "truncated" },
+    messages: [{ role: "assistant", content: "近况 🐋", timestamp: 42 }] });
+  expect(JSON.stringify(first)).not.toContain("fixture-private");
+  f.state.messagesReply = refuseTerminalTranscript;
+  const missing = await f.follow();
+  expect(missing).toEqual({ status: "ok", session: first.session, transcript: { status: "unavailable" }, messages: [] });
+  f.state.messagesReply = async (peer, requestId) => {
+    f.state.durable = "after-held-unavailable";
+    await refuseTerminalTranscript(peer, requestId);
+  };
+  expect(await f.follow()).toEqual({ status: "unavailable" });
+  f.state.messagesReply = undefined;
+  f.state.messages = [{ role: "assistant", content: "new authority only" }];
+  const next = await f.follow();
+  expect(record(next.session).id).not.toBe(record(first.session).id);
+  expect(next).toMatchObject({ status: "ok", messages: [{ role: "assistant", content: "new authority only" }] });
+  expect(next.transcript).toBeUndefined();
+  expect(f.trace.every(row => row.observe === true)).toBe(true);
+  expect(f.delivered).toEqual([]);
+  expect((await f.post("/api/cli-follow", { action: "input", message: "no write route" })).ok).toBe(false);
+  expect(f.delivered).toEqual([]);
+});
+
+test("encoded terminal payload limits preserve the recent transcript, live attachment and admission", async () => {
+  const f = await setup();
+  const id = await f.discover();
+  const path = `/api/cli-live/${id}`;
+  f.state.messages = Array.from({ length: 8 }, (_, index) => ({
+    role: "user", content: '中"\\\t\n'.repeat(3_000), timestamp: index,
+  }));
+  for (const [name, response] of [
+    ["follow", await f.get("/api/cli-follow")],
+    ["connect", await f.post(`${path}/actions`, { action: "connect" })],
+    ["snapshot", await f.get(path)],
+  ] as const) {
+    const bytes = await response.arrayBuffer();
+    console.info(`Terminal ${name} HTTP body (bytes):`, bytes.byteLength);
+    expect(response.status).toBe(200);
+    expect(bytes.byteLength).toBeLessThanOrEqual(256 * 1024);
+    const body = JSON.parse(new TextDecoder().decode(bytes));
+    expect(body.transcript).toEqual({ status: "truncated" });
+    expect(body.messages.at(-1)).toEqual(f.state.messages.at(-1));
+    if (name !== "follow") expect(body.session).toMatchObject({ id, cwd: f.cwd, attached: true });
+  }
+  expect(f.delivered).toEqual([]);
+  expect(await f.data(await f.post(`${path}/actions`, input))).toEqual({
+    disposition: "started", clientMessageId: "web-1", duplicate: false,
+  });
+  expect(f.trace.filter(row => row.type === "attach_session" || row.type === "prompt").map(row => row.type))
+    .toEqual(["attach_session", "prompt"]);
+  expect(f.delivered).toHaveLength(1);
+});
+
 type CliFixture = Awaited<ReturnType<typeof setup>>;
 const extraRegistration = (f: CliFixture) =>
   mkdir(join(f.registry, "0123456789abcdef"), { mode: 0o700 });
@@ -149,6 +207,35 @@ test("CLI follow withholds a pending snapshot when the server stops", async () =
 });
 
 const input = { action: "input", mode: "prompt", message: "Web fixture prompt", clientMessageId: "web-1" } as const;
+
+test("CLI Live replaces truncated, unavailable, streaming and settled snapshots without losing its attachment", async () => {
+  const f = await setup();
+  const path = `/api/cli-live/${await f.discover()}`;
+  f.state.messagesReply = writeLargeTerminalTranscript;
+  expect(await f.data(await f.post(`${path}/actions`, { action: "connect" }))).toMatchObject({
+    transcript: { status: "truncated" }, messages: [{ role: "assistant", content: "近况 🐋", timestamp: 42 }],
+  });
+  f.state.messagesReply = refuseTerminalTranscript;
+  expect(await f.data(await f.get(path))).toMatchObject({
+    state: { running: false }, transcript: { status: "unavailable" }, messages: [],
+  });
+  expect(await f.data(await f.post(`${path}/actions`, input))).toEqual({ disposition: "started", clientMessageId: "web-1", duplicate: false });
+  const live = { role: "assistant", content: "新的 💬", timestamp: 84 };
+  f.emit("message_update", { message: live });
+  expect(await f.data(await f.get(path))).toMatchObject({
+    state: { running: true, turnId: "1" }, transcript: { status: "unavailable" }, messages: [{ ...live, streaming: true }],
+  });
+  f.state.messagesReply = undefined;
+  f.state.running = false;
+  const settled = { ...live, content: "新的 💬 完成" };
+  f.state.messages = [settled];
+  f.emit("message_end", { message: settled });
+  const complete = await f.data(await f.get(path));
+  expect(complete).toMatchObject({ state: { running: false, turnId: null }, messages: [settled] });
+  expect(complete.transcript).toBeUndefined();
+  expect(f.trace.filter(row => row.type === "attach_session" || row.type === "prompt").map(row => row.type)).toEqual(["attach_session", "prompt"]);
+  expect(f.delivered).toHaveLength(1);
+});
 
 test("CLI HTTP mutations reject foreign origin, missing token and passthrough fields before attachment", async () => {
   const f = await setup();

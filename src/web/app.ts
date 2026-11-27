@@ -6,7 +6,10 @@ import { Interactions, isRequest, requestId } from "./interactions.ts";
 import type { Answer } from "./interactions.ts";
 import { Transcript, messageKey, roleOf } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
-import { branchDialog, refreshDetailsActivity, renderDetails } from "./details.ts";
+import { readPage, readTranscriptStatus, TranscriptHistory } from "./transcript-history.ts";
+import type { TranscriptStatus } from "./transcript-history.ts";
+import { branchDialog, createDetailsQueue, refreshDetailsActivity, renderDetails, renderDetailsBranch } from "./details.ts";
+import { createDetailsTree, isStaleTree } from "./details-tree.ts";
 import { renderCapabilities, renderLocalCompatibility } from "./capabilities.ts";
 import { canShowSnapshot, renderJournal, renderRuntimePane } from "./runtime-summary.ts";
 import { cliHistory } from "./cli-history.ts";
@@ -32,6 +35,12 @@ const form = (id: string) => byId(id, HTMLFormElement);
 const dialog = (id: string) => byId(id, HTMLDialogElement);
 const api = new Api();
 const stream = new Transcript(box("messages"), box("transcript"), box("no-messages"));
+const transcriptNotice = el("p", "notice small");
+transcriptNotice.id = "transcript-status";
+transcriptNotice.setAttribute("role", "status");
+transcriptNotice.hidden = true;
+// Keep it in view even when the transcript scrolls to the newest message.
+form("composer").prepend(transcriptNotice);
 const interactions = new Interactions(box("interactions"));
 const trace = box("session-trace");
 const traceControls = {
@@ -98,10 +107,13 @@ type RequestChange =
 type View = {
   session: Session; status: "inactive" | "loading" | "ready" | "failed"; error: string; state: Wire;
   messages: TranscriptEntry[]; liveKey: string; tools: Map<string, ToolTrace>; requests: Map<string, Wire>;
+  liveMessageKeys: Set<string>; transcript?: TranscriptStatus; history?: TranscriptHistory; historyEpoch: number;
+  transcriptRefresh?: object; stateRefresh?: object; pendingStateUnknown?: boolean; refreshScheduled?: boolean;
   options: Wire; optionsError: string; handoff: Wire; queue: number | undefined; revision: number; serial: number;
   sync: number; optionSync: number; running: boolean; compacting: boolean;
   workbench?: Wire;
   consideredDesktopDock?: boolean;
+  pendingSnapshot?: Promise<void>;
   snapshotRequestChanges?: RequestChange[];
   detailData?: Wire;
   generationSpeed?: GenerationSpeed;
@@ -118,7 +130,7 @@ let engine: Wire = {};
 let handoffSupport: Wire = {};
 let connection: "connecting" | "online" | "offline" = "connecting";
 let transport: "waiting" | "open" | "lost" = "waiting";
-let recovering = false;
+let recovering: false | "engine" | "transport" = false;
 let bootstrapped = false;
 let unprotected = false;
 let bootError = "";
@@ -142,7 +154,11 @@ const matchesDirectoryFilter = (cwd: string) => hasDirectory(cwd) && (!directory
 const languageReturnKey = "omo-web-language-return-session";
 let archived = false;
 let source: EventSource | undefined;
+let eventRetryTimer = 0;
+const CLOSED_EVENT_RETRY_MS = 2000;
+const RECONNECT_SNAPSHOT_RETRY_MS = 2000;
 let bootSeq = 0;
+let wakeReconnectSnapshot: (() => void) | undefined;
 let listSeq = 0;
 let mutation = 0;
 let refreshTimer = 0;
@@ -170,9 +186,11 @@ const openBranch = (source: BranchSource) => {
   showBranch(source);
 };
 const follow = cliFollow(api, hasDirectory, () => {
+  if (follow.active) current?.history?.invalidate();
   renderSessions();
   renderCliSessions();
   renderView();
+  if (current?.history) renderMessages(current);
 });
 const live = cliLive(api, () => focusCliLauncher("cli-live-button"), openBranch, hasDirectory);
 const browser = workspaceBrowser(api, () => ({ roots: workspaces, selected: nextCreationDirectory || current?.session.cwd || directoryFilter }), selectBrowsedWorkspace, () => {
@@ -227,7 +245,7 @@ function handoffUnavailable(view: View): string {
 }
 
 function markInactive(view: View): void {
-  view.sync++;
+  resetTranscriptBinding(view);
   view.optionSync++;
   view.snapshotRequestChanges = undefined;
   view.status = "inactive";
@@ -236,6 +254,37 @@ function markInactive(view: View): void {
   view.workbench = undefined;
   view.generationSpeed = undefined;
   if (view === current) workbenchRequest?.abort();
+}
+
+function resetTranscriptBinding(view: View): void {
+  invalidateHistory(view);
+  view.sync++;
+  view.revision++;
+  view.transcriptRefresh = view.stateRefresh = undefined;
+  view.pendingStateUnknown = view.refreshScheduled = undefined;
+  view.messages = [];
+  view.liveKey = "";
+  view.liveMessageKeys.clear();
+  view.tools.clear();
+  view.transcript = "unavailable";
+  if (view === current) stream.reset();
+}
+
+function invalidateHistory(view: View): void {
+  view.historyEpoch++;
+  view.history?.invalidate();
+  view.history = undefined;
+}
+
+function invalidateHistoryOnConnectionChange(view: View): void {
+  const hadHistory = Boolean(view.history);
+  invalidateHistory(view);
+  if (hadHistory) {
+    view.messages = [];
+    view.liveMessageKeys.clear();
+    view.transcript = "unavailable";
+    stream.reset();
+  }
 }
 
 function enterBranch(session: Session, editorText: string, source: BranchSource): void {
@@ -376,6 +425,7 @@ function toggleNav(open: boolean, restoreFocus = false): void {
 
 function updateConnection(): void {
   live.setTransport(transport);
+  const wasOnline = connection === "online";
   connection = bootError || engine.online === false || transport === "lost" ? "offline"
     : bootstrapped && transport === "open" && !recovering && engine.online === true ? "online" : "connecting";
   box("connection").dataset.state = connection;
@@ -406,6 +456,8 @@ function updateConnection(): void {
   void fetchCliRows();
   renderCliSessions();
   renderView();
+  if (current?.history) renderMessages(current);
+  if (!wasOnline && connection === "online" && current && (current.stateRefresh || current.transcriptRefresh)) scheduleSnapshot(current);
 }
 
 async function fetchCliRows(force = false): Promise<void> {
@@ -464,7 +516,9 @@ function renderCliSessions(): void {
 function applySessions(items: readonly Session[]): void {
   sessions = new Map(items.map(session => [session.id, session]));
   if (current) {
-    current.session = sessions.get(current.session.id) ?? current.session;
+    const session = sessions.get(current.session.id);
+    if (session && session.cwd !== current.session.cwd) resetTranscriptBinding(current);
+    current.session = session ?? current.session;
     if (!workspaces.includes(current.session.cwd)) clearCurrentView();
     else if (!current.session.active && current.status === "ready" && releases.get(current.session.id)?.status !== "pending") {
       markInactive(current);
@@ -518,7 +572,9 @@ function renderWorkspace(): void {
 }
 
 function clearCurrentView(): void {
+  if (current) invalidateHistory(current);
   current = undefined;
+  wakeReconnectSnapshot?.();
   clearTimeout(refreshTimer);
   stream.reset();
   interactions.reset();
@@ -557,6 +613,7 @@ function selectBrowsedWorkspace(cwd: string, roots: readonly string[]): void {
 
 async function bootstrap(reconcile = false): Promise<void> {
   const ticket = ++bootSeq;
+  wakeReconnectSnapshot?.();
   const version = mutation;
   const rootRevision = workspaceRevision;
   try {
@@ -564,6 +621,7 @@ async function bootstrap(reconcile = false): Promise<void> {
     if (ticket !== bootSeq) return;
     const token = str(data.token);
     const tokenChanged = token !== api.token;
+    if (tokenChanged && current) invalidateHistoryOnConnectionChange(current);
     api.token = token;
     engine = object(data.engine);
     unprotected = data.unprotected === true;
@@ -586,7 +644,10 @@ async function bootstrap(reconcile = false): Promise<void> {
     if (!source) connectEvents();
     if (firstBootstrap) restoreLanguageSession();
     const release = current && releases.get(current.session.id);
-    if (reconcile && current && (!release || release.status === "failed")) {
+    if (reconcile && recovering === "transport") {
+      if (connection === "offline" && transport === "open" && engine.online === true) updateConnection();
+      await reconcileReconnectSnapshot(ticket);
+    } else if (reconcile && current && (!release || release.status === "failed")) {
       if (!current.session.active && current.status !== "loading" && engine.online === true) {
         current.status = "inactive";
         current.error = "";
@@ -599,8 +660,41 @@ async function bootstrap(reconcile = false): Promise<void> {
   } catch (error) {
     if (ticket === bootSeq) bootError = tr(`无法连接本机 Web 服务：${errorText(error)}`, `Couldn't connect to OmO Web: ${errorText(error)}`);
   }
-  if (ticket === bootSeq) recovering = false;
+  if (ticket !== bootSeq) return;
+  if (recovering !== "transport" || (transport === "open" && engine.online === true && !bootError)) recovering = false;
   updateConnection();
+}
+
+async function reconcileReconnectSnapshot(ticket: number): Promise<void> {
+  const canReconcile = () => ticket === bootSeq && recovering === "transport" && transport === "open" && engine.online === true;
+  while (canReconcile()) {
+    const view = current;
+    if (!view?.session.active) return;
+    const release = releases.get(view.session.id);
+    if (release && release.status !== "failed") return;
+
+    // An existing read may still render, but only a read started after the gap can finish recovery.
+    const wake = Promise.withResolvers<void>();
+    wakeReconnectSnapshot = wake.resolve;
+    let retryTimer: number | undefined;
+    try {
+      const applied = await Promise.race([view.pendingSnapshot ?? snapshot(view, false, true), wake.promise]);
+      if (canReconcile() && view === current && releases.get(view.session.id) === release && applied === view.sync) {
+        void loadOptions(view);
+        return;
+      }
+    } catch (error) {
+      if (!(error instanceof RequestError || error instanceof TypeError)) throw error;
+      if (canReconcile() && view === current && releases.get(view.session.id) === release) {
+        // An open SSE stream will not generate another open event to retry a failed read.
+        retryTimer = window.setTimeout(wake.resolve, RECONNECT_SNAPSHOT_RETRY_MS);
+        await wake.promise;
+      }
+    } finally {
+      clearTimeout(retryTimer);
+      if (wakeReconnectSnapshot === wake.resolve) wakeReconnectSnapshot = undefined;
+    }
+  }
 }
 
 function renderSessions(): void {
@@ -658,6 +752,7 @@ function openSession(id: string, focusComposer = false, focusConversation = true
     if (!focusComposer) return;
     if (current.status === "ready") { prompt.focus(); return; }
   }
+  if (current) invalidateHistory(current);
   if (manager.open) manager.close();
   closeDetails(false);
   setComposeOptions(false);
@@ -667,11 +762,12 @@ function openSession(id: string, focusComposer = false, focusConversation = true
   const release = releases.get(id);
   const load = session.active && release?.status !== "released" && release?.status !== "uncertain";
   const view: View = {
-    session, status: load ? "loading" : "inactive", error: "", state: {}, messages: [], liveKey: "",
+    session, status: load ? "loading" : "inactive", error: "", state: {}, messages: [], liveKey: "", liveMessageKeys: new Set(),
     tools: new Map(), requests: new Map(), options: {}, optionsError: "", handoff: {}, queue: undefined, revision: 0, serial: 0,
-    sync: 0, optionSync: 0, running: session.running, compacting: false,
+    sync: 0, optionSync: 0, historyEpoch: 0, running: session.running, compacting: false,
   };
   current = view;
+  wakeReconnectSnapshot?.();
   stream.reset();
   interactions.reset();
   const draft = draftFor(id);
@@ -832,6 +928,18 @@ function renderView(): void {
   const pending = release?.status === "pending";
   const receipt = release?.status === "released" ? release : undefined;
   const available = Boolean(view && view.status === "ready");
+  const transcript = available ? view?.transcript ?? view?.history?.status : undefined;
+  if (transcript) {
+    transcriptNotice.dataset.status = transcript;
+    box("transcript").setAttribute("aria-describedby", transcriptNotice.id);
+  } else {
+    delete transcriptNotice.dataset.status;
+    box("transcript").removeAttribute("aria-describedby");
+  }
+  // Transcript renders its own empty-state `hidden` attribute asynchronously.
+  box("no-messages").style.display = transcript ? "none" : "";
+  notice(transcriptNotice, transcript === "truncated" ? tr("部分聊天记录未包含在快照中。", "Some chat history was omitted from this snapshot.")
+    : transcript === "unavailable" ? tr("暂时无法读取聊天记录。新消息仍会显示在这里。", "Chat history is unavailable. New messages will still appear here.") : "");
   box("welcome").hidden = Boolean(view);
   box("inactive-session").hidden = !view || available;
   box("active-session").hidden = !available;
@@ -862,6 +970,7 @@ function renderView(): void {
         || (node.hasAttribute("data-idle") && (view.running || view.compacting || sending.has(view.session.id)));
     });
   }
+  detailsTree?.syncWrites();
   const active = view.status !== "inactive";
   box("inactive-title").textContent = view.status === "loading" ? tr("正在读取会话…", "Loading session…")
     : view.status === "failed" ? tr("无法读取会话", "Couldn't load session") : tr("继续此会话", "Continue this session");
@@ -1005,15 +1114,58 @@ function requestsFrom(state: Wire): Map<string, Wire> {
 
 function renderMessages(view: View, bottom = false): void {
   if (view !== current || view.status !== "ready") return;
-  stream.render(view.messages, view.liveKey, view.tools, bottom);
+  renderTranscript(view, bottom);
 }
 
-async function snapshot(view: View, bottom = false): Promise<void> {
+function renderTranscript(view: View, bottom = false, added?: number): void {
+  const history = view.history;
+  const entries = history?.entries.length ? [...history.entries, ...view.messages] : view.messages;
+  stream.render(entries, view.liveKey, view.tools, bottom, history?.render(), added);
+}
+
+function updateHistory(view: View, page: ReturnType<typeof readPage>): void {
+  const before = view.history;
+  if (page && before?.id === page.id && !before.reloading) return;
+  before?.invalidate();
+  view.history = undefined;
+  if (!page) return;
+  const { id, cwd } = view.session;
+  const scope = (): boolean => view === current && view.history === history && view.session.id === id &&
+    view.session.cwd === cwd && hasDirectory(cwd) && view.session.active && !follow.active &&
+    (!releases.has(id) || releases.get(id)?.status === "failed");
+  const enabled = (): boolean => scope() && view.status === "ready" && connection === "online" && !follow.active;
+  const history = new TranscriptHistory(page, api, id, scope, enabled, () => view.messages, added => {
+    if (!scope()) return;
+    renderView();
+    renderTranscript(view, false, added);
+  }, () => {
+    if (!enabled() || history.reloading) return;
+    history.reloading = true;
+    history.clearExpansion();
+    renderView();
+    renderTranscript(view);
+    void snapshot(view).finally(() => {
+      history.reloading = false;
+      if (scope()) renderTranscript(view);
+    });
+  });
+  view.history = history;
+}
+
+async function snapshot(view: View, bottom = false, reconnect = false): Promise<number | undefined> {
   const release = releases.get(view.session.id);
   const requiresManualResume = release?.status === "released" || release?.status === "uncertain";
   if (requiresManualResume && (view.status !== "loading" || !writes.has(view.session.id))) return;
   const ticket = ++view.sync;
+  const historyEpoch = view.historyEpoch;
+  const requestedSession = view.session;
+  const transcriptRefresh = view.transcriptRefresh;
+  const stateRefresh = view.stateRefresh;
+  const deferTranscript = view.status === "ready" && view.running && Boolean(transcriptRefresh || stateRefresh);
+  const settled = Promise.withResolvers<void>();
+  view.pendingSnapshot = settled.promise;
   const revision = view.revision;
+  const baseEntries = new Set(view.messages);
   const baseState = view.state;
   const baseSpeed = view.generationSpeed;
   const requestChanges: RequestChange[] = [];
@@ -1022,20 +1174,36 @@ async function snapshot(view: View, bottom = false): Promise<void> {
   const baseRunningTools = new Set([...view.tools].filter(([, tool]) => tool.stage === "running").map(([id]) => id));
   try {
     const data = await api.request(sessionPath(view.session.id));
-    if (current !== view || ticket !== view.sync) return;
+    if (current !== view || ticket !== view.sync || releases.get(view.session.id) !== release) return;
     const parsed = parseSession(data.session);
+    const page = readPage(data.page);
+    if ((page && !parsed) || (parsed && (parsed.id !== requestedSession.id || parsed.cwd !== requestedSession.cwd))) {
+      throw new RequestError(tr("会话读取响应已失效。", "The session read no longer matches this conversation."), 409, "stale_session_read");
+    }
+    if (view.historyEpoch !== historyEpoch && page) return;
     if (requiresManualResume && !parsed?.active) throw new Error(tr("本机服务未确认已恢复此会话。", "The local engine did not confirm the session resumed."));
     const session = parsed ?? view.session;
     if (requiresManualResume) releases.delete(session.id);
     remember(session);
-    const state = object(data.state);
+    const rawState = object(data.state);
+    // A size-refused or incomplete read cannot revoke controls observed on this binding.
+    const state = view.pendingStateUnknown ? { ...view.state, ...rawState } : rawState;
     if (engine.online !== false) {
       if (data.generationSpeed === undefined && view.generationSpeed === baseSpeed) view.generationSpeed = undefined;
       else rememberGenerationSpeed(view, data.generationSpeed);
     }
     const previousModel = modelKey(object(view.state.model));
     view.handoff = object(data.handoff);
-    const messages = list(data.messages).map(object);
+    // A state invalidation can need an immediate read even while a large message is still streaming.
+    const applyTranscript = reconnect || (!deferTranscript &&
+      (!view.transcriptRefresh || (view.transcriptRefresh === transcriptRefresh && !view.running)));
+    const transcript = readTranscriptStatus(data.transcript);
+    if (applyTranscript) {
+      view.transcript = transcript;
+      updateHistory(view, transcript === "unavailable" ? undefined : page);
+      if (view.transcriptRefresh === transcriptRefresh) view.transcriptRefresh = undefined;
+    }
+    const messages = transcript === "unavailable" ? [] : list(data.messages).map(object);
     const changed = revision !== view.revision;
     const oldKeys = new Map(view.messages.map(entry => [entry.key, entry.message]));
     const keys = new Set<string>();
@@ -1046,33 +1214,57 @@ async function snapshot(view: View, bottom = false): Promise<void> {
       const old = oldKeys.get(key);
       return { key, message: old && JSON.stringify(old) === JSON.stringify(message) ? old : message };
     });
+    if (applyTranscript && transcript === "unavailable") {
+      // No history was attested, so keep only events observed on this uninterrupted binding.
+      view.messages = view.messages.filter(entry => view.liveMessageKeys.has(entry.key));
+    }
     if (changed) {
-      const newer = new Map(view.messages.map(entry => [entry.key, entry]));
-      view.messages = [...entries.map(entry => newer.get(entry.key) ?? entry), ...view.messages.filter(entry => !keys.has(entry.key))];
+      if (applyTranscript && transcript !== "unavailable") {
+        const correction = transcript === "truncated" || Boolean(transcriptRefresh);
+        const updates = view.messages.filter(entry => view.liveMessageKeys.has(entry.key) &&
+          (!correction || !baseEntries.has(entry) || (view.running && entry.key === view.liveKey)));
+        const newer = new Map(updates.map(entry => [entry.key, entry]));
+        view.messages = [...entries.map(entry => newer.get(entry.key) ?? entry), ...updates.filter(entry => !keys.has(entry.key))];
+      }
       // If an event arrived during the HTTP read, preserve only the fields it changed.
       view.state = { ...state, ...Object.fromEntries(Object.entries(view.state).filter(([key, value]) => value !== baseState[key])) };
       const streaming = session.running || state.isStreaming === true;
       if (!streaming && !view.running) {
         view.liveKey = "";
-        if (baseLiveKey && !keys.has(baseLiveKey)) view.messages = view.messages.filter(entry => entry.key !== baseLiveKey);
+        if (applyTranscript && transcript !== "unavailable" && baseLiveKey && !keys.has(baseLiveKey)) {
+          view.messages = view.messages.filter(entry => entry.key !== baseLiveKey);
+        }
         for (const id of baseRunningTools) if (view.tools.get(id)?.stage === "running") view.tools.delete(id);
       }
     } else {
-      view.messages = entries;
+      if (applyTranscript && transcript !== "unavailable") view.messages = entries;
       view.state = state;
-      view.running = session.running || state.isStreaming === true;
-      view.compacting = state.isCompacting === true;
-      view.queue = num(state.pendingMessageCount);
+      if (!view.pendingStateUnknown || typeof rawState.isStreaming === "boolean" || session.running) {
+        view.running = session.running || state.isStreaming === true;
+      }
+      if (!view.pendingStateUnknown || typeof rawState.isCompacting === "boolean") view.compacting = state.isCompacting === true;
+      if (!view.pendingStateUnknown || num(rawState.pendingMessageCount) !== undefined) view.queue = num(state.pendingMessageCount);
       if (!view.running) {
         view.liveKey = "";
         for (const [id, tool] of view.tools) if (tool.stage === "running") view.tools.delete(id);
       }
-      else if (view.liveKey && !keys.has(view.liveKey)) {
+      else if (applyTranscript && transcript !== "unavailable" && view.liveKey && !keys.has(view.liveKey)) {
         const live = oldKeys.get(view.liveKey);
         if (live) view.messages.push({ key: view.liveKey, message: live });
       }
     }
-    const requests = requestsFrom(state);
+    view.liveMessageKeys = new Set(view.messages.flatMap(entry => view.liveMessageKeys.has(entry.key) ? [entry.key] : []));
+    const requests = requestsFrom(rawState);
+    if (view.pendingStateUnknown) {
+      const dialogsKnown = Array.isArray(rawState.pendingDialogs);
+      const questionsKnown = Array.isArray(rawState.pendingQuestions);
+      for (const [id, request] of view.requests) {
+        if (!(request.method === "question" ? questionsKnown : dialogsKnown) && !requests.has(id)) requests.set(id, request);
+      }
+      if (dialogsKnown && questionsKnown && view.stateRefresh === stateRefresh) view.pendingStateUnknown = undefined;
+    }
+    if (view.stateRefresh === stateRefresh) view.stateRefresh = undefined;
+    if (!applyTranscript && !view.running && view.transcriptRefresh) scheduleSnapshot(view);
     // Replaying resolutions also covers requests that arrived and settled entirely during the GET.
     for (const change of requestChanges) applyRequestChange(requests, change);
     view.requests = requests;
@@ -1084,9 +1276,11 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     renderMessages(view, bottom);
     renderLiveDetailsActivity(view);
     if (becameReady || !view.workbench) void loadWorkbenchStatus(view);
+    return ticket;
   } catch (error) {
-    if (current !== view || ticket !== view.sync) return;
+    if (current !== view || ticket !== view.sync || releases.get(view.session.id) !== release) return;
     if (releases.get(view.session.id)?.status === "pending") return;
+    if (reconnect) throw error;
     if (view.status !== "ready" || !view.session.active) {
       view.status = "failed";
       view.error = errorText(error);
@@ -1095,7 +1289,13 @@ async function snapshot(view: View, bottom = false): Promise<void> {
     }
     renderView();
   } finally {
+    if (view.pendingSnapshot === settled.promise) view.pendingSnapshot = undefined;
+    settled.resolve();
     if (view.snapshotRequestChanges === requestChanges) view.snapshotRequestChanges = undefined;
+    if (view === current && !view.pendingSnapshot && view.refreshScheduled) {
+      view.refreshScheduled = undefined;
+      scheduleSnapshot(view);
+    }
   }
 }
 
@@ -1141,20 +1341,37 @@ function connectEvents(): void {
   events.addEventListener("open", () => {
     if (events !== source) return;
     const reconnected = transport === "lost";
-    recovering = reconnected;
+    if (reconnected) recovering = "transport";
     transport = "open";
     updateConnection();
     if (reconnected) {
       if (engine.online === false) {
-        recovering = false;
         void fetchSessions();
       } else void bootstrap(true);
     }
   });
   events.addEventListener("error", () => {
     if (events !== source) return;
+    if (transport !== "lost" && current) {
+      invalidateHistoryOnConnectionChange(current);
+      current.liveMessageKeys.clear();
+      current.liveKey = "";
+      current.tools.clear();
+    }
     transport = "lost";
+    if (recovering === "transport") {
+      bootSeq++;
+      wakeReconnectSnapshot?.();
+    }
     updateConnection();
+    // CONNECTING already has a browser-managed retry; only replace a terminal source.
+    if (events.readyState !== EventSource.CLOSED || eventRetryTimer) return;
+    eventRetryTimer = window.setTimeout(() => {
+      eventRetryTimer = 0;
+      if (events !== source) return;
+      source = undefined;
+      connectEvents();
+    }, CLOSED_EVENT_RETRY_MS);
   });
   events.addEventListener("omo", event => {
     if (!(event instanceof MessageEvent) || typeof event.data !== "string" || events !== source) return;
@@ -1181,6 +1398,7 @@ function updateMessage(view: View, event: Wire, type: string): void {
   const index = view.messages.findIndex(entry => entry.key === key);
   if (index < 0) view.messages.push({ key, message });
   else view.messages[index] = { key, message };
+  view.liveMessageKeys.add(key);
   if (role === "assistant") {
     view.liveKey = type === "message_end" ? "" : key;
     if (type !== "message_end") view.running = true;
@@ -1189,7 +1407,13 @@ function updateMessage(view: View, event: Wire, type: string): void {
 
 function scheduleSnapshot(view: View): void {
   clearTimeout(refreshTimer);
-  refreshTimer = window.setTimeout(() => { if (current === view && view.session.active) void snapshot(view); }, 120);
+  refreshTimer = window.setTimeout(() => {
+    if (current !== view || !view.session.active || transport !== "open" || recovering === "transport" ||
+        releases.get(view.session.id)?.status === "pending") return;
+    if (view.transcriptRefresh && view.running && !view.stateRefresh) return;
+    if (view.pendingSnapshot) { view.refreshScheduled = true; return; }
+    void snapshot(view);
+  }, 120);
 }
 
 function applyRequestChange(requests: Map<string, Wire>, change: RequestChange): void {
@@ -1232,15 +1456,27 @@ function onEvent(event: Wire): void {
     if (type === "engine") {
       const status = object(event.engine);
       if (typeof status.online !== "boolean") return;
-      recovering = status.online && engine.online === false;
+      if (recovering !== "transport") recovering = status.online && engine.online === false ? "engine" : false;
       engine = status;
+      if (!status.online && recovering === "transport") {
+        bootSeq++;
+        wakeReconnectSnapshot?.();
+      }
       if (!status.online && current) {
+        invalidateHistoryOnConnectionChange(current);
+        current.liveMessageKeys.clear();
+        current.liveKey = "";
+        current.tools.clear();
         current.generationSpeed = undefined;
         renderLiveDetailsActivity(current);
       }
       updateConnection();
       if (status.online) void bootstrap(true);
       else void fetchSessions();
+    }
+    else if (recovering === "transport") {
+      // The engine may have come online while the transport could not deliver the change.
+      if (engine.online === false && object(event.engine).online === true) void bootstrap(true);
     }
     else if (recovering) return;
     else if (current && engine.online !== false) void bootstrap(true);
@@ -1257,6 +1493,15 @@ function onEvent(event: Wire): void {
   }
   view.revision++;
   switch (type) {
+    case "transcript_refresh_required":
+      view.transcriptRefresh = {};
+      if (!view.running) scheduleSnapshot(view);
+      return;
+    case "state_refresh_required":
+      view.stateRefresh = {};
+      view.pendingStateUnknown = true;
+      scheduleSnapshot(view);
+      return;
     case "agent_start":
       view.running = true;
       break;
@@ -1276,9 +1521,16 @@ function onEvent(event: Wire): void {
       view.state = { ...view.state, currentTurnId: undefined };
       scheduleSnapshot(view);
       void loadWorkbenchStatus(view);
-      if (view.status === "ready" && inspector.open) loadDetailStats(view);
+      if (view.status === "ready" && inspector.open) {
+        detailsTree?.invalidate();
+        refreshVisibleDetails(view);
+      }
       break;
     case "agent_idle":
+      if (view.transcriptRefresh) {
+        view.running = false;
+        view.liveKey = "";
+      }
       scheduleSnapshot(view);
       break;
     case "message_start":
@@ -1337,14 +1589,24 @@ function onEvent(event: Wire): void {
     case "compaction_end":
       view.compacting = false;
       if (event.aborted !== true && str(event.errorMessage)) draftFor(view.session.id).error = str(event.errorMessage);
+      if (event.aborted !== true && event.success !== false && !event.errorMessage && !event.error) resetTranscriptBinding(view);
+      if (event.aborted !== true && !str(event.errorMessage) && inspector.open) {
+        detailsTree?.invalidate();
+        refreshVisibleDetails(view);
+      }
       scheduleSnapshot(view);
       break;
     case "queue_update":
       view.queue = list(event.steering).length + list(event.followUp).length;
-      if (inspector.open) void loadDetails(view);
+      if (inspector.open && overviewSelected()) loadDetailStats(view);
+      else overviewDirty = true;
+      detailsQueue?.activate(true);
       break;
     case "pending_input_update":
       scheduleSnapshot(view);
+      if (inspector.open && overviewSelected()) loadDetailStats(view);
+      else overviewDirty = true;
+      detailsQueue?.activate(true);
       break;
     case "model_changed":
     case "service_tier_changed": {
@@ -1371,12 +1633,22 @@ function onEvent(event: Wire): void {
       scheduleSnapshot(view);
       break;
     case "session_replaced":
+      resetTranscriptBinding(view);
+      view.status = "loading";
+      view.running = false;
+      view.compacting = false;
+      view.state = {};
+      view.requests.clear();
+      view.queue = undefined;
       workbenchRequest?.abort();
       view.workbench = undefined;
       view.generationSpeed = undefined;
       resetProjectRules();
       renderLiveDetailsActivity(view);
-      if (inspector.open) loadDetails(view);
+      if (inspector.open) {
+        detailsTree?.invalidate();
+        refreshVisibleDetails(view);
+      }
       scheduleSnapshot(view);
       break;
     case "transcript_write_failed":
@@ -1731,7 +2003,7 @@ function submitComposer(): void {
   else void sendPrompt();
 }
 
-async function runAction(view: View, action: Action, label: string, onError: (text: string) => void, after?: (data: Wire) => void): Promise<boolean> {
+async function runAction(view: View, action: Action, label: string, onError: (text: string, error?: unknown) => void, after?: (data: Wire) => void): Promise<boolean> {
   const id = view.session.id;
   if (writes.has(id) || releases.get(id)?.status === "pending") return false;
   writes.add(id);
@@ -1745,13 +2017,10 @@ async function runAction(view: View, action: Action, label: string, onError: (te
     after?.(data);
     if (action.action === "navigate") {
       if (object(data.result).cancelled === true) return false;
-      view.revision++;
-      view.messages = [];
-      view.liveKey = "";
-      view.tools.clear();
+      detailsTree?.invalidate();
+      resetTranscriptBinding(view);
       workbenchRequest?.abort();
       view.workbench = undefined;
-      stream.reset();
       const editor = str(object(data.result).editorText);
       if (editor) {
         const draft = draftFor(id);
@@ -1765,10 +2034,10 @@ async function runAction(view: View, action: Action, label: string, onError: (te
     if (view !== current) return true;
     if (action.action === "resume") void loadOptions(view);
     if (manager.open) renderManager(view);
-    if (inspector.open && action.action !== "abort") void loadDetails(view);
+    if (inspector.open && action.action !== "abort") refreshVisibleDetails(view);
     return true;
   } catch (error) {
-    if (view === current) onError(tr(`${label}失败：${errorText(error)}`, `${label} failed: ${errorText(error)}`));
+    if (view === current) onError(tr(`${label}失败：${errorText(error)}`, `${label} failed: ${errorText(error)}`), error);
     return false;
   } finally {
     writes.delete(id);
@@ -1828,7 +2097,9 @@ async function releaseToCli(view: View): Promise<void> {
   if (view !== current || !manager.open || releases.get(id)?.status === "pending" || handoffUnavailable(view)) return;
   const attempt: Release = { status: "pending" };
   releases.set(id, attempt);
+  view.history?.invalidate();
   renderView();
+  renderMessages(view);
   box("manage-handoff-status").focus();
   const selected = () => current?.session.id === id ? current : undefined;
   const ownsFocus = () => manager.open || document.activeElement === btn("manage-button") ||
@@ -1864,6 +2135,7 @@ async function releaseToCli(view: View): Promise<void> {
       releases.set(id, { status: "failed", error: message });
       if (target) {
         renderView();
+        renderMessages(target);
         if (manager.open && document.activeElement === box("manage-handoff-status")) box("manage-handoff-error").focus();
       }
     }
@@ -2038,7 +2310,14 @@ async function openCommandPicker(view: View, help = false): Promise<void> {
 
 let detailsRequest: AbortController | undefined;
 let runtimeRequest: AbortController | undefined;
+let branchRequest: AbortController | undefined;
 let dagRequest: AbortController | undefined;
+let activityRequest: AbortController | undefined;
+let detailsTree: ReturnType<typeof createDetailsTree> | undefined;
+let detailsQueue: ReturnType<typeof createDetailsQueue> | undefined;
+let overviewDirty = false;
+let branchData: Wire | undefined;
+let nativeData: { tasks: Wire; dag: Wire; memory: Wire; snapshot?: Wire } | undefined;
 let detailsOpener: HTMLElement | undefined;
 type DetailReveal = "tree" | "todo";
 let detailReveal: DetailReveal | undefined;
@@ -2046,6 +2325,11 @@ let capabilitiesRequest: AbortController | undefined;
 let capabilitiesAttempted = false;
 const detailsTabs = () => [...inspector.querySelectorAll<HTMLButtonElement>('[role="tab"]')];
 const capabilitiesSelected = () => !box("runtime-capabilities").hidden;
+const overviewSelected = () => !box("runtime-metrics").hidden;
+const branchSelected = () => !box("runtime-todo").hidden;
+const memoryDisclosure = () => byId("runtime-memory-branch", HTMLDetailsElement);
+const nativePanel = () => !box("runtime-subagent").hidden ? "tasks" : !box("runtime-dag").hidden ? "dag"
+  : branchSelected() && memoryDisclosure().open ? "memory" : undefined;
 
 function syncDetailsRefresh(): void {
   const refresh = btn("details-refresh");
@@ -2111,9 +2395,8 @@ function selectDetailsView(tab: HTMLButtonElement): void {
   }
   box("details-scroll").scrollTop = 0;
   detailReveal = undefined;
-  if (capabilitiesSelected() && inspector.open && current?.status === "ready" && !capabilitiesAttempted) {
-    loadCapabilities(current);
-  } else syncDetailsRefresh();
+  if (inspector.open && current?.status === "ready") loadDetails(current);
+  syncDetailsRefresh();
 }
 
 function revealDetailsTarget(): void {
@@ -2124,8 +2407,10 @@ function revealDetailsTarget(): void {
   detailReveal = undefined;
   fold.open = true;
   const title = fold.querySelector("summary");
-  title?.focus({ preventScroll: true });
-  title?.scrollIntoView({ block: "start" });
+  if (document.activeElement === btn(root === "#runtime-tree" ? "runtime-open-overview" : "runtime-open-todo")) {
+    title?.focus({ preventScroll: true });
+    title?.scrollIntoView({ block: "start" });
+  }
 }
 
 function openDetails(tab = "overview", opener: HTMLElement = btn("details-button"), reveal?: DetailReveal): void {
@@ -2144,11 +2429,46 @@ function openDetails(tab = "overview", opener: HTMLElement = btn("details-button
 }
 
 function showDetails(view: View): void {
+  notice(box("details-error"));
+  overviewDirty = false;
   for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities, #runtime-todo)')) panel.replaceChildren();
   box("runtime-todo").querySelector("[data-runtime-branch]")?.remove();
   box("runtime-memory-journal").replaceChildren();
   box("runtime-memory-branch-content").replaceChildren();
-  byId("runtime-memory-branch", HTMLDetailsElement).open = false;
+  memoryDisclosure().open = false;
+  const visible = () => current === view && inspector.open && overviewSelected();
+  detailsQueue = createDetailsQueue(api, sessionPath(view.session.id), () => visible() && view.status === "ready",
+    () => view.session.active && connection === "online" && !writes.has(view.session.id)
+      && releases.get(view.session.id)?.status !== "pending",
+    () => {
+      if (window.confirm(tr("清空所有尚未发送的排队输入？", "Remove all unsent messages from the queue?"))) {
+        void runAction(view, { action: "clearQueue" }, tr("清空队列", "Clear queue"),
+          message => notice(box("details-error"), message));
+      }
+    });
+  const canNavigate = () => view.session.active && connection === "online" && !view.running && !view.compacting
+    && !view.requests.size && !(view.queue && view.queue > 0) && !sending.has(view.session.id)
+    && !writes.has(view.session.id) && releases.get(view.session.id)?.status !== "pending";
+  const tree = createDetailsTree(api, sessionPath(view.session.id), visible, canNavigate, (targetId, expectedLeafId) => {
+    const draft = draftFor(view.session.id);
+    const warning = draft.text.trim()
+      ? tr("切换上下文位置？选中的消息可能替换当前草稿。", "Switch context? The selected message may replace your draft.")
+      : tr("切换上下文位置？原有分支仍会保留。", "Switch context? Existing branches are kept.");
+    const fail = (message: string, error?: unknown) => {
+      if (detailsTree !== tree) return;
+      const stale = isStaleTree(error);
+      if (stale) tree.invalidate();
+      notice(box("details-error"), stale ? "" : message);
+    };
+    if (window.confirm(warning)) {
+      const action = { action: "navigate", targetId, expectedLeafId } as const;
+      void runAction(view, action, tr("切换上下文", "Switch context"), fail, result => {
+        if (object(result.result).cancelled === true) fail(tr("本次切换已取消。", "Context switch cancelled."));
+      });
+    }
+  });
+  detailsTree = tree;
+  box("runtime-metrics").append(detailsTree.root);
   // HTMLDialogElement.show() runs the dialog focusing steps even when non-modal.
   if (compactInspector.matches) inspector.showModal();
   else inspector.open = true;
@@ -2169,8 +2489,21 @@ function closeDetails(restoreFocus = true): void {
   if (!inspector.open) return;
   inspector.close();
   detailsRequest?.abort();
+  detailsRequest = undefined;
   runtimeRequest?.abort();
+  runtimeRequest = undefined;
+  branchRequest?.abort();
+  branchRequest = undefined;
   dagRequest?.abort();
+  dagRequest = undefined;
+  activityRequest?.abort();
+  activityRequest = undefined;
+  detailsTree?.abort();
+  detailsTree = undefined;
+  detailsQueue?.deactivate();
+  detailsQueue = undefined;
+  branchData = undefined;
+  nativeData = undefined;
   resetProjectRules();
   if (current) current.detailData = undefined;
   detailReveal = undefined;
@@ -2233,68 +2566,73 @@ function syncComposeOptionsLayout(): void {
 function loadDetailStats(view: View): void {
   detailsRequest?.abort();
   const request = detailsRequest = new AbortController();
-  const live = () => !request.signal.aborted && inspector.open && view === current;
+  const tree = detailsTree?.root;
+  const queue = detailsQueue;
+  const live = () => !request.signal.aborted && inspector.open && overviewSelected() && view === current;
   const overview = box("runtime-metrics");
   const fail = (message: string) => notice(box("details-error"), message);
-  if (!overview.childElementCount) overview.append(el("p", "muted", tr("正在读取运行详情…", "Loading run details…")));
+  const loading = !overview.querySelector(".runtime-metrics") && !overview.querySelector(":scope > p")
+    ? el("p", "muted", tr("正在读取运行详情…", "Loading run details…")) : undefined;
+  if (loading) overview.prepend(loading);
   fail("");
   void api.request(`${sessionPath(view.session.id)}/details`, undefined, request.signal).then(data => {
-    if (!live()) return;
+    if (!live() || !tree || !queue) return;
     view.detailData = data;
+    overviewDirty = false;
     if (engine.online !== false) rememberGenerationSpeed(view, data.generationSpeed);
-    renderDetails(data, view.state, view.options, {
-      canWrite: connection === "online",
-      canNavigate: connection === "online" && !view.running && !view.compacting && !sending.has(view.session.id),
-      queueCount: view.queue,
-      clearQueue: () => {
-        if (window.confirm(tr("清空所有尚未发送的排队输入？", "Remove all unsent messages from the queue?"))) {
-          void runAction(view, { action: "clearQueue" }, tr("清空队列", "Clear queue"), fail);
-        }
-      },
-      navigate: targetId => {
-        const draft = draftFor(view.session.id);
-        const warning = draft.text.trim()
-          ? tr("切换上下文位置？选中的消息可能替换当前草稿。", "Switch context? The selected message may replace your draft.")
-          : tr("切换上下文位置？原有分支仍会保留。", "Switch context? Existing branches are kept.");
-        if (!view.running && !view.compacting && window.confirm(warning)) {
-          void runAction(view, { action: "navigate", targetId }, tr("切换上下文", "Switch context"), fail, result => {
-            if (object(result.result).cancelled === true) fail(tr("本次切换已取消。", "Context switch cancelled."));
-          });
-        }
-      },
-      insertCommand: command => insertCommand(view, command),
-    }, view.generationSpeed);
+    queue.update(num(object(data.state).pendingMessageCount));
+    renderDetails(data, view.state, view.options, { insertCommand: command => insertCommand(view, command) },
+      tree, queue.root, view.generationSpeed);
     revealDetailsTarget();
   }).catch(error => {
     if (!live()) return;
-    if (!overview.querySelector("section")) overview.replaceChildren();
+    overview.querySelector(":scope > p")?.remove();
     fail(tr(`无法读取运行详情：${errorText(error)}`, `Couldn't load run details: ${errorText(error)}`));
   }).finally(() => {
     if (detailsRequest === request) detailsRequest = undefined;
   });
 }
 
-function loadDetails(view: View): void {
-  loadDetailStats(view);
-  runtimeRequest?.abort();
-  const request = runtimeRequest = new AbortController();
-  dagRequest?.abort();
-  const dag = box("runtime-dag");
-  const selectedRun = dag.querySelector<HTMLDetailsElement>(".dag-run[open]")?.dataset.dagKey;
-  const focusedRun = document.activeElement?.closest<HTMLElement>(".dag-run")?.dataset.dagKey;
-  const treeRequest = dagRequest = new AbortController();
-  const live = () => !request.signal.aborted && inspector.open && view === current;
-  const path = sessionPath(view.session.id);
-  const journal = box("runtime-memory-journal");
-  const setJournal = (data?: Wire) => {
-    journal.replaceChildren(renderJournal(data));
-  };
-  const setActivity = (tasks?: Wire, dag?: Wire, snapshot?: "waiting" | Wire) => {
-    box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", tasks, snapshot));
+function loadBranchDetails(view: View): void {
+  branchRequest?.abort();
+  const request = branchRequest = new AbortController();
+  const live = () => request === branchRequest && inspector.open && branchSelected() && current === view;
+  if (!branchData) renderDetailsBranch({ status: "loading" });
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
+  void api.request(`${sessionPath(view.session.id)}/branch-runtime`, undefined, signal).catch((): Wire => ({
+    status: "unavailable", reason: "read_failed",
+  })).then(data => {
+    if (!live()) return;
+    branchData = data;
+    if (data.status === "ok" && (typeof data.leafId === "string" || data.leafId === null)) detailsTree?.checkLeaf(data.leafId);
+    renderDetailsBranch(data);
+    revealDetailsTarget();
+  }).finally(() => {
+    if (branchRequest === request) branchRequest = undefined;
+  });
+}
+
+function renderNativeDetails(view: View): void {
+  const panel = nativePanel();
+  if (!panel || !nativeData) return;
+  if (panel === "memory") {
+    box("runtime-memory-journal").replaceChildren(renderJournal(nativeData.memory));
+    return;
+  }
+  const data = nativeData;
+  const fallback = canShowSnapshot(data[panel]);
+  const snapshot = fallback ? data.snapshot ?? "waiting" : undefined;
+  if (panel === "tasks") {
+    box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", data.tasks, snapshot));
+  } else {
     const runs = box("runtime-dag");
-    runs.replaceChildren(...renderRuntimePane("dag", dag, snapshot, async key => {
-      const signal = AbortSignal.any([treeRequest.signal, AbortSignal.timeout(28_000)]);
-      return api.request(`${path}/native-runtime/dag/${key}`, undefined, signal);
+    const selectedRun = runs.querySelector<HTMLDetailsElement>(".dag-run[open]")?.dataset.dagKey;
+    const focusedRun = document.activeElement?.closest<HTMLElement>(".dag-run")?.dataset.dagKey;
+    dagRequest?.abort();
+    const request = dagRequest = new AbortController();
+    runs.replaceChildren(...renderRuntimePane("dag", data.dag, snapshot, key => {
+      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(28_000)]);
+      return api.request(`${sessionPath(view.session.id)}/native-runtime/dag/${key}`, undefined, signal);
     }));
     for (const detail of runs.querySelectorAll<HTMLDetailsElement>(".dag-run")) {
       if (detail.dataset.dagKey === selectedRun) detail.open = true;
@@ -2302,38 +2640,103 @@ function loadDetails(view: View): void {
         detail.querySelector("summary")?.focus({ preventScroll: true });
       }
     }
-  };
-  if (!journal.childElementCount) setJournal();
-  if (!dag.childElementCount) setActivity();
-  const runtime = async () => {
-    let data: Wire;
-    try {
-      // The host can fence the three parallel reads with two state requests.
-      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
-      data = await api.request(`${path}/native-runtime`, undefined, signal);
-    } catch (error: unknown) {
+  }
+  if (!fallback || data.snapshot || activityRequest) return;
+  const request = activityRequest = new AbortController();
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(8_000)]);
+  void api.request(`${sessionPath(view.session.id)}/activity`, undefined, signal)
+    .catch(() => ({ status: "unavailable" })).then(snapshot => {
+      if (activityRequest !== request || !inspector.open || current !== view || nativeData !== data) return;
+      data.snapshot = snapshot;
+      const visible = nativePanel();
+      if ((visible === "tasks" || visible === "dag") && canShowSnapshot(data[visible])) renderNativeDetails(view);
+    }).finally(() => {
+      if (activityRequest === request) activityRequest = undefined;
+    });
+}
+
+function loadNativeDetails(view: View): void {
+  runtimeRequest?.abort();
+  activityRequest?.abort();
+  activityRequest = undefined;
+  const request = runtimeRequest = new AbortController();
+  const live = () => runtimeRequest === request && inspector.open && current === view && Boolean(nativePanel());
+  const panel = nativePanel();
+  if (panel === "dag") {
+    dagRequest?.abort();
+    dagRequest = undefined;
+  }
+  const host = box(panel === "memory" ? "runtime-memory-journal" : panel === "dag" ? "runtime-dag" : "runtime-subagent");
+  if (!host.childElementCount) {
+    const status = el("p", "small muted", tr("正在读取原生运行信息…", "Loading native runtime…"));
+    status.setAttribute("role", "status");
+    host.append(status);
+  }
+  // The host can fence the three parallel reads with two state requests.
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
+  void api.request(`${sessionPath(view.session.id)}/native-runtime`, undefined, signal)
+    .catch((error: unknown) => {
       const reason = error instanceof RequestError && error.status === 404 && error.code === "not_found"
         ? "web_unsupported"
         : error instanceof RequestError && error.status >= 400 && error.status < 500 ? "read_refused" : "read_failed";
       const failure = { status: "unavailable", reason };
-      data = { tasks: failure, dag: failure, memory: failure };
-    }
-    if (!live()) return;
-    const tasks = object(data.tasks);
-    const dag = object(data.dag);
-    setJournal(object(data.memory));
-    const fallback = canShowSnapshot(tasks) || canShowSnapshot(dag);
-    setActivity(tasks, dag, fallback ? "waiting" : undefined);
-    if (fallback) {
-      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(8_000)]);
-      const snapshot = await api.request(`${path}/activity`, undefined, signal)
-        .catch(() => ({ status: "unavailable" }));
-      if (live()) setActivity(tasks, dag, snapshot);
-    }
-  };
-  void runtime().finally(() => {
-    if (runtimeRequest === request) runtimeRequest = undefined;
-  });
+      return { tasks: failure, dag: failure, memory: failure };
+    }).then(data => {
+      if (!live()) return;
+      nativeData = { tasks: object(data.tasks), dag: object(data.dag), memory: object(data.memory) };
+      renderNativeDetails(view);
+    }).finally(() => {
+      if (runtimeRequest === request) runtimeRequest = undefined;
+    });
+}
+
+function loadDetails(view: View, refresh = false): void {
+  if (view !== current || view.status !== "ready" || !inspector.open) return;
+  if (overviewSelected()) {
+    if (refresh || (!detailsRequest && (overviewDirty || !view.detailData))) loadDetailStats(view);
+    detailsTree?.activate();
+    detailsQueue?.activate(refresh);
+  } else {
+    detailsRequest?.abort();
+    detailsRequest = undefined;
+    detailsTree?.abort();
+    detailsQueue?.deactivate();
+  }
+  if (branchSelected()) {
+    if (refresh || (!branchData && !branchRequest)) loadBranchDetails(view);
+    else revealDetailsTarget();
+  } else {
+    branchRequest?.abort();
+    branchRequest = undefined;
+  }
+  const panel = nativePanel();
+  if (panel) {
+    if (refresh || (!nativeData && !runtimeRequest)) loadNativeDetails(view);
+    else if (nativeData && !runtimeRequest) renderNativeDetails(view);
+  } else {
+    runtimeRequest?.abort();
+    runtimeRequest = undefined;
+  }
+  if (panel !== "dag") {
+    dagRequest?.abort();
+    dagRequest = undefined;
+  }
+  if (!panel || panel === "memory") {
+    activityRequest?.abort();
+    activityRequest = undefined;
+  }
+  if (capabilitiesSelected()) {
+    if (refresh || !capabilitiesAttempted) loadCapabilities(view);
+  } else if (capabilitiesRequest) clearCapabilities();
+}
+
+function refreshVisibleDetails(view: View): void {
+  // A settlement or action may have changed a hidden read; re-read it on next intent.
+  if (!overviewSelected()) overviewDirty = true;
+  if (!branchSelected()) branchData = undefined;
+  if (!nativePanel()) nativeData = undefined;
+  if (!capabilitiesSelected()) capabilitiesAttempted = false;
+  loadDetails(view, true);
 }
 
 function openCliHistory(id?: string): void {
@@ -2419,7 +2822,7 @@ function listen(): void {
     if (document.hidden) return;
     void fetchSessions();
     if (current) void loadWorkbenchStatus(current);
-    if (current && inspector.open) loadDetails(current);
+    if (current && inspector.open) loadDetails(current, true);
   });
   window.setInterval(() => {
     if (!document.hidden && connection === "online") void fetchCliRows(true);
@@ -2471,9 +2874,16 @@ function listen(): void {
   });
   btn("details-button").addEventListener("click", () => { if (inspector.open) dismissDetails(); else openDetails(); });
   btn("current-todo").addEventListener("click", () => openDetails("todo", btn("current-todo"), "todo"));
+  const journal = box("runtime-memory-journal");
+  journal.classList.add("fold-body");
+  box("runtime-memory-branch-content").before(journal);
+  memoryDisclosure().addEventListener("toggle", () => {
+    if (current && inspector.open && branchSelected()) loadDetails(current);
+  });
   box("runtime-metrics").addEventListener("click", event => {
     if (!(event.target instanceof Element) || !event.target.closest("#runtime-open-resources")) return;
     selectDetailsView(btn("runtime-open-todo"));
+    memoryDisclosure().open = true;
     const heading = box("runtime-resources-title");
     heading.focus({ preventScroll: true });
     heading.scrollIntoView({ block: "start" });
@@ -2493,8 +2903,8 @@ function listen(): void {
   });
   btn("details-refresh").addEventListener("click", () => {
     if (!current || !inspector.open) return;
-    if (capabilitiesSelected()) loadCapabilities(current);
-    else loadDetails(current);
+    loadDetails(current, true);
+    if (overviewSelected()) detailsTree?.refresh();
   });
   inspector.querySelector("[data-close]")?.addEventListener("click", dismissDetails);
   inspector.addEventListener("cancel", event => {
@@ -2511,10 +2921,13 @@ function listen(): void {
     if (current && !commandRequest && box("command-error").hidden) renderCommandOptions(current);
   });
   btn("retry").addEventListener("click", () => {
+    clearTimeout(eventRetryTimer);
+    eventRetryTimer = 0;
     source?.close();
     source = undefined;
-    transport = "waiting";
-    recovering = false;
+    if (current) invalidateHistoryOnConnectionChange(current);
+    transport = recovering === "transport" ? "lost" : "waiting";
+    if (recovering !== "transport") recovering = false;
     bootError = "";
     listError = "";
     updateConnection();

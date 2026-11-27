@@ -4,10 +4,11 @@ import type { WireObject } from "./protocol.ts";
 import { discoverTerminalRegistry, registeredTerminal } from "./terminal-registry.ts";
 import type { TerminalEndpoint, TerminalRegistry } from "./terminal-registry.ts";
 import {
-  admissionReply, attachReply, canonicalDirectory, displayText, interruptReply, isAssistant, leafReply, parse, projectMessages,
-  projectState, projectStreamingAssistant, readTerminalIdentity, readTerminalState, terminalInput, terminalMissing, terminalUnattached, turnConflict,
+  admissionReply, attachReply, canonicalDirectory, displayText, interruptReply, isAssistant, leafReply, parse,
+  projectState, projectStreamingAssistant, readTerminalIdentity, readTerminalState, readTerminalTranscript, terminalInput,
+  terminalMissing, terminalUnattached, turnConflict, withStreamingMessage,
 } from "./terminal-view.ts";
-import type { TerminalBranchIdentity, TerminalInput, TerminalInputResult, TerminalMessage, TerminalSession, TerminalSnapshot } from "./terminal-view.ts";
+import type { TerminalBranchIdentity, TerminalInput, TerminalInputResult, TerminalMessage, TerminalSession, TerminalSnapshot, TerminalTranscript } from "./terminal-view.ts";
 import { TERMINAL_ENTRY_BYTES, TerminalPeer, TerminalRefusal, terminalOffline, terminalProtocol } from "./terminal-wire.ts";
 import { WorkspaceAccess } from "./workspace-access.ts";
 
@@ -42,11 +43,10 @@ type Receipt = {
 type Reading = Awaited<ReturnType<typeof readTerminalIdentity>>;
 type State = Awaited<ReturnType<typeof readTerminalState>>;
 type Listing = { readonly available: boolean; readonly sessions: readonly TerminalSession[] };
-type Follow = {
+type Follow = (TerminalTranscript & {
   readonly status: "ok";
   readonly session: Pick<TerminalSession, "id" | "name" | "cwd" | "running">;
-  readonly messages: readonly TerminalMessage[];
-} | { readonly status: "none" | "ambiguous" | "unavailable" };
+}) | { readonly status: "none" | "ambiguous" | "unavailable" };
 
 const MAX_ATTACHED = 8;
 const MAX_PENDING = 8;
@@ -276,7 +276,7 @@ export class TerminalSessions {
       await this.#verifyRegistration(identity);
       const before = await selection();
       if (before !== "ok") return { status: before };
-      const messages = projectMessages(await peer.request({ type: "get_messages", observe: true }));
+      const history = await readTerminalTranscript(peer);
       const state = await readTerminalState(peer, identity);
       await this.#verifyRegistration(identity);
       const after = await selection();
@@ -285,7 +285,7 @@ export class TerminalSessions {
       const id = createHmac("sha256", this.#key)
         .update(JSON.stringify(["follow", endpoint.instance, endpoint.stamp, sessionId, cwd, workspaceKey])).digest("hex");
       return { status: "ok", session: { id, cwd, name: displayText(label ?? "", 200).trim() || "OmO CLI",
-        running: projectState(state).running }, messages };
+        running: projectState(state).running }, ...history };
     } catch (error) {
       if (!(error instanceof WebError)) throw error;
       return { status: await selection() === "ambiguous" ? "ambiguous" : "unavailable" };
@@ -417,19 +417,15 @@ export class TerminalSessions {
   }
 
   async #snapshot(slot: Attachment, peer: TerminalPeer, reading: Reading): Promise<TerminalSnapshot> {
-    const messages = projectMessages(await peer.request({ type: "get_messages", observe: true }));
+    const history = await readTerminalTranscript(peer);
     const state = projectState(await readTerminalState(peer, slot.candidate));
     await this.#verifyRegistration(slot.candidate);
     this.#ensureSelected(slot);
     slot.observedTurn = state.turnId;
     if (!state.running) slot.streaming = undefined;
-    const partial = slot.streaming;
-    const last = messages.at(-1);
-    const alreadySettled = partial && last?.role === "assistant" && last.timestamp === partial.timestamp &&
-      last.content.startsWith(partial.content);
     return {
       session: this.#view(slot.candidate, reading.row, state, true), state,
-      messages: partial && !alreadySettled ? [...messages, partial] : messages,
+      ...(slot.streaming ? withStreamingMessage(history, slot.streaming) : history),
     };
   }
 

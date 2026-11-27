@@ -3,6 +3,7 @@ import type { Wire } from "./dom.ts";
 import { tr, uiLocale } from "./locale.ts";
 import { groupToolCalls, ToolDisplay, visibleToolTarget } from "./tool-display.ts";
 import type { ToolTrace } from "./tool-display.ts";
+import type { HistoryContent, HistoryControl, HistoryRender } from "./transcript-history.ts";
 export type { ToolTrace } from "./tool-display.ts";
 
 // Only static element names and text nodes are emitted. Raw HTML, links and remote images stay text.
@@ -240,8 +241,26 @@ type Row = { readonly key: string; readonly message?: Wire; readonly tool?: Tool
 type Cached = { readonly message: Wire; readonly live: boolean; readonly view: MessageView };
 type RenderInput = {
   readonly entries: readonly TranscriptEntry[]; readonly liveKey: string; readonly tools: ReadonlyMap<string, ToolTrace>;
+  readonly history?: HistoryRender;
+};
+type ContentView = {
+  readonly key: string; readonly node: HTMLElement; readonly output: HTMLElement;
+  readonly button: HTMLButtonElement; readonly status: HTMLElement; count: number; control?: HistoryControl;
 };
 const pageSize = 80;
+const loadOlderLabel = tr("加载更早消息", "Load older messages");
+const reloadLabel = tr("重新加载记录", "Reload transcript");
+
+function historyButton(node: HTMLButtonElement, control: HistoryControl | undefined, label: string): void {
+  if (node.textContent !== label) node.textContent = label;
+  node.toggleAttribute("data-reload", control?.reload === true);
+  node.setAttribute("aria-disabled", String(Boolean(control?.busy || control?.disabled)));
+  node.setAttribute("aria-busy", String(control?.busy === true));
+}
+
+function activateHistory(control?: HistoryControl): void {
+  if (control && !control.busy && !control.disabled) control.activate();
+}
 
 type TraceTargets = {
   readonly user?: HTMLElement; readonly assistant?: HTMLElement; readonly tool?: HTMLElement;
@@ -253,11 +272,17 @@ export class Transcript {
   private readonly toolViews = new Map<string, ToolDisplay>();
   private readonly openTools = new Set<string>();
   private readonly results = new Map<string, number>();
-  private readonly older = button(tr("加载更早消息", "Load older messages"), () => this.flush(true), "transcript-load");
+  private readonly contentViews = new WeakMap<HTMLElement, ContentView>();
+  private readonly older = button(loadOlderLabel, () => {
+    if (this.start) this.flush(true);
+    else activateHistory(this.latest?.history?.older);
+  }, "transcript-load");
   private readonly status = el("span", "sr-only");
+  private readonly olderError = el("p", "notice small");
   private latest?: RenderInput;
   private frame?: number;
   private forceBottom = false;
+  private prepended?: number;
   private limit = pageSize;
   private start = 0;
   private first?: string;
@@ -268,6 +293,7 @@ export class Transcript {
 
   constructor(private readonly root: HTMLElement, private readonly scroller: HTMLElement, private readonly empty: HTMLElement) {
     this.status.setAttribute("role", "status");
+    this.olderError.setAttribute("role", "status");
   }
 
   observeTrace(update: (targets: TraceTargets) => void): void {
@@ -280,6 +306,7 @@ export class Transcript {
     this.latest = this.displayed = this.indexed = undefined;
     this.first = undefined;
     this.forceBottom = false;
+    this.prepended = undefined;
     this.limit = pageSize;
     this.start = this.indexedLength = 0;
     this.cache.clear();
@@ -294,9 +321,11 @@ export class Transcript {
     this.trace?.({});
   }
 
-  render(entries: readonly TranscriptEntry[], liveKey: string, tools: ReadonlyMap<string, ToolTrace>, forceBottom = false): void {
-    this.latest = { entries, liveKey, tools };
+  render(entries: readonly TranscriptEntry[], liveKey: string, tools: ReadonlyMap<string, ToolTrace>, forceBottom = false,
+    history?: HistoryRender, prepended?: number): void {
+    this.latest = { entries, liveKey, tools, history };
     this.forceBottom ||= forceBottom;
+    if (prepended !== undefined) this.prepended = (this.prepended ?? 0) + prepended;
     this.frame ??= requestAnimationFrame(() => {
       this.frame = undefined;
       this.flush();
@@ -317,22 +346,26 @@ export class Transcript {
     }
   }
 
-  private flush(expand = false): void {
-    if (!this.latest || (expand && !this.start)) return;
+  private flush(expandLocal = false): void {
+    if (!this.latest || (expandLocal && !this.start)) return;
     if (this.frame !== undefined) cancelAnimationFrame(this.frame);
     this.frame = undefined;
-    const { entries, liveKey, tools } = this.latest;
+    const { entries, liveKey, tools, history } = this.latest;
+    const prepended = this.prepended;
+    this.prepended = undefined;
+    const expand = expandLocal || prepended !== undefined;
     const { scrollTop, scrollHeight, clientHeight } = this.scroller;
     const active = document.activeElement;
     const rowFocus = active instanceof HTMLElement && this.root.contains(active)
-      && (active.closest(".tool-details, .tool-group") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
+      && (active.closest(".tool-details, .tool-group, .transcript-content") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
     const toolFocus = rowFocus?.matches(".tool-group-summary")
       ? rowFocus.parentElement?.querySelector<HTMLElement>(".tool-summary")
       : rowFocus?.querySelector<HTMLElement>(".tool-summary");
     const nearEnd = scrollHeight - clientHeight - scrollTop < 72;
-    const follow = this.forceBottom || (nearEnd && !rowFocus);
+    const follow = this.forceBottom || (nearEnd && !rowFocus && active !== this.older);
     this.forceBottom = false;
-    const boundary = expand && this.older.nextElementSibling instanceof HTMLElement ? this.older.nextElementSibling : undefined;
+    const afterControls = this.olderError.nextElementSibling;
+    const boundary = expand && afterControls instanceof HTMLElement ? afterControls : undefined;
     const toolBoundary = boundary?.querySelector<HTMLElement>(".tool-summary") ?? undefined;
     const readingAnchor = expand && rowFocus?.closest(".tool-details, .tool-group") && boundary?.contains(rowFocus) ? rowFocus : boundary;
     const previousTop = readingAnchor?.getBoundingClientRect().top;
@@ -341,6 +374,7 @@ export class Transcript {
     const dangling: Row[] = [];
     for (const [id, tool] of tools) if (!this.results.has(id)) dangling.push({ key: `result:${id}`, tool });
     const total = entries.length + dangling.length;
+    if (prepended !== undefined) this.limit += prepended;
     const tail = Math.max(0, total - this.limit);
     if (!this.displayed || (follow && !expand)) this.start = tail;
     else {
@@ -350,11 +384,13 @@ export class Transcript {
       }
       this.start = Math.min(this.start, tail);
     }
-    let loaded = 0;
-    if (expand) {
+    let loaded = prepended ?? 0;
+    if (expandLocal) {
       loaded = Math.min(this.start, pageSize);
       this.start -= loaded;
       this.limit = Math.max(this.limit, total - this.start);
+    } else if (prepended !== undefined) {
+      this.start = Math.max(0, this.start - prepended);
     }
     this.displayed = entries;
     this.first = entries[this.start]?.key;
@@ -400,22 +436,28 @@ export class Transcript {
         this.toolViews.set(key, view);
       }
       view.update(call, tool, result);
+      const body = view.node.querySelector<HTMLElement>(":scope > .tool-details > .fold-body");
+      if (body) this.renderHistoryContent(body, result && history?.content(result));
       if (this.trace && (tool?.id || str(call?.id) || str(call?.name) || str(result?.toolCallId) || str(result?.toolName))) {
         latestTool = view.node;
       }
       return view.node;
     };
-    if (this.older.parentNode !== this.root) this.root.prepend(this.status, this.older);
-    this.older.hidden = !this.start;
+    if (this.older.parentNode !== this.root) this.root.prepend(this.status, this.older, this.olderError);
+    const remote = this.start ? undefined : history?.older;
+    this.older.hidden = !this.start && !remote;
     const olderCount = this.start.toLocaleString(uiLocale);
-    const label = tr(`加载更早消息（${olderCount} 条）`, `Load older messages (${olderCount})`);
-    if (this.older.textContent !== label) this.older.textContent = label;
+    const label = this.start ? tr(`加载更早消息（${olderCount} 条）`, `Load older messages (${olderCount})`)
+      : remote?.reload ? reloadLabel : remote?.busy ? tr("正在读取…", "Loading…") : loadOlderLabel;
+    historyButton(this.older, remote, label);
+    this.olderError.hidden = !remote?.error;
+    if (this.olderError.textContent !== (remote?.error ?? "")) this.olderError.textContent = remote?.error ?? "";
     const renderCall = (key: string, part: Wire): HTMLElement | undefined => {
       const id = str(part.id);
       const result = this.results.get(id);
       return renderTool(id ? `id:${id}` : key, part, tools.get(id), result === undefined ? undefined : entries[result]?.message);
     };
-    let last: Element = this.older;
+    let last: Element = this.olderError;
     let latestUser: HTMLElement | undefined;
     let latestAssistant: HTMLElement | undefined;
     for (const row of rows) {
@@ -436,6 +478,14 @@ export class Transcript {
           const members = group.flatMap(call => renderCall(key, call) ?? []);
           return this.toolViews.get(`id:${id}`)?.groupWith(members);
         });
+        const messageView = this.cache.get(row.key)?.view;
+        if (messageView) {
+          const content = history?.content(message);
+          const textParts = messageView.parts.filter(({ part }) => part.type === "text");
+          // Text cursors read from the start of the original, not from the end of the preview.
+          if (textParts.length === 1 && textParts[0]?.node) textParts[0].node.hidden = Boolean(content?.chunks.length);
+          this.renderHistoryContent(messageView.body, content);
+        }
         if (groupedElsewhere && node.classList.contains("message--tool-only") && !this.cache.get(row.key)?.view.body.childElementCount) {
           node.remove();
           continue;
@@ -474,13 +524,59 @@ export class Transcript {
       const anchor = readingAnchor && this.root.contains(readingAnchor)
         ? visibleToolTarget(readingAnchor) : visibleToolTarget(toolBoundary);
       if (anchor && this.root.contains(anchor) && previousTop !== undefined) {
-        if (moveFocus) {
+        if (moveFocus && (loaded || this.older.hidden)) {
           if (anchor.tagName !== "SUMMARY") anchor.tabIndex = -1;
           anchor.focus({ preventScroll: true });
         }
         this.scroller.scrollTop += anchor.getBoundingClientRect().top - previousTop;
-      } else if (moveFocus) this.scroller.focus({ preventScroll: true });
+      } else if (moveFocus && this.older.hidden) this.scroller.focus({ preventScroll: true });
     } else if (follow) this.scroller.scrollTop = this.scroller.scrollHeight;
+    if (!expand && active === this.older && this.older.hidden) this.scroller.focus({ preventScroll: true });
+  }
+
+  private renderHistoryContent(host: HTMLElement, content?: HistoryContent): void {
+    let view = this.contentViews.get(host);
+    if (view && (!content || view.key !== content.key)) {
+      const focused = view.node.contains(document.activeElement);
+      view.node.remove();
+      this.contentViews.delete(host);
+      view = undefined;
+      if (focused) this.scroller.focus({ preventScroll: true });
+    }
+    if (!content) return;
+    if (!view) {
+      const node = el("div", "transcript-content stack stack--tight");
+      const output = el("div", "plain break");
+      const status = el("p", "small muted");
+      status.setAttribute("role", "status");
+      const load = button("", () => activateHistory(this.contentViews.get(host)?.control), "button--quiet");
+      node.append(output, status, load);
+      host.append(node);
+      view = { key: content.key, node, output, status, button: load, count: 0 };
+      this.contentViews.set(host, view);
+    }
+    view.control = content.control;
+    if (content.chunks.length < view.count) { view.count = 0; view.output.replaceChildren(); }
+    const chunks = content.chunks.slice(view.count).map(chunk => el("span", "", chunk));
+    view.output.append(...chunks);
+    view.count = content.chunks.length;
+    view.output.hidden = !view.count;
+    const label = content.control?.reload ? reloadLabel : content.control?.busy ? tr("正在读取…", "Loading…")
+      : view.count ? tr("加载下一段正文", "Load next content chunk") : tr("加载正文", "Load message content");
+    historyButton(view.button, content.control, label);
+    const status = content.control?.reload ? tr("记录版本已失效。", "This transcript page expired.") :
+      content.control?.error ?? (chunks.length ? tr("已加载正文。", "Message content loaded.") :
+        content.control?.busy || !view.count ? "" : view.status.textContent);
+    if (view.status.textContent !== status) view.status.textContent = status;
+    view.status.hidden = !status;
+    const target = chunks.find(chunk => chunk.textContent);
+    if (target && document.activeElement === view.button) {
+      target.tabIndex = -1;
+      target.focus({ preventScroll: true });
+    }
+    const moveFocus = !content.control && document.activeElement === view.button;
+    view.button.hidden = !content.control;
+    if (moveFocus) this.scroller.focus({ preventScroll: true });
   }
 
   private updateMessage(row: Row, message: Wire, renderCall: (part: Wire, index: number) => HTMLElement | undefined): HTMLElement {

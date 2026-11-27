@@ -60,10 +60,12 @@ async function workbench(width: number, height: number, run: (browser: Bun.WebVi
         await beforeDetails?.(read);
         return Response.json({
           stats: { contextUsage: { tokens: 34700, contextWindow: 128000, percent: 27.109 }, cost: read === 1 ? 0 : 0.01234 },
-          runtime: { status: "ok", todo: { status: "ok", phases: [{ name: "检查",
-            tasks: [{ status: "in_progress", content: "检查窄屏" }, { status: "pending", content: "复查焦点" }] }] } },
         });
       },
+      [`/api/sessions/${session.id}/branch-runtime`]: Response.json({
+        status: "ok", leafId: "fixture-leaf", todo: { status: "ok", phases: [{ name: "检查",
+          tasks: [{ status: "in_progress", content: "检查窄屏" }, { status: "pending", content: "复查焦点" }] }] },
+      }),
       [`/api/sessions/${session.id}/native-runtime`]: Response.json({
         tasks: { status: "empty" }, memory: { status: "ok", totalSteps: 0, reflectedSteps: 0 },
         dag: { status: "ok", limitReached: false, rows: [{

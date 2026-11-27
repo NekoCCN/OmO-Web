@@ -371,3 +371,28 @@ export function projectRuntimeBranch(tree: unknown): RuntimeBranchView {
       };
   return { status: "ok", leafId, todo, memory, ...(incomplete ? { incomplete: true as const } : {}) };
 }
+
+export function projectPagedRuntimeBranch(entries: readonly {
+  readonly id: string; readonly parentId: string | null; readonly raw: Fields;
+}[], leafId: string | null): RuntimeBranchView {
+  type Node = { readonly entry: Fields; readonly children: Node[] };
+  const nodes = new Map<string, Node>();
+  for (const { id, raw } of entries) {
+    if (nodes.has(id)) return { status: "invalid", reason: "duplicate-id" };
+    nodes.set(id, { entry: raw, children: [] });
+  }
+  const roots: Node[] = [];
+  // Use the effective Native parent pointers, never append order or label.targetId.
+  // Build only after all pages were received, since a parent can live outside its page.
+  for (const { id, parentId } of entries) {
+    const children = parentId === null ? roots : nodes.get(parentId)?.children;
+    const node = nodes.get(id);
+    if (!children || !node) return { status: "invalid", reason: "broken-ancestry" };
+    children.push(node);
+  }
+  const reachable = [...roots];
+  for (const node of reachable) reachable.push(...node.children);
+  if (reachable.length !== nodes.size) return { status: "invalid", reason: "broken-ancestry" };
+  // A root selection can have older disconnected history; it has no active ancestry.
+  return projectRuntimeBranch({ tree: leafId === null ? [] : roots, leafId });
+}

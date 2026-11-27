@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 
-const chromium = process.env.BUN_CHROME_PATH ?? Bun.which("chromium") ?? Bun.which("google-chrome-stable");
+const chromium = process.env.OMO_HANDOFF_CHROMIUM ?? process.env.BUN_CHROME_PATH ?? Bun.which("chromium") ?? Bun.which("google-chrome-stable");
 const browserTest = test.skipIf(!chromium || typeof Bun.WebView !== "function");
 const sessions = ["alpha", "beta"].map(id => ({
   id, name: `侧栏 · ${id}`, cwd: `/fixture/${id}`, active: true, archived: false, settled: true, running: false,
@@ -21,6 +21,9 @@ async function sidebar(width: number, run: (fixture: {
   actions: unknown[];
   setSnapshot: (data: SnapshotFixture) => void;
   setTodo: (content: string) => void;
+  detailReads: string[];
+  treeReplies: Array<Response | (() => Promise<Response>)>;
+  nativeReplies: Response[];
   holdNextSnapshot: () => { requested: Promise<void>; release: () => void };
 }) => Promise<void>, initialTodo: string | null = "核对侧栏") {
   const bundle = await Bun.build({ entrypoints: ["src/web/app.ts"], target: "browser" });
@@ -28,6 +31,9 @@ async function sidebar(width: number, run: (fixture: {
   if (!bundle.success || !script) throw new Error("Could not build sidebar fixture");
   const reads: string[] = [];
   const actions: unknown[] = [];
+  const detailReads: string[] = [];
+  const treeReplies: Array<Response | (() => Promise<Response>)> = [];
+  const nativeReplies: Response[] = [];
   let send: ReadableStreamDefaultController<string> | undefined;
   let alphaSnapshot: SnapshotFixture = {};
   let todoContent = initialTodo;
@@ -74,22 +80,39 @@ async function sidebar(width: number, run: (fixture: {
       [`${path}/:id/workbench-status`]: Response.json({ status: "ok", currentTodo: "核对侧栏", pendingTodo: 1 }),
       [`${path}/:id/details`]: request => Response.json({
         stats: request.params.id === "alpha" ? { contextUsage: { tokens: 900, percent: 9, contextWindow: 10000 }, cost: 0 } : {},
-        runtime: { status: "ok", leafId: "leaf-fixture", todo: todoContent === null ? { status: "missing" }
-          : { status: "ok", phases: [{ name: "验收", tasks: [{ status: "pending", content: todoContent }] }] },
-          memory: { status: "ok", recalledCount: 3 } },
         ...(request.params.id === "alpha" ? { generationSpeed: { tokensPerSecond: 52.1, measuredAt: 2 } } : {}),
       }),
-      [`${path}/:id/native-runtime`]: Response.json({
-        tasks: { status: "empty" }, dag: { status: "empty" }, memory: { status: "ok", totalSteps: 8, reflectedSteps: 0 },
-      }),
+      [`${path}/:id/tree`]: request => {
+        detailReads.push(`${request.params.id}/tree${new URL(request.url).search}`);
+        const reply = treeReplies.shift();
+        return typeof reply === "function" ? reply() : reply ?? Response.json({ nodes: [], leafId: null });
+      },
+      [`${path}/:id/branch-runtime`]: request => {
+        detailReads.push(`${request.params.id}/branch-runtime`);
+        return Response.json({ status: "ok", leafId: "leaf-fixture", todo: todoContent === null ? { status: "missing" }
+          : { status: "ok", phases: [{ name: "验收", tasks: [{ status: "pending", content: todoContent }] }] },
+          memory: { status: "ok", recalledCount: 3 } });
+      },
+      [`${path}/:id/native-runtime`]: request => {
+        detailReads.push(`${request.params.id}/native-runtime`);
+        return nativeReplies.shift() ?? Response.json({
+          tasks: { status: "empty" }, dag: { status: "empty" }, memory: { status: "ok", totalSteps: 8, reflectedSteps: 0 },
+        });
+      },
+      [`${path}/:id/activity`]: request => {
+        detailReads.push(`${request.params.id}/activity`);
+        return Response.json({ status: "ok", updatedAt: 2, tasks: [{ status: "completed" }], runs: [] });
+      },
       [`${path}/:id/instructions`]: request => {
         reads.push(`${request.method} ${request.params.id}${new URL(request.url).search}`);
         return request.params.id === "beta" ? Response.json({ status: "missing" })
           : Response.json({ status: "ok", file: "AGENTS.md", content: ruleText });
       },
       [`${path}/:id/actions`]: async request => {
-        actions.push(await request.json());
-        return Response.json({ session: sessions.find(row => row.id === request.params.id), result: {} });
+        const action = await request.json();
+        actions.push(action);
+        return Response.json({ session: sessions.find(row => row.id === request.params.id),
+          result: action?.action === "navigate" ? { cancelled: false, leafId: action.targetId, editorText: "导航后的历史草稿" } : {} });
       },
     },
   });
@@ -100,10 +123,10 @@ async function sidebar(width: number, run: (fixture: {
   if (width <= 760) await browser.click("#open-navigation");
   await browser.click('[data-session="alpha"]');
   await wait(browser, `!document.querySelector("#details-button").hidden`);
-  await run({
+  try { await run({
     browser, events: value => send?.enqueue(`event: omo\ndata: ${JSON.stringify({ sessionId: "alpha", ...value })}\n\n`),
     disconnect: () => send?.close(),
-    reads, actions, setSnapshot: data => { alphaSnapshot = data; },
+    reads, actions, detailReads, treeReplies, nativeReplies, setSnapshot: data => { alphaSnapshot = data; },
     setTodo: content => { todoContent = content; },
     holdNextSnapshot: () => {
       const started = Promise.withResolvers<void>();
@@ -111,11 +134,15 @@ async function sidebar(width: number, run: (fixture: {
       snapshotGate = { started: started.resolve, reply: reply.promise };
       return { requested: started.promise, release: reply.resolve };
     },
-  });
+  }); } catch (error) {
+    if (detailReads.length) console.error("Fixture runtime reads:", detailReads);
+    throw error;
+  }
 }
 
-function wait(browser: Bun.WebView, condition: string) {
-  return browser.evaluate(`new Promise((resolve, reject) => {
+async function wait(browser: Bun.WebView, condition: string) {
+  try {
+    return await browser.evaluate(`new Promise((resolve, reject) => {
     const timer = setTimeout(() => { observer.disconnect(); reject(Error(${JSON.stringify(condition)})); }, 2600);
     const observer = new MutationObserver(check);
     function check() {
@@ -124,6 +151,17 @@ function wait(browser: Bun.WebView, condition: string) {
     }
     observer.observe(document.body, { subtree: true, attributes: true, childList: true, characterData: true }); check();
   })`);
+  } catch (error) {
+    if (!/runtime-tree|runtime-memory-journal/.test(condition)) throw error;
+    const state = await browser.evaluate(`({
+      visible: document.querySelector("#details-dialog").open,
+      active: document.activeElement.outerHTML.slice(0, 200),
+      selected: document.querySelector('#runtime-shortcuts [aria-selected="true"]')?.id,
+      title: document.querySelector("#session-title")?.textContent,
+      tree: document.querySelector("#runtime-tree")?.innerText,
+    })`);
+    throw new Error(`${condition}: ${JSON.stringify(state)}`, { cause: error });
+  }
 }
 
 async function accessibleNode(browser: Bun.WebView, selector: string) {
@@ -148,6 +186,178 @@ async function capture(browser: Bun.WebView, name: string) {
     await Bun.write(`${dir}/${name}-${appearance}.png`, await browser.screenshot());
   }
 }
+
+const treeSummary = "#runtime-tree summary";
+const loadOlder = "#runtime-tree [data-tree-older]";
+const reloadTree = "#runtime-tree [data-tree-reload]";
+const treePage = (id: string, summary: string, leafId = id, nextCursor?: string) => Response.json({
+  nodes: [{ id, parentId: `outside-${id}`, type: "message", role: "user", summary }], leafId,
+  ...(nextCursor ? { nextCursor } : {}),
+});
+const treeFailure = (status: number) => Response.json({ error: "fixture tree failure", code: status === 409 ? "session_changed" : "internal" }, { status });
+
+async function clickTreeControl(browser: Bun.WebView, selector: string) {
+  await wait(browser, `document.querySelector(${JSON.stringify(selector)})?.getClientRects().length`);
+  expect(await browser.evaluate(`(() => {
+    const control = document.querySelector(${JSON.stringify(selector)});
+    control.scrollIntoView({ block: "center", behavior: "instant" });
+    const { x, y, width, height } = control.getBoundingClientRect();
+    return control.contains(document.elementFromPoint(x + width / 2, y + height / 2));
+  })()`)).toBe(true);
+  await browser.click(selector);
+}
+
+for (const width of [320, 1440]) browserTest(`lazy details reads each resource only on intent and adds one older page at a time at ${width}px`, async () => {
+  await sidebar(width, async ({ browser, detailReads, treeReplies }) => {
+    if (width === 320) await browser.click("#details-button");
+    await wait(browser, `document.querySelector(".metric-highlights")`);
+    expect(detailReads).toEqual([]);
+    await browser.click("#details-refresh");
+    expect(detailReads).toEqual([]);
+    treeReplies.push(treePage("new", "最新节点", "new", "opaque +/= cursor"), treePage("old", "过去节点", "new"));
+    await clickTreeControl(browser, treeSummary);
+    await wait(browser, `document.querySelector('#runtime-tree [aria-current="true"]')?.textContent.includes("最新节点")`);
+    expect(detailReads).toEqual(["alpha/tree"]);
+    expect(await browser.evaluate(`document.activeElement.matches(${JSON.stringify(treeSummary)})`)).toBe(true);
+    await clickTreeControl(browser, loadOlder);
+    await wait(browser, `document.querySelector("#runtime-tree").innerText.includes("过去节点")`);
+    expect(detailReads).toEqual(["alpha/tree", "alpha/tree?cursor=opaque+%2B%2F%3D+cursor"]);
+    expect(await browser.evaluate(`[document.activeElement.matches(${JSON.stringify(loadOlder)}),
+      document.querySelector('#runtime-tree [aria-current="true"]').textContent.includes("最新节点")]`)).toEqual([true, true]);
+    expect(await browser.evaluate(`(() => {
+      const scroller = document.querySelector("#details-scroll");
+      const { top, bottom } = document.activeElement.getBoundingClientRect();
+      const bounds = scroller.getBoundingClientRect();
+      return [scroller.scrollWidth <= scroller.clientWidth, top >= bounds.top - 1 && bottom <= bounds.bottom + 1];
+    })()`)).toEqual([true, true]);
+    await capture(browser, `lazy-tree-pages-${width}`);
+    await browser.click("#runtime-open-todo");
+    await wait(browser, `document.querySelector("[data-runtime-branch] details")`);
+    expect(detailReads.at(-1)).toBe("alpha/branch-runtime");
+    expect(detailReads).not.toContain("alpha/native-runtime");
+    await browser.click("#details-refresh");
+    await wait(browser, `document.querySelector("[data-runtime-branch] details")?.getClientRects().length`);
+    await clickTreeControl(browser, "#runtime-memory-branch summary");
+    await wait(browser, `document.querySelector("#runtime-memory-journal").textContent.includes("8")`);
+    await browser.click("#runtime-open-dag");
+    expect(detailReads.filter(read => read.endsWith("native-runtime"))).toEqual(["alpha/native-runtime"]);
+    expect(detailReads.filter(read => read.endsWith("branch-runtime"))).toEqual(["alpha/branch-runtime", "alpha/branch-runtime"]);
+  });
+});
+
+browserTest("lazy details keeps overview usable through loading, retry and stale older cursors", async () => {
+  await sidebar(1440, async ({ browser, detailReads, treeReplies }) => {
+    await wait(browser, `document.querySelector(".metric-highlights")`);
+    const held = Promise.withResolvers<Response>();
+    treeReplies.push(() => held.promise, treePage("new", "当前节点", "new", "older-token"), treeFailure(500), treeFailure(409), Response.json({ nodes: [], leafId: null }));
+    await clickTreeControl(browser, treeSummary);
+    await wait(browser, `document.querySelector("#runtime-tree [role=status]")?.textContent.includes("正在")`);
+    held.resolve(treeFailure(500));
+    await wait(browser, `document.querySelector(${JSON.stringify(reloadTree)})?.getClientRects().length`);
+    expect(await browser.evaluate(`Boolean(document.querySelector(".metric-highlights")?.getClientRects().length)`)).toBe(true);
+    expect(await browser.evaluate(`document.querySelector("#runtime-tree").innerText`)).not.toContain("没有可导航");
+    await clickTreeControl(browser, reloadTree);
+    await wait(browser, `document.querySelector('#runtime-tree [aria-current="true"]')`);
+    await clickTreeControl(browser, loadOlder);
+    await wait(browser, `document.querySelector("#runtime-tree [role=status]")?.textContent.includes("失败")`);
+    expect(await browser.evaluate(`document.querySelector('#runtime-tree [aria-current="true"]').textContent`)).toContain("当前节点");
+    expect(await browser.evaluate(`document.activeElement.matches(${JSON.stringify(loadOlder)})`)).toBe(true);
+    await clickTreeControl(browser, loadOlder);
+    await wait(browser, `document.querySelector("#runtime-tree [role=status]")?.textContent.includes("重新读取")`);
+    expect(detailReads).toEqual(["alpha/tree", "alpha/tree", "alpha/tree?cursor=older-token", "alpha/tree?cursor=older-token"]);
+    expect(await browser.evaluate(`document.activeElement.matches(${JSON.stringify(reloadTree)})`)).toBe(true);
+    await clickTreeControl(browser, reloadTree);
+    await wait(browser, `document.querySelector("#runtime-tree").innerText.includes("没有可导航")`);
+    expect(detailReads.at(-1)).toBe("alpha/tree");
+  });
+});
+
+browserTest("lazy details rejects late pages after close and session switch without stealing focus", async () => {
+  await sidebar(1440, async ({ browser, detailReads, treeReplies }) => {
+    await wait(browser, `document.querySelector(".metric-highlights")`);
+    const closed = Promise.withResolvers<Response>();
+    const switched = Promise.withResolvers<Response>();
+    const closedStarted = Promise.withResolvers<void>();
+    const switchedStarted = Promise.withResolvers<void>();
+    treeReplies.push(() => { closedStarted.resolve(); return closed.promise; },
+      () => { switchedStarted.resolve(); return switched.promise; }, treePage("beta-new", "乙会话节点"));
+    await clickTreeControl(browser, treeSummary);
+    await wait(browser, `document.querySelector("#runtime-tree [role=status]")?.textContent.includes("正在")`);
+    await closedStarted.promise;
+    await browser.click("#details-button");
+    closed.resolve(treePage("closed", "不应写入已关闭面板"));
+    expect(await browser.evaluate("document.activeElement.id")).toBe("details-button");
+    await browser.press("Enter");
+    await wait(browser, `document.querySelector(${JSON.stringify(treeSummary)}) && document.querySelector(".metric-highlights")`);
+    await clickTreeControl(browser, treeSummary);
+    await wait(browser, `document.querySelector("#runtime-tree [role=status]")?.textContent.includes("正在")`);
+    await switchedStarted.promise;
+    await browser.evaluate(`document.querySelector('button[data-session="beta"]').focus()`);
+    await browser.press("Enter");
+    await wait(browser, `document.querySelector("#session-title").textContent.endsWith("beta") &&
+      document.querySelector("#details-dialog[open] #runtime-metrics .metric-highlights")?.getClientRects().length`);
+    await browser.evaluate(`document.querySelector(${JSON.stringify(treeSummary)}).focus()`);
+    expect(await browser.evaluate(`document.activeElement.matches(${JSON.stringify(treeSummary)})`)).toBe(true);
+    await browser.press("Enter");
+    await wait(browser, `document.querySelector('#runtime-tree [aria-current="true"]')?.textContent.includes("乙会话节点")`);
+    switched.resolve(treePage("late-alpha", "不应写入乙会话"));
+    await browser.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    expect(detailReads).toEqual(["alpha/tree", "alpha/tree", "beta/tree"]);
+    expect(await browser.evaluate(`[
+      document.querySelectorAll("#runtime-tree .tree li").length,
+      document.querySelector('#runtime-tree [aria-current="true"]').textContent.includes("乙会话节点"),
+      document.activeElement.matches(${JSON.stringify(treeSummary)})
+    ]`)).toEqual([1, true, true]);
+  });
+});
+
+browserTest("lazy details navigates with the rendered leaf, preserves confirmation and never submits the draft", async () => {
+  await sidebar(1440, async ({ browser, detailReads, treeReplies, actions }) => {
+    await wait(browser, `document.querySelector(".metric-highlights")`);
+    treeReplies.push(treePage("history-user", "历史用户消息", "not-on-first-page"));
+    await clickTreeControl(browser, treeSummary);
+    await wait(browser, `document.querySelector("#runtime-tree [role=status]")?.textContent.includes("不在已加载")`);
+    expect(await browser.evaluate(`document.querySelector("#runtime-tree [aria-current]") === null`)).toBe(true);
+    await browser.click("#prompt");
+    await browser.type("保留的草稿");
+    // Stub only the blocking platform dialog to inspect its copy and exercise both decisions.
+    await browser.evaluate(`(() => { window.treeConfirmations = []; window.confirm = message => {
+      window.treeConfirmations.push(message); return window.treeConfirmations.length > 1;
+    }; })()`);
+    const node = "#runtime-tree .tree button";
+    await clickTreeControl(browser, node);
+    expect(actions).toEqual([]);
+    expect(await browser.evaluate(`[
+      window.treeConfirmations[0].includes("替换当前草稿"), document.querySelector("#prompt").value
+    ]`)).toEqual([true, "保留的草稿"]);
+    await clickTreeControl(browser, node);
+    await wait(browser, `document.querySelector("#prompt").value === "导航后的历史草稿" && document.querySelector(${JSON.stringify(reloadTree)})?.getClientRects().length`);
+    expect(actions).toEqual([{ action: "navigate", targetId: "history-user", expectedLeafId: "not-on-first-page" }]);
+    expect(detailReads).toEqual(["alpha/tree"]);
+  });
+});
+
+browserTest("lazy details refreshes the visible runtime and falls back only when the live source is unsupported", async () => {
+  await sidebar(1440, async ({ browser, detailReads, nativeReplies }) => {
+    await wait(browser, `document.querySelector(".metric-highlights")`);
+    const unsupported = { status: "unavailable", reason: "unsupported" };
+    nativeReplies.push(Response.json({ tasks: unsupported, dag: unsupported, memory: { status: "empty" } }),
+      Response.json({ code: "internal" }, { status: 500 }));
+    await browser.click("#runtime-open-subagents");
+    await wait(browser, `document.querySelector("#runtime-subagent").innerText.includes("非实时")`);
+    expect(detailReads).toEqual(["alpha/native-runtime", "alpha/activity"]);
+    await browser.click("#runtime-open-dag");
+    await wait(browser, `document.querySelector("#runtime-dag").innerText.includes("非实时")`);
+    expect(detailReads).toEqual(["alpha/native-runtime", "alpha/activity"]);
+    await browser.click("#details-refresh");
+    await wait(browser, `document.querySelector("#runtime-dag").innerText.includes("读取失败或超时")`);
+    expect(await browser.evaluate(`document.querySelector("#runtime-dag").innerText`)).not.toContain("非实时");
+    expect(detailReads).toEqual(["alpha/native-runtime", "alpha/activity", "alpha/native-runtime"]);
+    await browser.click("#runtime-open-todo");
+    await wait(browser, `document.querySelector("[data-runtime-branch] details")`);
+    expect(detailReads.at(-1)).toBe("alpha/branch-runtime");
+  });
+});
 
 browserTest("desktop dock opens without stealing focus and never becomes a modal when resized", async () => {
   await sidebar(1440, async ({ browser }) => {
@@ -322,12 +532,11 @@ browserTest("session sidebar uses live readings and loads text-only project rule
     await wait(browser, `document.querySelector("#runtime-metrics").textContent.includes("75 token/s")`);
     expect(await metrics()).toMatch(/上下文已用25%.*32,000 \(25%\)/);
     await browser.click("#runtime-open-todo");
+    await clickTreeControl(browser, "#runtime-memory-branch summary");
     await wait(browser, `document.querySelector("#runtime-todo #runtime-journal dd")?.getClientRects().length`);
     expect(reads).toEqual([]);
     expect(await browser.evaluate(`[...document.querySelectorAll("#runtime-journal dd")].map(node => node.textContent)`))
       .toEqual(["8", "0"]);
-    await browser.evaluate(`document.querySelector("#runtime-memory-branch summary").scrollIntoView({ block: "center" })`);
-    await browser.click("#runtime-memory-branch summary");
     expect(await browser.evaluate(`document.querySelector("#runtime-memory-branch").innerText`)).toContain("3");
     await browser.evaluate(`document.querySelector("#runtime-instructions summary").scrollIntoView({ block: "center" })`);
     await browser.click("#runtime-instructions summary");
@@ -416,6 +625,7 @@ browserTest("overview exposes rules and memory without another tab or an eager r
       } else {
         await browser.click("#runtime-open-resources");
       }
+      await wait(browser, `document.querySelector("#runtime-journal dd")?.getClientRects().length`);
       expect(await browser.evaluate(`[
         document.querySelector("#runtime-open-todo").getAttribute("aria-selected"),
         document.activeElement.id,
@@ -543,8 +753,8 @@ browserTest("a held session snapshot cannot restore generation speed after engin
 browserTest("settled turns update the open dock's Todo and retain disclosure focus and newer speed", async () => {
   await sidebar(1440, async ({ browser, events, setSnapshot, setTodo }) => {
     const todo = `document.querySelector("#runtime-todo [data-runtime-branch]")`;
-    await wait(browser, `${todo}`);
     await browser.click("#runtime-open-todo");
+    await wait(browser, `${todo}?.textContent.includes("数量未知")`);
     expect(await browser.evaluate(`${todo}.querySelector("summary") === null`)).toBe(true);
     setTodo("新原生待办");
     events({ type: "agent_settled" });

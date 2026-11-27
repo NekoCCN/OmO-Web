@@ -9,6 +9,8 @@ import type { WireObject } from "../src/protocol.ts";
 class FixtureEngine extends Engine {
   #next = 0;
 
+  override status = { online: true };
+
   override async probe() {}
 
   override async request(type: string) {
@@ -17,6 +19,7 @@ class FixtureEngine extends Engine {
   }
 
   override async requestExisting(type: string) {
+    if (type === "get_messages") return { messages: [] };
     return type === "get_state" ? { thinkingLevel: "high", thinkingLevelSource: "explicit", usageTotals: { output: 123_456 } } : {};
   }
 }
@@ -24,9 +27,9 @@ class FixtureEngine extends Engine {
 test("speed projects only the latest completed, measurable stream on the same live binding", async () => {
   const root = await mkdtemp(join(tmpdir(), "omo-web-runtime-speed-"));
   const clock = spyOn(performance, "now");
+  const events: WireObject[] = [];
+  const sessions = new Sessions(root, [root], new FixtureEngine(["unused"], root, () => {}, () => {}), event => events.push(event));
   try {
-    const events: WireObject[] = [];
-    const sessions = new Sessions(root, [root], new FixtureEngine(["unused"], root, () => {}, () => {}), event => events.push(event));
     await sessions.load();
     const a = await sessions.create(root), b = await sessions.create(root);
     const message = { role: "assistant", timestamp: 123, content: [{ type: "text", text: "some output" }] };
@@ -96,6 +99,7 @@ test("speed projects only the latest completed, measurable stream on the same li
     expect(await sessions.snapshot(a.id)).not.toHaveProperty("generationSpeed");
   } finally {
     clock.mockRestore();
+    sessions.stop();
     await rm(root, { recursive: true, force: true });
   }
 });

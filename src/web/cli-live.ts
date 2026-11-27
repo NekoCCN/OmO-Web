@@ -35,6 +35,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
   let fresh = false;
   let state: Wire = {};
   let entries: readonly TranscriptEntry[] = [];
+  let history: "truncated" | "unavailable" | undefined;
   let restoreOnClose = true;
 
   function render(): void {
@@ -62,7 +63,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
     input.readOnly = pending === "input";
     box("cli-live-conversation").hidden = !hasTranscript && !input.value;
     notice(box("cli-live-workspace"), row?.cwd);
-    notice(box("cli-live-status"), pending === "connect" ? tr("正在连接 CLI…", "Connecting to CLI…")
+    const status = pending === "connect" ? tr("正在连接 CLI…", "Connecting to CLI…")
       : pending === "disconnect" ? tr("正在释放 Web 连接…", "Disconnecting Web…")
       : transport === "lost" ? tr("实时更新已离线，草稿会保留。连接恢复后只刷新消息，不会重发。",
         "Live updates are offline. Your draft is kept. Reconnecting refreshes messages without resending them.")
@@ -73,8 +74,13 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
       : available === false ? tr("CLI 实时不可用：未启用或找不到本地终端控制服务。", "Live CLI is unavailable. The local terminal service is disabled or could not be found.")
       : !items.length ? tr("没有发现可连接的 CLI 会话。", "No CLI sessions are available to connect.")
       : transport === "waiting" ? tr("正在等待 Web 实时连接…", "Waiting for the Web connection…")
-      : shown === row?.id ? tr("已断开；显示最后一次同步的消息。", "Disconnected. Showing the last synced messages.")
-        : tr("选择会话后，点击「连接」读取对话。", "Select a session and choose “Connect” to read the conversation."));
+      : shown === row?.id ? entries.length ? tr("已断开；显示最后一次同步的消息。", "Disconnected. Showing the last synced messages.")
+        : tr("已断开。", "Disconnected.")
+        : tr("选择会话后，点击「连接」读取对话。", "Select a session and choose “Connect” to read the conversation.");
+    const historyNote = shown === row?.id && (connected ? fresh : !pending) ?
+      history === "unavailable" ? tr(" · 对话记录暂不可读", " · Conversation history is unavailable")
+        : history === "truncated" ? tr(" · 仅显示部分近期消息", " · Showing a limited set of recent messages") : "" : "";
+    notice(box("cli-live-status"), status + historyNote);
     box("cli-live-hint").textContent = unknownDelivery ? tr(`上一次发送的结果未知，请先核对 CLI，不要重发这条消息。${hint}`,
       `Delivery of your last message is unknown. Check the CLI before trying again. Do not resend this message. ${hint}`) : hint;
   }
@@ -83,6 +89,7 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
     shown = "";
     state = {};
     entries = [];
+    history = undefined;
     transcript.reset();
     input.value = drafts.get(select.value) ?? "";
     notice(box("cli-live-error"));
@@ -128,13 +135,17 @@ export function cliLive(api: Api, onClose: () => void, openBranch: (source: Bran
 
   function apply(id: string, data: Wire): void {
     state = object(data.state);
+    const next = object(data.transcript).status;
+    history = next === "truncated" || next === "unavailable" ? next : undefined;
     const before = entries;
     entries = list(data.messages).map(object).map((message, i) => ({
       key: `cli-live:${i}`,
       message: JSON.stringify(before[i]?.message) === JSON.stringify(message) ? before[i]?.message ?? message : message,
     }));
     const last = entries.at(-1);
-    transcript.render(entries, last?.message.streaming === true ? last.key : "", tools, shown !== id);
+    if (!last && history) transcript.reset();
+    else transcript.render(entries, last?.message.streaming === true ? last.key : "", tools, shown !== id);
+    box("cli-live-empty").hidden = Boolean(history) || entries.length > 0;
     shown = id;
     fresh = true;
     retryDelay = 500;

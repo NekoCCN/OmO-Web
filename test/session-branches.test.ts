@@ -4,12 +4,14 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { CliHistory } from "../src/cli-history.ts";
 import { Engine } from "../src/engine.ts";
-import { record } from "../src/protocol.ts";
+import { record, WebError } from "../src/protocol.ts";
 import type { WireObject } from "../src/protocol.ts";
 import { Sessions } from "../src/sessions.ts";
 
 const cleanup: string[] = [];
+const activeSessions: Sessions[] = [];
 afterEach(async () => {
+  for (const sessions of activeSessions.splice(0)) sessions.stop();
   await Promise.all(cleanup.splice(0).map(path => rm(path, { recursive: true, force: true })));
 });
 
@@ -36,7 +38,13 @@ class BranchEngine extends Engine {
   readonly runtimes = new Map<string, Runtime>();
   failure: "cancel" | "missing" | "outside" | undefined;
 
-  constructor(cwd: string) { super(["never-spawned"], cwd, () => {}, () => {}); }
+  constructor(cwd: string, entriesTail: boolean) {
+    super(["never-spawned"], cwd, () => {}, () => {});
+    this.status = { online: true };
+    if (entriesTail) this.capabilities = new Set(["entries_tail"]);
+  }
+
+  override async probe(): Promise<void> {}
 
   override async request(type: string, fields: WireObject): Promise<WireObject> {
     if (type !== "open_session" || typeof fields.sessionPath !== "string" || typeof fields.cwd !== "string") {
@@ -49,7 +57,8 @@ class BranchEngine extends Engine {
     });
     const [head, ...entries] = text.split("\n").filter(Boolean).map(line => record(JSON.parse(line)));
     const runtime = { path, cwd: fields.cwd, nativeId: String(head?.id ?? crypto.randomUUID()),
-      name: "", leafId: typeof entries.at(-1)?.id === "string" ? String(entries.at(-1)?.id) : null,
+      name: "", leafId: this.capabilities.has("entries_tail") && dirname(path).includes(".omo-web-branch-") ? "a1" :
+        typeof entries.at(-1)?.id === "string" ? String(entries.at(-1)?.id) : null,
       entries, busy: false };
     const route = crypto.randomUUID();
     this.runtimes.set(route, runtime);
@@ -62,7 +71,18 @@ class BranchEngine extends Engine {
     if (!runtime) throw new Error("Unknown runtime");
     switch (type) {
       case "get_state": return this.#state(runtime);
-      case "get_tree": return { leafId: runtime.leafId, tree: [] };
+      case "get_tree":
+        if (this.capabilities.has("entries_tail")) {
+          throw new WebError(502, "engine_frame_too_large", "tree would exceed frame limit");
+        }
+        return { leafId: runtime.leafId, tree: [] };
+      case "get_entries": {
+        if (!this.capabilities.has("entries_tail") || fields.tail !== 1 || fields.maxBytes !== 262_144 ||
+          Object.keys(fields).length !== 3) throw new Error("Expected exactly one bounded Native tail entry");
+        const tail = runtime.entries.slice(-1);
+        const hasMore = runtime.entries.length > 1;
+        return { entries: tail, leafId: runtime.leafId, hasMore, ...(hasMore ? { next_before: tail[0].id } : {}) };
+      }
       case "get_messages": return { messages: this.#path(runtime, runtime.leafId).map(entry => entry.message) };
       case "get_fork_messages": return { messages: runtime.entries.flatMap(entry => {
         const user = messages.find(row => row.id === entry.id && row.role === "user");
@@ -117,7 +137,7 @@ class BranchEngine extends Engine {
   }
 }
 
-async function fixture() {
+async function fixture(entriesTail = false) {
   const home = await realpath(await mkdtemp(join(tmpdir(), "omo-web-branch-test-")));
   cleanup.push(home);
   const cwd = join(home, "workspace");
@@ -126,8 +146,9 @@ async function fixture() {
   const web = join(home, "web", "sessions");
   await mkdir(cwd);
   await mkdir(dir, { recursive: true });
-  const engine = new BranchEngine(cwd);
+  const engine = new BranchEngine(cwd, entriesTail);
   const sessions = new Sessions(dirname(web), [cwd], engine, () => {});
+  activeSessions.push(sessions);
   await sessions.load();
   const cli = new CliHistory(profile, [cwd]);
   const id = crypto.randomUUID();
@@ -137,8 +158,8 @@ async function fixture() {
   return { cwd, cli, dir, home, id, path, bytes, engine, sessions, web };
 }
 
-test("active Web clones use the live leaf rather than the last appended entry", async () => {
-  const { cwd, engine, sessions } = await fixture();
+async function cloneActiveWebAtSelectedLeaf(entriesTail: boolean) {
+  const { cwd, engine, sessions } = await fixture(entriesTail);
   const source = await sessions.create(cwd);
   const [live] = [...engine.runtimes.values()];
   live.entries = entries;
@@ -161,6 +182,17 @@ test("active Web clones use the live leaf rather than the last appended entry", 
   expect(live.leafId).toBe("u2");
   expect(live.path).toBe(previousPath);
   expect(await readFile(previousPath, "utf8")).toBe(bytes);
+}
+
+test("legacy active Web clones use the live leaf rather than the last appended entry", () => cloneActiveWebAtSelectedLeaf(false));
+test("entries_tail active Web clones use bounded leaf reads for the source and scratch routes", () => cloneActiveWebAtSelectedLeaf(true));
+
+test("entries_tail scratch compares its actual leaf when restoring an independently selected branch", async () => {
+  const { cli, cwd, id, sessions } = await fixture(true);
+  const source = await cli.branchSource(id, cwd);
+  const result = await sessions.branchFrom({ ...source, leafId: "u2" }, { kind: "clone" });
+  if (result.cancelled) throw new Error("Expected scratch clone");
+  expect((await sessions.snapshot(result.session.id)).messages).toHaveLength(3);
 });
 
 test("CLI history forks privately before the selected message and returns its unsent draft", async () => {

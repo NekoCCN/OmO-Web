@@ -4,14 +4,36 @@ import { record } from "../src/protocol.ts";
 
 const mode = process.argv[2];
 const log = process.argv[3];
-const route = "rpc-private-route";
-const durable = "native-private-durable";
+let route = "rpc-private-route";
+let durable = "native-private-durable";
 const time = "2026-11-25T12:34:56.000Z";
 const secret = "PRIVATE-DO-NOT-RETURN";
 let state: Record<string, unknown> = {};
 let reads = 0;
 let lists = 0;
+let openings = 0;
+const paging = mode?.startsWith("tree-");
+let leafId: string | null = mode === "tree-null-leaf" ? null : "entry-42";
+const pagingEntries = Array.from({ length: mode === "tree-budget" ? 201 : 45 }, (_, i) => ({
+  id: `entry-${i}`, parentId: i === 0 ? null : `entry-${i - 1}`, type: "message",
+  message: { role: "assistant", content: [{ type: "text", text: secret }] },
+}));
+const activeTodo = { id: "entry-3", parentId: "entry-1", type: "custom", customType: "senpi.todo-state",
+  data: { schema: "v2", phases: [{ name: "Checks", tasks: [{ content: "Paged Todo", status: "in_progress" }] }] } };
+const siblingMemory = { id: "entry-2", parentId: "entry-1", type: "custom", customType: "omo-kibitzer:nudged",
+  data: { version: 1, nudges: [{ hint: secret, path: secret }] } };
+const activeMemory = { id: "entry-4", parentId: "entry-3", type: "custom", customType: "omo-kibitzer:gate",
+  data: { version: 1, status: "skipped", consecutiveFailures: 1, candidateCount: 2 } };
+const labelRecord = { id: "entry-44", parentId: "entry-43", type: "label",
+  targetId: "entry-3", label: secret };
 const runId = "dag_22222222-2222-4222-8222-222222222222";
+
+function todoEntries() {
+  const tasks = mode === "todo-zero" ? [{ content: "Done", status: "completed" }]
+    : [{ content: "Review changes", status: "in_progress" }, { content: secret, status: "pending" }];
+  return mode === "empty" ? [] : [{ id: secret, parentId: null, type: "custom", customType: "senpi.todo-state",
+    data: { schema: "v2", phases: [{ name: secret, tasks: mode === "todo-budget" ? Array(501).fill(tasks[0]) : tasks }] } }];
+}
 
 for await (const line of createInterface({ input: process.stdin })) {
   const cmd = record(JSON.parse(line));
@@ -32,8 +54,12 @@ for await (const line of createInterface({ input: process.stdin })) {
       reply({});
       break;
     case "open_session":
-      state = { sessionId: mode === "legacy-route" ? route : durable, sessionFile: cmd.sessionPath,
-        cwd: cmd.cwd, sessionName: cmd.name };
+      if (paging && ++openings > 1) {
+        route = `rpc-private-route-${openings}`;
+        durable = `native-private-durable-${openings}`;
+      }
+      state = { sessionId: mode === "legacy-route" ? route : durable, sessionFile: cmd.sessionPath, cwd: cmd.cwd,
+        sessionName: cmd.name, ...(mode === "tree-busy" ? { pendingQuestions: [{ id: "pending" }] } : {}) };
       reply({ sessionId: route, state, permissionPreset: "ask", permissionPresetStatus: "applied" });
       break;
     case "get_state":
@@ -47,12 +73,66 @@ for await (const line of createInterface({ input: process.stdin })) {
     case "get_tree": {
       if (cmd.sessionId !== route) { reply({}, "unknown_session"); break; }
       if (mode === "todo-release") console.log(JSON.stringify({ type: "session_released", sessionId: route }));
-      const tasks = mode === "todo-zero" ? [{ content: "Done", status: "completed" }]
-        : [{ content: "Review changes", status: "in_progress" }, { content: secret, status: "pending" }];
-      const entry = { id: secret, parentId: null, type: "custom", customType: "senpi.todo-state",
-        data: { schema: "v2", phases: [{ name: secret, tasks: mode === "todo-budget" ? Array(501).fill(tasks[0]) : tasks }] } };
-      reply(mode === "empty" ? { tree: [], leafId: null } :
-        { tree: [{ entry, children: [] }], leafId: mode === "todo-invalid" ? "unknown" : secret });
+      const entries = todoEntries();
+      reply({ tree: entries.map(entry => ({ entry, children: [] })), leafId: entries.length === 0 ? null :
+        mode === "todo-invalid" ? "unknown" : secret });
+      break;
+    }
+    case "get_messages":
+      reply({ messages: mode === "tree-transcript" ? Array.from({ length: 49 }, (_, timestamp) =>
+        ({ role: "user", content: `active leaf ${leafId}`, timestamp })) : [] });
+      break;
+    case "get_session_stats":
+      reply({ totalMessages: 7, failures: 0 });
+      break;
+    case "get_pending_inputs":
+      reply({ lifetimeId: "lifetime", throughCursor: 0, inputs: [], outcomes: [] });
+      break;
+    case "list_sessions":
+      reply({ sessions: [] });
+      break;
+    case "get_entries": {
+      if (cmd.sessionId !== route) { reply({}, "unknown_session"); break; }
+      if (cmd.maxBytes !== 262144 || (cmd.tail !== 40 && cmd.tail !== 1)) { reply({}, "wrong_paging"); break; }
+      if (mode === "tree-unsupported") { reply({}, "unknown_command"); break; }
+      if (mode === "todo-release") console.log(JSON.stringify({ type: "session_released", sessionId: route }));
+      if (mode === "tree-replaced" && cmd.before !== undefined) {
+        console.log(JSON.stringify({ type: "session_replaced", sessionId: route }));
+      }
+      const entries = paging ? pagingEntries.map((entry, i) => {
+        if (i === 2) return siblingMemory;
+        if (i === 3) return activeTodo;
+        if (i === 4 && mode === "tree-cycle") return { ...entry, parentId: "entry-6" };
+        if (i === 4) return activeMemory;
+        if (i === 1 && mode === "tree-cross-duplicate") return { ...entry, id: "entry-10" };
+        if (i === 44 && mode === "tree-giant") return { ...entry, note: secret.repeat(30_000) };
+        if (i === 44 && mode === "tree-bad-id") return { ...entry, id: "../private" };
+        if (i === 44) return labelRecord;
+        return entry;
+      }) : todoEntries();
+      const end = cmd.before === undefined ? entries.length : entries.findIndex(entry => entry.id === cmd.before);
+      if (end < 0) { reply({}, "not_found"); break; }
+      const start = mode === "tree-giant" && cmd.before === undefined ? end - 1 : Math.max(0, end - cmd.tail);
+      const page = entries.slice(start, end);
+      if (mode === "tree-repeat" && cmd.before !== undefined) {
+        reply({ entries: [entries[end]], leafId, hasMore: true, next_before: cmd.before });
+      } else {
+        reply({ entries: page, leafId: mode === "tree-leaf-changed" && cmd.before !== undefined ? "newly-appended" :
+          paging ? leafId : entries.length === 0 ? null :
+          mode === "todo-invalid" ? "unknown" : secret, hasMore: start > 0,
+          ...(start > 0 ? { next_before: mode === "tree-bad-next" ? "wrong" : page[0]?.id } : {}) });
+      }
+      break;
+    }
+    case "navigate_tree": {
+      if (cmd.sessionId !== route) { reply({}, "unknown_session"); break; }
+      if (cmd.expectedLeafId !== leafId) { reply({}, "stale_leaf"); break; }
+      if (typeof cmd.targetId !== "string" || !pagingEntries.some(entry => entry.id === cmd.targetId)) {
+        reply({}, "not_found");
+        break;
+      }
+      leafId = cmd.targetId;
+      reply({ cancelled: false, leafId });
       break;
     }
     case "extension_request": {

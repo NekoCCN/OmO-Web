@@ -136,11 +136,14 @@ test.each([
   ["empty", { status: "empty" }],
   ["todo-invalid", unavailable("malformed")],
   ["todo-budget", unavailable("incomplete")],
+  ["tree-current", unavailable("incomplete")],
   ["todo-release", unavailable("ownership_changed")],
 ] as const)("workbench status distinguishes %s Todo without exposing the tree", async (mode, expected) => {
   await usingApp(mode, async ({ app, cwd, log }) => {
     const url = new URL("workbench-status?sessionId=foreign", await create(app, cwd));
     const before = (await readFile(log, "utf8")).length;
+    expect((await fetch(url)).status).toBe(400);
+    url.search = "";
     const response = await fetch(url);
     expect(response.status).toBe(200);
     expect(response.headers.get("cache-control")).toBe("no-store");
@@ -148,7 +151,199 @@ test.each([
     const requests = (await readFile(log, "utf8")).slice(before).trim().split("\n")
       .map(line => z.object({ type: z.string() }).parse(JSON.parse(line)).type);
     expect(requests).toEqual(mode === "todo-release"
-      ? ["get_state", "get_tree"] : ["get_state", "get_tree", "get_state"]);
+      ? ["get_state", "get_entries"] : ["get_state", "get_entries", "get_state"]);
+  });
+});
+
+const treePage = z.object({
+  nodes: z.array(z.strictObject({ id: z.string(), parentId: z.string().nullable(), type: z.string(),
+    role: z.string().optional(), label: z.string().optional(), summary: z.string().optional() })),
+  leafId: z.string().nullable(), nextCursor: z.string().optional(),
+});
+const older = (tree: URL, cursor: string) => new URL(`?cursor=${encodeURIComponent(cursor)}`, tree);
+
+async function postAction(url: URL, body: unknown) {
+  const { token } = z.object({ token: z.string() }).parse(await (await fetch(new URL("/api/bootstrap", url))).json());
+  return fetch(new URL("actions", url), { method: "POST", headers: { Origin: url.origin,
+    "X-OmO-Token": token, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+}
+
+test("details overview retains metrics without requesting history, runtime or queue text", async () => {
+  await usingApp("tree-current", async ({ app, cwd, log }) => {
+    const url = await create(app, cwd);
+    const response = await fetch(new URL("details", url));
+    expect(response.status).toBe(200);
+    const overview = await response.json();
+    expect(overview).not.toHaveProperty("tree");
+    expect(overview).not.toHaveProperty("runtime");
+    expect(overview).not.toHaveProperty("queue");
+    expect(overview).toMatchObject({ stats: { totalMessages: 7, failures: 0 },
+      sessionMemory: { status: "unavailable" } });
+    expect(await readFile(log, "utf8")).not.toMatch(/"type":"(?:get_tree|get_entries|extension_request|get_pending_inputs)"/);
+  });
+});
+
+test("tree pages cover append order without exposing message bodies, label metadata, or Native cursors", async () => {
+  await usingApp("tree-current", async ({ app, cwd, log }) => {
+    const url = new URL("tree", await create(app, cwd));
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    const receipt = await response.text();
+    const newest = treePage.parse(JSON.parse(receipt));
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(newest.nodes.map(node => node.id)).toEqual(Array.from({ length: 40 }, (_, i) => `entry-${i + 5}`));
+    expect(newest.nodes[0]).toMatchObject({ parentId: "entry-4", role: "assistant" });
+    expect(newest.leafId).toBe("entry-42");
+    expect(receipt).not.toContain("PRIVATE-DO-NOT-RETURN");
+    expect(newest.nextCursor).not.toBe("entry-5");
+    const cursor = z.string().parse(newest.nextCursor);
+    const previous = treePage.parse(await (await fetch(older(url, cursor))).json());
+    expect(previous.nodes.map(node => node.id)).toEqual(["entry-0", "entry-1", "entry-2", "entry-3", "entry-4"]);
+    expect(previous.nodes[3]).toMatchObject({ parentId: "entry-1", type: "custom" });
+    expect(previous.leafId).toBe("entry-42");
+    expect(previous.nextCursor).toBeUndefined();
+    expect(JSON.stringify(previous)).not.toContain("Paged Todo");
+    const calls = (await readFile(log, "utf8")).split("\n").filter(line => line.includes('"type":"get_entries"'))
+      .map(line => z.object({ tail: z.number(), maxBytes: z.number(), before: z.string().optional() }).parse(JSON.parse(line)));
+    expect(calls).toEqual([{ tail: 40, maxBytes: 262144 }, { tail: 40, maxBytes: 262144, before: "entry-5" }]);
+    expect(await readFile(log, "utf8")).not.toContain('"type":"get_tree"');
+  });
+});
+
+test("tree singleton over the Native soft byte limit remains a bounded preview", async () => {
+  await usingApp("tree-giant", async ({ app, cwd }) => {
+    const response = await fetch(new URL("tree", await create(app, cwd)));
+    expect(response.status).toBe(200);
+    const body = await response.text();
+    expect(body.length).toBeLessThan(512);
+    expect(body).not.toContain("PRIVATE-DO-NOT-RETURN");
+    expect(treePage.parse(JSON.parse(body)).nodes.map(node => node.id)).toEqual(["entry-44"]);
+  });
+});
+
+test.each(["tree-bad-id", "tree-bad-next"])("tree rejects malformed Native page %s", async mode => {
+  await usingApp(mode, async ({ app, cwd }) => {
+    expect((await fetch(new URL("tree", await create(app, cwd)))).status).toBe(502);
+  });
+});
+
+test.each([
+  ["tree-repeat", 502], ["tree-cross-duplicate", 502], ["tree-replaced", 409], ["tree-leaf-changed", 409],
+] as const)("tree continuation fails closed on %s", async (mode, status) => {
+  await usingApp(mode, async ({ app, cwd }) => {
+    const url = new URL("tree", await create(app, cwd));
+    const { nextCursor } = treePage.parse(await (await fetch(url)).json());
+    const response = await fetch(older(url, z.string().parse(nextCursor)));
+    expect(response.status).toBe(status);
+    if (status === 409) expect(await response.clone().json()).toMatchObject({ code: "tree_stale" });
+    expect(await response.text()).not.toContain("entry-10");
+  });
+});
+
+test("tree rejects malformed selectors, same-host foreign sessions, foreign hosts and a rebound workspace", async () => {
+  await usingApp("tree-current", async ({ app, cwd, log }) => {
+    const url = new URL("tree", await create(app, cwd));
+    const before = await readFile(log, "utf8");
+    for (const query of ["?cursor=", "?cursor=../x", "?cursor=a&cursor=b", "?limit=10", "?cursor=a&sessionId=foreign"]) {
+      expect((await fetch(new URL(query, url))).status).toBe(400);
+    }
+    expect(await readFile(log, "utf8")).toBe(before);
+    const cursor = z.string().parse(treePage.parse(await (await fetch(url)).json()).nextCursor);
+    await usingApp("tree-current", async other => {
+      const foreign = new URL("tree", await create(other.app, other.cwd));
+      expect((await fetch(older(foreign, cursor))).status).toBe(409);
+    });
+    const sibling = new URL("tree", await create(app, cwd));
+    expect((await fetch(older(sibling, cursor))).status).toBe(409);
+    await rename(cwd, `${cwd}-original`);
+    await mkdir(cwd);
+    const beforeSwap = await readFile(log, "utf8");
+    expect((await fetch(older(url, cursor))).status).toBe(403);
+    expect(await readFile(log, "utf8")).toBe(beforeSwap);
+  });
+});
+
+test("navigate compares expected leaf, invalidates cursors, and reads legacy leaf independently of append order", async () => {
+  await usingApp("tree-current", async ({ app, cwd, log }) => {
+    const url = new URL("tree", await create(app, cwd));
+    const cursor = z.string().parse(treePage.parse(await (await fetch(url)).json()).nextCursor);
+    expect((await postAction(url, { action: "navigate", targetId: "entry-1", expectedLeafId: "entry-44" })).status).toBe(409);
+    const explicit = await postAction(url, { action: "navigate", targetId: "entry-1", expectedLeafId: "entry-42" });
+    expect(explicit.status).toBe(200);
+    expect(await explicit.json()).toMatchObject({ result: { leafId: "entry-1" } });
+    expect((await fetch(older(url, cursor))).status).toBe(409);
+    const legacy = await postAction(url, { action: "navigate", targetId: "entry-42" });
+    expect(legacy.status).toBe(200);
+    const requests = (await readFile(log, "utf8")).trim().split("\n").map(line => z.object({
+      type: z.string(), tail: z.number().optional(), expectedLeafId: z.string().optional(),
+    }).parse(JSON.parse(line)));
+    expect(requests.filter(call => call.type === "get_entries").map(call => call.tail)).toEqual([40, 1]);
+    expect(requests.filter(call => call.type === "navigate_tree").map(call => call.expectedLeafId)).toEqual(["entry-44", "entry-42", "entry-1"]);
+    expect(requests.some(call => call.type === "get_tree" || call.type === "prompt")).toBe(false);
+    expect((await fetch(older(url, cursor))).status).toBe(409);
+  });
+});
+
+test("navigate never writes for a pending question or a supplied foreign route", async () => {
+  await usingApp("tree-busy", async ({ app, cwd, log }) => {
+    const url = await create(app, cwd);
+    expect((await postAction(url, { action: "navigate", targetId: "entry-1", expectedLeafId: "entry-42",
+      sessionId: "foreign" })).status).toBe(400);
+    expect((await postAction(url, { action: "navigate", targetId: "entry-1", expectedLeafId: "entry-42" })).status).toBe(409);
+    expect(await readFile(log, "utf8")).not.toContain('"type":"navigate_tree"');
+  });
+});
+
+test("explicit navigation evicts transcript cursors without rereading the old branch", async () => {
+  await usingApp("tree-transcript", async ({ app, cwd, log }) => {
+    const session = await create(app, cwd);
+    const path = new URL(session.href.replace(/\/native-runtime$/u, ""));
+    const initial = await (await fetch(path)).json();
+    expect(initial.messages.at(-1).content).toBe("active leaf entry-42");
+    expect((await postAction(session, { action: "navigate", targetId: "entry-1", expectedLeafId: "entry-42" })).status).toBe(200);
+    const stale = new URL("transcript", session);
+    stale.searchParams.set("cursor", initial.page.olderCursor);
+    expect((await fetch(stale)).status).toBe(409);
+    const current = await (await fetch(path)).json();
+    expect(current.messages.at(-1).content).toBe("active leaf entry-1");
+    expect(current.page.id).not.toBe(initial.page.id);
+    const requests: { type: string }[] = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+    expect(requests.filter(call => call.type === "get_messages")).toHaveLength(2);
+    expect(requests.some(call => call.type === "get_tree" || call.type === "get_snapshot")).toBe(false);
+  });
+});
+
+test("navigate forwards an explicit null expected leaf rather than substituting an appended id", async () => {
+  await usingApp("tree-null-leaf", async ({ app, cwd, log }) => {
+    const response = await postAction(await create(app, cwd), { action: "navigate", targetId: "entry-1", expectedLeafId: null });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ result: { leafId: "entry-1" } });
+    expect(await readFile(log, "utf8")).not.toContain('"type":"get_entries"');
+  });
+});
+
+test.each([
+  ["tree-current", { status: "ok", leafId: "entry-42", todo: { status: "ok", phases: [
+    { name: "Checks", tasks: [{ content: "Paged Todo", status: "in_progress" }] },
+  ] }, memory: { status: "ok", gate: { status: "skipped", consecutiveFailures: 1, candidateCount: 2 } } }, 2],
+  ["tree-null-leaf", { status: "ok", leafId: null, todo: { status: "none" }, memory: { status: "none" } }, 2],
+  ["tree-budget", unavailable("incomplete"), 4],
+  ["tree-giant", unavailable("incomplete"), 1],
+  ["tree-cross-duplicate", unavailable("malformed"), 2],
+  ["tree-cycle", unavailable("malformed"), 2],
+  ["tree-replaced", unavailable("ownership_changed"), 2],
+  ["tree-leaf-changed", unavailable("ownership_changed"), 2],
+  ["tree-unsupported", unavailable("unsupported"), 1],
+] as const)("branch runtime %s requires complete bounded ancestry and no get_tree fallback", async (mode, expected, count) => {
+  await usingApp(mode, async ({ app, cwd, log }) => {
+    const url = new URL("branch-runtime", await create(app, cwd));
+    expect((await fetch(new URL("?tail=400", url))).status).toBe(400);
+    const response = await fetch(url);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual(expected);
+    const trace = await readFile(log, "utf8");
+    expect(trace).not.toContain('"type":"get_tree"');
+    expect(trace.match(/"type":"get_entries"/g)).toHaveLength(count);
   });
 });
 

@@ -36,6 +36,7 @@ const noControlChars = (value: string): boolean => {
 
 export const openInput = z.strictObject({ cwd: z.string().min(1).max(4096), name: z.string().trim().min(1).max(120).optional() });
 export const emptyBody = z.strictObject({});
+export const entryId = z.string().min(1).max(200).regex(/^[A-Za-z0-9_-]+$/u);
 export const actions = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("resume") }),
   z.strictObject({
@@ -65,7 +66,7 @@ export const actions = z.discriminatedUnion("action", [
   z.strictObject({ action: z.literal("autoCompaction"), enabled: z.boolean() }),
   z.strictObject({ action: z.literal("compact"), instructions: z.string().max(6000).optional() }),
   z.strictObject({ action: z.literal("clearQueue") }),
-  z.strictObject({ action: z.literal("navigate"), targetId: z.string().min(1).max(120).nullable() }),
+  z.strictObject({ action: z.literal("navigate"), targetId: entryId.nullable(), expectedLeafId: entryId.nullable().optional() }),
   z.strictObject({
     action: z.literal("answer"), requestId: z.string().min(1).max(200), value: z.string().max(30_000).optional(),
     confirmed: z.boolean().optional(), cancelled: z.literal(true).optional(),
@@ -96,24 +97,6 @@ export function transcriptMessage(value: unknown): WireObject | undefined {
     return;
   }
   return message(raw);
-}
-
-export function transcriptTree(value: unknown): WireObject {
-  const tree = record(value);
-  const nodes: WireObject[] = [];
-  const pending = [{ source: array(tree.tree), target: nodes }];
-  for (const { source, target } of pending) {
-    for (const node of source.map(record)) {
-      const raw = record(node.entry);
-      const entry = pick(raw, ["type", "id", "parentId", "timestamp", "provider", "modelId", "thinkingLevel", "name", "label"]);
-      const content = transcriptMessage(raw.message);
-      if (content) entry.message = content;
-      const children: WireObject[] = [];
-      target.push({ entry, children, ...pick(node, ["label"]) });
-      pending.push({ source: array(node.children), target: children });
-    }
-  }
-  return { tree: nodes, ...pick(tree, ["leafId"]) };
 }
 
 const safeLabel = z.string().trim().min(1).max(120).refine(noControlChars);

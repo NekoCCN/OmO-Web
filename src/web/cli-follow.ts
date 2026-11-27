@@ -6,7 +6,8 @@ import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
 import { tr } from "./locale.ts";
 
 type Target = { readonly id: string; readonly name: string; readonly cwd: string; readonly running: boolean };
-type Snapshot = { readonly status: "ok"; readonly target: Target; readonly messages: readonly Wire[] }
+type History = "truncated" | "unavailable";
+type Snapshot = { readonly status: "ok"; readonly target: Target; readonly messages: readonly Wire[]; readonly history?: History }
   | { readonly status: "none" | "ambiguous" | "unavailable" };
 const pollInterval = 2_000;
 const readTimeout = 8_000;
@@ -28,8 +29,9 @@ function parseSnapshot(data: Wire, authorized: (cwd: string) => boolean): Snapsh
       const name = str(session.name);
       if (!id || !cwd || !authorized(cwd) || typeof session.name !== "string"
         || typeof session.running !== "boolean" || !Array.isArray(data.messages)) return { status: "unavailable" };
+      const history = object(data.transcript).status;
       const messages: Wire[] = [];
-      for (const raw of data.messages) {
+      for (const raw of history === "unavailable" ? [] : data.messages) {
         const { role, content, timestamp, streaming } = object(raw);
         if ((role !== "user" && role !== "assistant" && role !== "custom") || typeof content !== "string") {
           return { status: "unavailable" };
@@ -37,7 +39,8 @@ function parseSnapshot(data: Wire, authorized: (cwd: string) => boolean): Snapsh
         // Pass only the projected text fields to Transcript, never raw UI events.
         messages.push({ role, content, timestamp: num(timestamp), streaming: role === "assistant" && streaming === true });
       }
-      return { status: "ok", target: { id, name: name || tr("未命名 CLI 会话", "Untitled CLI session"), cwd, running: session.running }, messages };
+      return { status: "ok", target: { id, name: name || tr("未命名 CLI 会话", "Untitled CLI session"), cwd, running: session.running }, messages,
+        ...(history === "truncated" || history === "unavailable" ? { history } : {}) };
     }
     default: return { status: "unavailable" };
   }
@@ -63,11 +66,13 @@ export function cliFollow(api: Api, authorized: (cwd: string) => boolean, onChan
     empty.hidden = true;
   }
 
-  function setStatus(state: keyof typeof labels | "ok", running = false): void {
+  function setStatus(state: keyof typeof labels | "ok", running = false, history?: History): void {
     const text = state === "ok" ? tr(`只读跟随 · ${running ? "CLI 正在运行" : "CLI 未在运行"}`,
       `Following · Read-only · ${running ? "CLI is running" : "CLI is idle"}`) : labels[state];
+    const detail = history === "unavailable" ? tr(" · 对话记录暂不可读", " · Conversation history is unavailable")
+      : history === "truncated" ? tr(" · 仅显示部分近期消息", " · Showing a limited set of recent messages") : "";
     if (status.dataset.state !== state) status.dataset.state = state;
-    if (status.textContent !== text) status.textContent = text;
+    if (status.textContent !== text + detail) status.textContent = text + detail;
   }
 
   function apply(snapshot: Snapshot): void {
@@ -83,7 +88,7 @@ export function cliFollow(api: Api, authorized: (cwd: string) => boolean, onChan
     workspace = target.cwd;
     const switched = !before || before.id !== target.id || before.cwd !== target.cwd;
     if (switched) clearTranscript();
-    setStatus("ok", target.running);
+    setStatus("ok", target.running, snapshot.history);
     const previous = new Map(entries.map(entry => [entry.key, entry]));
     const keys = new Set<string>();
     const next = snapshot.messages.map((message, i) => {
@@ -93,11 +98,15 @@ export function cliFollow(api: Api, authorized: (cwd: string) => boolean, onChan
       const old = previous.get(key);
       return old && JSON.stringify(old.message) === JSON.stringify(message) ? old : { key, message };
     });
-    if (switched || entries.length !== next.length || next.some((entry, index) => entry !== entries[index])) {
+    if (snapshot.history && next.length === 0) {
+      // An unavailable read is not an authoritative empty transcript.
+      clearTranscript();
+    } else if (switched || entries.length !== next.length || next.some((entry, index) => entry !== entries[index])) {
       entries = next;
       const last = entries.at(-1);
       transcript.render(entries, last?.message.streaming === true ? last.key : "", tools, switched);
     }
+    empty.hidden = Boolean(snapshot.history) || entries.length > 0;
     if (switched || before?.name !== target.name) onChange();
   }
 
