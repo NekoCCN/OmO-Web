@@ -27,7 +27,7 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 有仓库访问权限时，可以从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`。校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
 
 ```sh
-VERSION="0.1.1"
+VERSION="0.1.2"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&

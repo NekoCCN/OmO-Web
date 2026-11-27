@@ -22,7 +22,7 @@ cd /path/to/your/project
 omo-web
 ```
 
-If you can't reach npm and have repository access, [download the `.tgz` from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) and run `npm install -g ./omo-web-0.1.1.tgz`.
+If you can't reach npm and have repository access, [download the `.tgz` from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.2) and run `npm install -g ./omo-web-0.1.2.tgz`.
 
 In an interactive terminal, `omo-web` opens a launcher. Use the arrow keys and Enter to pick a working directory, edit **Access settings**, or start the service. Open the printed address (default `http://127.0.0.1:4317`). Stop the service from the launcher before changing settings. Access settings persist; directory edits apply only to the current launcher session. For scripts use `omo-web serve`. The launcher follows the system language (English / 简体中文, English fallback).
 
@@ -38,10 +38,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 Replace the example path with a directory that exists. `bun start` builds first and then starts; repeat runs can use `bun run serve` to skip the rebuild.
 
-Prefer the Bun-only archive? Download `omo-web-0.1.1.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
+Prefer the Bun-only archive? If you have repository access, download `omo-web-0.1.2.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
 
 ```sh
-VERSION="0.1.1"
+VERSION="0.1.2"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
@@ -130,12 +130,12 @@ OMO_WEB_WORKSPACES="$dirs" bun start
 
 Non-loopback listeners require HTTPS. Binding to an interface does not configure a firewall or restrict which source addresses can connect. Use a VPN where possible and set a password. Passwordless mode is an explicit opt-in for restricted networks: anyone who can connect can read sessions and run tools through OmO. See [Linux and Windows remote setup](docs/usage.md#密码与远程访问).
 
-For a tunnel or reverse proxy that terminates HTTPS, keep OmO Web on `127.0.0.1`, configure **Access settings → Proxy origin** (or `OMO_WEB_PROXY_ORIGIN`), and use the [proxy setup checklist](docs/usage.md#内网穿透与反向代理). This option is available in source builds and is not part of the published `0.1.1` package.
+For a tunnel or reverse proxy that terminates HTTPS, keep OmO Web on `127.0.0.1`, configure **Access settings → Proxy origin** (or `OMO_WEB_PROXY_ORIGIN`), and use the [proxy setup checklist](docs/usage.md#内网穿透与反向代理).
 
 ## Platform limits
 
 - Linux: verified with Bun 1.4.5 and OmO Native 5.1.83; the launcher was also tested in a real terminal.
-- Windows: CI covers local and remote Web access, password files, and npm installation. Interactive launcher behavior and native CLI handoff were not verified on Windows.
+- Windows: CI covers local and remote Web access, private password files, and launching the service from the installed npm command. Interactive launcher menus and native CLI handoff were not verified on Windows.
 - macOS is not in the current test matrix.
 
 ## Develop
@@ -149,7 +149,7 @@ bun run build     # browser assets
 bun run serve     # start without rebuilding
 ```
 
-[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.1 notes](docs/releases/0.1.1.md) · [Distribution options](docs/distribution.md)
+[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.2 notes](docs/releases/0.1.2.md) · [Distribution options](docs/distribution.md)
 
 [Web API](docs/web-api.md) · [CLI parity matrix](docs/parity/local-cli-web-matrix.md) · [Interface conventions](DESIGN.md)
 

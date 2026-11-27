@@ -20,9 +20,9 @@ cd /path/to/your/project
 omo-web
 ```
 
-如果连不上 [npm](https://www.npmjs.com/package/omo-web)，且有仓库访问权限，可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) 下载 `.tgz`，再运行 `npm install -g ./omo-web-0.1.1.tgz`。在交互终端运行 `omo-web`，用方向键和回车选择工作目录、进入「访问设置」或启动服务。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。运行中要改设置，先停止服务；访问设置会保留，工作目录编辑只对本次 TUI 会话有效。脚本用 `omo-web serve` 直接启动。
+如果连不上 [npm](https://www.npmjs.com/package/omo-web)，且有仓库访问权限，可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.2) 下载 `.tgz`，再运行 `npm install -g ./omo-web-0.1.2.tgz`。在交互终端运行 `omo-web`，用方向键和回车选择工作目录、进入「访问设置」或启动服务。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。运行中要改设置，先停止服务；访问设置会保留，工作目录编辑只对本次 TUI 会话有效。脚本用 `omo-web serve` 直接启动。
 
-也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) 下载 Bun 运行包，或从源码运行最新版：
+有仓库访问权限时，也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.2) 下载 Bun 运行包，或从源码运行：
 
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
@@ -78,7 +78,7 @@ Web 和 CLI 使用同一 OmO profile 时，可继续同一份会话日志。终�
 
 非本机监听必须使用 HTTPS。选网卡不会改防火墙，也不会限制客户端来源，推荐通过 VPN 并设置密码。无密码只适合能限制连接对象的私网：能连接的人可以读会话并操作本机。
 
-用内网穿透或反代终止 HTTPS 时，让 OmO Web 继续监听 `127.0.0.1`，在「访问设置 → 代理入口」或 `OMO_WEB_PROXY_ORIGIN` 中填写对外地址，并按[代理配置说明](docs/usage.md#内网穿透与反向代理)保留 `Host`。这个选项在源码版本可用，不包含在已发布的 `0.1.1` 中。
+用内网穿透或反代终止 HTTPS 时，让 OmO Web 继续监听 `127.0.0.1`，在「访问设置 → 代理入口」或 `OMO_WEB_PROXY_ORIGIN` 中填写对外地址，并按[代理配置说明](docs/usage.md#内网穿透与反向代理)保留 `Host`。
 
 [Linux 和 Windows 的远程配置](docs/usage.md#密码与远程访问) · [环境变量](docs/usage.md#环境变量)
 
@@ -91,6 +91,6 @@ bun run release:pack
 bun run npm:pack
 ```
 
-[使用详解](docs/usage.md) · [安装与升级](docs/install-release.md) · [发行方式](docs/distribution.md) · [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md)
+[使用详解](docs/usage.md) · [安装与升级](docs/install-release.md) · [0.1.2 发行说明](docs/releases/0.1.2.md) · [发行方式](docs/distribution.md) · [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md)
 
 OmO Web 采用 [MIT 许可证](LICENSE)。构建产物也包含所用第三方组件的许可。

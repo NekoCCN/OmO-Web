@@ -41,8 +41,8 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 把 `VERSION` 和 `TAG` 换成实际发布的版本和标签。可从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 页面直接下载两个文件。已安装并登录 `gh` 的用户也可执行下例。
 
 ```sh
-VERSION="0.1.1"
-TAG="v0.1.1"
+VERSION="0.1.2"
+TAG="v0.1.2"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 gh release download "$TAG" --repo NekoCCN/OmO-Web --pattern "$ARCHIVE" --pattern "$ARCHIVE.sha256" &&
   sha256sum -c "$ARCHIVE.sha256" &&
@@ -63,6 +63,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 - 默认本机免密（`127.0.0.1`）。可以用 `omo-web password-file <路径>` 生成私有密码文件，再设置 `OMO_WEB_PASSWORD_FILE`，登录用户名为 `omo`。
 - 非本机监听需要直接 HTTPS（`OMO_WEB_HOST` 为本机某网卡的 IPv4 或 `0.0.0.0`，并指定 `OMO_WEB_ORIGIN` 和证书/私钥）；配置不完整不回退到明文。优先配置密码，无密码只在确认风险后用于受限私网。
+- 若由内网穿透或反向代理终止 HTTPS，可以保留本机监听并设置 `OMO_WEB_PROXY_ORIGIN`；具体转发要求见[代理配置](usage.md#内网穿透与反向代理)。
 - 单操作者工作台：密码或 HTTPS 本身都不是多用户权限系统。完整 Linux 与 PowerShell 示例见[远程配置](usage.md#密码与远程访问)。
 
 ## 用 npm 安装终端启动器
@@ -73,7 +74,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 npm install -g omo-web
 ```
 
-也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.1) 下载 `.tgz` 后运行 `npm install -g ./omo-web-0.1.1.tgz`。从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.1.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与不依赖 Node.js 的 Bun `.tar.gz` 不同。
+有仓库访问权限时，也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.2) 下载 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.2.tgz`。从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.2.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与不依赖 Node.js 的 Bun `.tar.gz` 不同。
 
 在实际项目目录运行 `omo-web`。用方向键移动，Enter 选择工作目录、访问设置或开始监听。密码、HTTPS、证书和网卡详见 [TUI 配置](usage.md#通过-tui-配置)。`omo-web serve` 不读取启动器设置，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
 
@@ -88,6 +89,7 @@ npm install -g omo-web
   VERSION="$(bun -p 'require("./package.json").version')"
   TAG="v$VERSION"
   ARCHIVE="omo-web-$VERSION.tar.gz"
+  NPM_ARCHIVE="omo-web-$VERSION.tgz"
   TAG_SHA="$(git ls-remote origin "refs/tags/$TAG^{}" | cut -f1)"
   if [ -z "$TAG_SHA" ]; then
     TAG_SHA="$(git ls-remote origin "refs/tags/$TAG" | cut -f1)"
@@ -95,11 +97,14 @@ npm install -g omo-web
   test "$TAG_SHA" = "$(git rev-parse HEAD)" || { echo "远端标签 $TAG 未指向当前提交。" >&2; exit 1; }
   bun install --frozen-lockfile
   bun run check
+  bun run build
   bun test
-  bun run release:pack
+  bun run npm:pack
   tar tzf "dist/$ARCHIVE"
   (cd dist && sha256sum -c "$ARCHIVE.sha256")
+  (cd dist/npm && sha256sum "$NPM_ARCHIVE" > "$NPM_ARCHIVE.sha256")
   gh release create "$TAG" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" \
+    "dist/npm/$NPM_ARCHIVE" "dist/npm/$NPM_ARCHIVE.sha256" \
     --repo NekoCCN/OmO-Web --draft --verify-tag \
     --title "OmO Web $VERSION" --notes-file "docs/releases/$VERSION.md"
 )
@@ -107,9 +112,9 @@ npm install -g omo-web
 
 macOS 校验可用 `(cd dist && shasum -a 256 -c "$ARCHIVE.sha256")` 等效。
 
-为每个版本准备 `docs/releases/$VERSION.md`，例如 [0.1.0 发行说明](releases/0.1.0.md)。`release:pack` 构建浏览器与服务端并生成两个文件。校验文件只记录包的文件名，所以在包所在目录执行校验（本地构建时是 `dist/`）。`--verify-tag` 不创建标签；上传后先在 GitHub 审查草稿，再手动发布。其他渠道见[分发选型](distribution.md)。
+为每个版本准备 `docs/releases/$VERSION.md`，例如 [0.1.2 发行说明](releases/0.1.2.md)。校验文件只记录文件名，请在相应包所在目录执行。`--verify-tag` 不创建标签；上传后先下载校验草稿资产，再发布。npm 发布必须使用与 GitHub 同一份已验证的 `.tgz`，不要重新打包。其他渠道见[分发选型](distribution.md)。
 
 ## 剩余缺口
 
 - `docs/rpc.md` 随运行时发放，不在版本控制内。
-- Windows/macOS 的完整会话链与非 Linux 平台的包运行尚未验证；反向代理部署模式明确不支持。
+- Windows 已在 CI 验证安装与启动、私有 ACL、直连 HTTPS 和代理入口；交互式 TUI 菜单与原生 CLI 交接未验证。macOS 不在当前测试矩阵。
