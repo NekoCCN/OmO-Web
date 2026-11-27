@@ -5,6 +5,7 @@ const root = new URL("../", import.meta.url);
 const name = `omo-web-${version}`;
 const filename = `${name}.tar.gz`;
 const files = [
+  ["LICENSE", "LICENSE"],
   ...webAssetPaths.map(path => [path, path] as const),
   ["dist/server.js", "dist/server.js"],
   ["public/licenses/teenyicons.txt", "public/licenses/teenyicons.txt"],

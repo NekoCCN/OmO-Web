@@ -21,7 +21,7 @@ Web 启动一个私有的本机 stdio 引擎子进程（`omo --mode rpc --multi-
 
 ## 用户：源码安装
 
-私有仓库的 HTTPS 克隆需要已配置 Git 凭据，且对应 GitHub 账户有仓库访问权限。
+公开仓库可直接通过 HTTPS 克隆，不需要 GitHub 登录。
 
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
@@ -38,7 +38,7 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 ## 用户：发行包安装
 
-把 `VERSION` 和 `TAG` 换成实际发布的版本和标签。可在已登录的 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 页面下载两个文件，也可在有仓库访问权限的账户上登录 `gh` 后执行下例。若该版本尚未上传发行资产，可用源码安装。
+把 `VERSION` 和 `TAG` 换成实际发布的版本和标签。可从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 页面直接下载两个文件。已安装并登录 `gh` 的用户也可执行下例。
 
 ```sh
 VERSION="0.1.0"
@@ -64,6 +64,12 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 - 默认本机免密（`127.0.0.1`）；仅本机加密码时设置 `OMO_WEB_PASSWORD_FILE`（`0600` 独立文件，用户名固定 `omo`，20–128 个可打印 ASCII，允许一个末尾换行）。
 - 对外访问必须同时配密码与 HTTPS（`OMO_WEB_HOST=0.0.0.0` + `OMO_WEB_ORIGIN` + `OMO_WEB_TLS_CERT/KEY`），服务直接终止 TLS，不支持反向代理代终止；配置不完整拒绝启动，不回退明文。
 - 单操作者工作台：拿到密码即全部控制面，无登录限流，不建议直挂互联网。
+
+## npm 候选包：终端启动器
+
+从源码执行 `bun run npm:pack` 后，可在本机用 `npm install --global ./dist/npm/omo-web-0.1.0.tgz` 安装。它不是已经上架的 npm 包。启动器需要 Node；Web 服务仍需要 Bun 和 OmO Native。
+
+在实际项目目录运行 `omo-web`。用方向键移动、Enter 选择工作目录或启动。服务启动后可以打开浏览器、停止服务或退出；目录编辑只影响本次启动。`omo-web serve` 不进入交互界面，适合脚本；没有交互终端时，`omo-web` 也直接启动。
 
 ## 维护者：发版
 

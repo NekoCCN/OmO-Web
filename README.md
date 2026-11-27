@@ -10,7 +10,7 @@ OmO Web 把 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent) 的会
 
 ## 快速开始
 
-安装 [Bun 1.3+](https://bun.sh/docs/installation) 和 OmO Native，在 `omo` 里配好模型。用有仓库访问权限的 GitHub 账户克隆源码。
+安装 [Bun 1.3+](https://bun.sh/docs/installation) 和 OmO Native，在 `omo` 里配好模型。可以直接下载 [GitHub 发行包](https://github.com/NekoCCN/OmO-Web/releases/latest)，也可以克隆源码：
 
 ```sh
 git clone \
@@ -123,3 +123,7 @@ bun run serve     # 跳过重构建直接启动
 [使用详解](docs/usage.md) · [安装、升级和发版](docs/install-release.md) · [0.1.0 发行说明](docs/releases/0.1.0.md) · [包管理器选型](docs/distribution.md)
 
 [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md) · [界面约定](DESIGN.md)
+
+## 许可证
+
+OmO Web 采用 [MIT 许可证](LICENSE)。发行包同时保留所含第三方组件的许可文本。

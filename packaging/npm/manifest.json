@@ -1,0 +1,22 @@
+{
+  "name": "omo-web",
+  "license": "MIT",
+  "description": "Local browser workbench for OmO Native",
+  "type": "module",
+  "bin": {
+    "omo-web": "bin/omo-web.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "homepage": "https://github.com/NekoCCN/OmO-Web#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NekoCCN/OmO-Web.git"
+  },
+  "bugs": {
+    "url": "https://github.com/NekoCCN/OmO-Web/issues"
+  },
+  "keywords": ["omo-native", "bun", "local-first", "workbench"],
+  "files": ["bin/omo-web.js", "bin/tui.js", "dist/app.js", "dist/server.js", "public"]
+}

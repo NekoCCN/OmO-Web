@@ -2,6 +2,7 @@
   "name": "omo-web",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "engines": { "bun": ">=1.3.0" },
   "scripts": {
@@ -9,6 +10,7 @@
     "start": "bun run build && bun src/main.ts",
     "serve": "bun src/main.ts",
     "release:pack": "bun run build && bun build src/main.ts --target bun --packages=bundle --outfile dist/server.js && bun scripts/pack-release.ts",
+    "npm:pack": "bun run release:pack && bun --no-env-file scripts/pack-npm.ts",
     "check": "tsc --noEmit",
     "test": "bun test",
     "verify:native": "bun scripts/verify-native.ts"

@@ -1,11 +1,11 @@
 # 分发选型
 
-**首发推荐私有 GitHub Releases + SHA-256。** 源码安装已可用，发行包可在本地构建，远端资产要等维护者实际发布。主 `package.json` 保持 `private: true`、没有 `bin`，仓库没有项目级开源许可证。
+**使用公开 GitHub Releases + SHA-256 安装首发。** 从 [v0.1.0](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载或从源码构建。本项目采用 [MIT 许可证](../LICENSE)，主 `package.json` 仍标记 `private: true`，避免误发源码目录。
 
-## 首发：私有 GitHub Releases + SHA-256
+## 首发：GitHub Releases + SHA-256
 
 - 不是包管理器：用户从 Releases 页或 `gh release download` 取两个文件，自行 `sha256sum -c` 校验后解压运行。
-- 下载需要授权：私有仓库的 Releases 资产只对有访问权限的账户可见——已登录的 Releases 页面，或 `gh` 登录后下载。未上传资产的版本回退到源码安装。
+- 公开发布页可匿名下载。未上传资产的版本可从源码安装。
 - 校验可确认下载文件匹配发布的校验值，不证明发布者身份或其他平台可用；验证范围见 [0.1.0 发行说明](releases/0.1.0.md#验证范围)。
 
 安装与发版命令见 [安装与发版](install-release.md)。
@@ -18,14 +18,15 @@
 
 参考：[GitHub Packages npm registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry)。
 
-## 公开 npm：仅在许可与授权决定后才考虑
+## npm：本地候选包
 
 - 公开作用域包的发布流程见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages)；私有 npm 包是付费套餐，见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-private-packages)。
-- 公开发布需要项目所有者授权并明确分发许可；仓库当前没有项目级开源许可证。需核对包名与 scope、`bin` 启动器和发布文件白名单，再以 npm registry 的安装方式实测。公开 npm 包会分发包内容，不因源码仓库私有而变成私有包。
+- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。使用 `npm install --global ./dist/npm/omo-web-0.1.0.tgz` 本地安装，再在自己的项目目录运行 `omo-web`。交互终端会打开启动器；`omo-web serve` 直接启动，可用于脚本。启动器需要 Node 和 Bun，运行会话还需要 OmO Native。默认仍只监听本机。
+- 候选名为 `omo-web`，尚未在 npm 注册或发布。同名查询返回 404 不表示已预留。候选包包含 MIT 与第三方许可；正式发布前须由维护者登录 npm、核对包名和发布权限。不要直接发布源码根目录。
 
 ## Homebrew：tap 与 core 是两回事
 
-- 进入 core 需要满足公开源码、许可、平台与稳定版准入（见 [Acceptable Formulae](https://docs.brew.sh/Acceptable-Formulae)）；当前私有、无许可的状态不符合。
+- 进入 core 仍需满足平台、稳定版等准入要求（见 [Acceptable Formulae](https://docs.brew.sh/Acceptable-Formulae)）；本项目暂无此计划。
 - 自建 tap 是维护者自己的事（见 [How to Create and Maintain a Tap](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap)，tap 由所有者维护）。不要默认「私有 tap 就能自动拿到带认证的资产」——tap 公式仍要解决私有下载的凭据问题。
 - 有明确 macOS／Linux 用户需求、实机验证和稳定的下载渠道后，再做自建 tap；当前不申请 core。
 
@@ -38,8 +39,8 @@
 
 | 路线 | 状态 |
 | --- | --- |
-| 私有 GitHub Releases + SHA-256 | 首发推荐；本地包已构建，尚未上架 |
+| GitHub Releases + SHA-256 | v0.1.0 已公开，可匿名下载 |
 | GitHub Packages 私有 registry | 下一步候选，接受认证负担时 |
-| 公开 npm | 许可＋授权决定后 |
+| 公开 npm | 有 MIT 候选包；待维护者确认并登录 npm |
 | Homebrew tap | 维护者自建 tap，不进 core；暂不做 |
 | Docker / GHCR | 有项目需要才评估 |
