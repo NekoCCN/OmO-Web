@@ -14,19 +14,15 @@ OmO Web is a local browser workbench for [OmO Native](https://github.com/code-ye
 
 Install **[Bun 1.3+](https://bun.sh/docs/installation)** and **[OmO Native](https://github.com/code-yeongyu/oh-my-openagent)**. Configure a model in `omo`. For the npm launcher, also install **Node.js 18+**.
 
-Download the launcher from GitHub Releases, then install it with npm. No account is required:
+Install the launcher from [npm](https://www.npmjs.com/package/omo-web):
 
 ```sh
-curl -fLO https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
-npm install -g ./omo-web-0.1.0.tgz
-```
-
-You can also [download the `.tgz` in your browser](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0). Then run it from a project directory:
-
-```sh
+npm install -g omo-web
 cd /path/to/your/project
 omo-web
 ```
+
+If you can't reach npm, [download the `.tgz` from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) and run `npm install -g ./omo-web-0.1.0.tgz`.
 
 Open the printed address (default `http://127.0.0.1:4317`). In an interactive terminal, `omo-web` opens a keyboard-driven launcher: move with the arrow keys, press Enter to pick a working directory and start. From the same screen you can open the browser, stop the service, or quit; directory edits apply to that launch only. For scripts use `omo-web serve`, and `omo-web --help` lists the startup commands. The launcher follows the system language (English / 简体中文, English fallback).
 

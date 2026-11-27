@@ -67,14 +67,13 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 ## 用 npm 安装终端启动器
 
-无需登录。先从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载 `.tgz`，再用 npm 安装：
+从公开的 [npm 页面](https://www.npmjs.com/package/omo-web) 安装，无需登录：
 
 ```sh
-curl -fLO https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
-npm install -g ./omo-web-0.1.0.tgz
+npm install -g omo-web
 ```
 
-从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.0.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与原先不依赖 Node.js 的 Bun `.tar.gz` 不同。
+也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载 `.tgz` 后运行 `npm install -g ./omo-web-0.1.0.tgz`。从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.0.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与原先不依赖 Node.js 的 Bun `.tar.gz` 不同。
 
 在实际项目目录运行 `omo-web`。用方向键移动、Enter 选择工作目录或启动。服务启动后可以打开浏览器、停止服务或退出；目录编辑只影响本次启动。`omo-web serve` 不进入交互界面，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
 

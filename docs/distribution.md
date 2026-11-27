@@ -41,6 +41,6 @@
 | --- | --- |
 | GitHub Releases + SHA-256 | v0.1.0 已公开，可匿名下载 |
 | GitHub Packages 私有 registry | 下一步候选，接受认证负担时 |
-| npm 安装 | GitHub 上的 MIT `.tgz` 可直接安装 |
+| npm 安装 | `npm install -g omo-web`；[GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 提供同一份 MIT `.tgz` |
 | Homebrew tap | 维护者自建 tap，不进 core；暂不做 |
 | Docker / GHCR | 有项目需要才评估 |
