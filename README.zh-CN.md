@@ -15,12 +15,13 @@ OmO Web 是 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent) 的本
 安装 [Bun 1.3+](https://bun.sh/docs/installation) 和 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)，先用 `omo` 配好模型。使用 npm 安装终端启动器还需 Node.js 18+。
 
 ```sh
-npm install -g https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+curl -fLO https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+npm install -g ./omo-web-0.1.0.tgz
 cd /path/to/your/project
 omo-web
 ```
 
-这条命令通过 npm 安装 GitHub 上的包，不需要 GitHub 或 npm 登录。`omo-web` 在交互终端打开 TUI，可以选目录、启动、打开浏览器和停止服务。脚本用 `omo-web serve` 直接启动。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。
+也可以用浏览器从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载 `.tgz` 再安装，不需要登录。`omo-web` 在交互终端打开 TUI，可以选目录、启动、打开浏览器和停止服务。脚本用 `omo-web serve` 直接启动。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。
 
 也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载原来的 Bun 运行包，或从源码运行最新版：
 

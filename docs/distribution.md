@@ -21,7 +21,7 @@
 ## npm 安装格式
 
 - 公开作用域包的发布流程见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages)；私有 npm 包是付费套餐，见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-private-packages)。
-- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。[GitHub 发行页](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0)提供 `.tgz`，可以直接用 `npm install -g <下载地址>` 安装，再在项目目录运行 `omo-web`。交互终端会打开启动器；`omo-web serve` 直接启动。启动器需要 Node.js 18+ 和 Bun，运行会话还需要 OmO Native。
+- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。在 [GitHub 发行页](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0)下载 `.tgz` 后运行 `npm install -g ./omo-web-0.1.0.tgz`，再在项目目录运行 `omo-web`。交互终端会打开启动器；`omo-web serve` 直接启动。启动器需要 Node.js 18+ 和 Bun，运行会话还需要 OmO Native。
 - 独立 npm 包包含 MIT 与第三方许可；源码根目录保持私有标记，不直接向 registry 发布。维护者正式发布时应核对 SHA-256、登录的账号及 npm 的 2FA 要求，发布验证过的 `.tgz`。
 
 ## Homebrew：tap 与 core 是两回事

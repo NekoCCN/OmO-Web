@@ -14,13 +14,14 @@ OmO Web is a local browser workbench for [OmO Native](https://github.com/code-ye
 
 Install **[Bun 1.3+](https://bun.sh/docs/installation)** and **[OmO Native](https://github.com/code-yeongyu/oh-my-openagent)**. Configure a model in `omo`. For the npm launcher, also install **Node.js 18+**.
 
-Install the launcher from GitHub Releases with npm. No account is required for this download:
+Download the launcher from GitHub Releases, then install it with npm. No account is required:
 
 ```sh
-npm install -g https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+curl -fLO https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+npm install -g ./omo-web-0.1.0.tgz
 ```
 
-Then run it from a real project directory:
+You can also [download the `.tgz` in your browser](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0). Then run it from a project directory:
 
 ```sh
 cd /path/to/your/project

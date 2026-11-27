@@ -67,10 +67,11 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 ## 用 npm 安装终端启动器
 
-无需登录 npm，可直接用 npm 安装 [GitHub Release 的 `.tgz`](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0)：
+无需登录。先从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0) 下载 `.tgz`，再用 npm 安装：
 
 ```sh
-npm install -g https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+curl -fLO https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+npm install -g ./omo-web-0.1.0.tgz
 ```
 
 从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.0.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与原先不依赖 Node.js 的 Bun `.tar.gz` 不同。
