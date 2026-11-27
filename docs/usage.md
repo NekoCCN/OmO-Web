@@ -56,8 +56,9 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 | `OMO_WEB_PORT` | `4317` | 非 TLS 模式可用 `0` 分配随机端口 |
 | `OMO_WEB_HOST` | `127.0.0.1` | `0.0.0.0` 监听所有 IPv4 接口；也可绑定本机网卡已分配的 IPv4。非本机监听需要 HTTPS，并要求密码或显式选择无密码 |
 | `OMO_WEB_PASSWORD_FILE` | 未设置 | 私有密码文件，用户名固定为 `omo`；推荐用 `omo-web password-file` 创建 |
-| `OMO_WEB_ALLOW_UNAUTHENTICATED` | 未设置 | 只有 `1` 允许在未配置密码文件时监听非本机地址；仍要求 HTTPS，有密码时不会禁用认证 |
+| `OMO_WEB_ALLOW_UNAUTHENTICATED` | 未设置 | 只有 `1` 允许在无密码时使用非本机监听或外部代理入口；有密码时不会禁用认证 |
 | `OMO_WEB_ORIGIN` | 未设置 | 启用 TLS 时必填；无路径、尾部斜杠或凭据的 HTTPS 访问地址，端口与监听端口一致 |
+| `OMO_WEB_PROXY_ORIGIN` | 未设置 | 代理对浏览器提供的 HTTPS origin；不含路径、尾部斜杠或凭据，可使用不同于后端监听的端口 |
 | `OMO_WEB_TLS_CERT` / `OMO_WEB_TLS_KEY` | 未设置 | 与访问地址匹配且被浏览器信任的 PEM 证书，以及对应的未加密 PEM 私钥 |
 | `OMO_WEB_BIN` | `omo` | 对应的 Native CLI 可执行文件 |
 | `OMO_WEB_DATA` | `~/.omo-web` | Web 会话索引和私有日志；默认共享的原生会话日志位于 OmO profile。一个数据目录只开一个服务实例 |
@@ -70,9 +71,10 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 ### 通过 TUI 配置
 
 1. 在交互终端运行 `omo-web`，进入「访问设置」。用「监听地址」选择 `127.0.0.1`、一张网卡上已分配的 IPv4，或 `0.0.0.0`。网卡旁的 CIDR 用于辨认网段，不是入站白名单。
-2. 用「设置 / 修改密码」输入 20–128 个可打印 ASCII 字符，输入不会回显；保存时会开启认证。独立的「密码」开关可以关闭认证，再打开时复用已保存的密码。浏览器用户名固定为 `omo`。
+2. 用「设置 / 修改密码」输入 1–128 个可打印 ASCII 字符，输入不会回显；不足 20 字符会提醒，但仍可保存并开启认证。独立的「密码」开关可以关闭认证，再打开时复用已保存的密码。浏览器用户名固定为 `omo`。
 3. 用「生成 SSL 自签证书」输入浏览器要使用的主机名或 IP，不能填 `0.0.0.0`。生成需要 `PATH` 上的 OpenSSL 1.1.1+，完成后自动开启 HTTPS。证书有效期为 90 天；在客户端核对并信任公开的 `cert.pem`（不要传输 `key.pem`），或改用客户端已经信任的证书。只监听 `127.0.0.1` 时可关闭 HTTPS；重新开启可复用证书。
-4. 返回主菜单启动服务，打开显示的地址。如果改了网卡或浏览器访问地址，检查 URL 和证书是否仍匹配，必要时重新生成。非本机启动没有密码时，先确认风险，再启动。
+4. 若使用内网穿透或反代，在「代理入口」填写对外 HTTPS origin；清空关闭。代理不需要 OmO Web 自签证书时，可保留回环监听、关闭本机 HTTPS。见下方代理配置说明。
+5. 返回主菜单启动服务，打开本机地址或访问配置的对外代理入口。如果改了网卡或直连 HTTPS 地址，检查 URL 和证书是否仍匹配。远程入口没有密码时，启动器会要求确认风险。
 
 设置保存在 `OMO_WEB_DATA/launcher/`（默认 `~/.omo-web/launcher/`）；已在 TUI 修改的选项覆盖继承的同名环境配置。请把数据目录放在私有位置，不要放入共享工作区。运行中先停止服务才能改设置，修改会在下次启动生效。`omo-web serve` 不读取启动器设置。
 
@@ -80,7 +82,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 安装 npm 版启动器后，运行 `omo-web password-file <路径>`。例如 Linux/macOS 用 `omo-web password-file "$HOME/.omo-web-password"`，Windows PowerShell 用 `omo-web password-file "$HOME\.omo-web-password"`。命令不显示密码，也不覆盖已有文件。先在本机打开文件，把该密码存进密码管理器，不要把文件放进要给 OmO 操作的项目，也不要把密码写进启动命令或 URL。
 
-自己准备文件也可以。密码为 20–128 个可打印 ASCII 字符，可带一个末尾换行。POSIX 文件应是 `0600`；Windows 使用仅当前用户可访问的 ACL，校验同时允许 Windows 系统和管理员账户。不要用 `chmod` 模拟 Windows ACL。
+自己准备文件也可以。密码为 1–128 个可打印 ASCII 字符，可带一个末尾换行；低于 20 字符时服务会提醒。POSIX 文件应是 `0600`；Windows 使用仅当前用户可访问的 ACL，校验同时允许 Windows 系统和管理员账户。不要用 `chmod` 模拟 Windows ACL。
 
 ### 从外地用 HTTPS 访问
 
@@ -116,7 +118,17 @@ omo-web serve
 
 两组命令都需替换域名和文件路径。用 npm 包可把 `bun start` 换成 `omo-web serve`；源码检出可把 PowerShell 里的 `omo-web serve` 换成 `bun start`。浏览器打开 `OMO_WEB_ORIGIN`，**不要打开 `0.0.0.0`**。出现登录框时使用用户名 `omo`。确认能在本机用同一个 HTTPS 地址访问后，再到另一台设备验网络路径。
 
-启用密码时，网页、静态资源、API 和 SSE 都需要凭据；远程监听会暂时限制同一连接地址的连续错误密码请求。服务直接终止 TLS，不信任 `X-Forwarded-*`，不支持代理代为终止 TLS。配置不完整会拒绝启动，不会回退明文。修改密码或证书需重启；Basic 登录由浏览器缓存，无应用内登出。
+启用密码时，网页、静态资源、API 和 SSE 都需要凭据；远程入口会暂时限制同一连接地址的连续错误密码请求。上面的直连模式由服务直接终止 TLS；配置不完整会拒绝启动，不会回退明文。修改密码或证书需重启；Basic 登录由浏览器缓存，无应用内登出。
+
+### 内网穿透与反向代理
+
+适用于由代理提供对外 HTTPS、代理进程与 OmO Web 在同一台机器的部署。以下以公网入口 `https://web.example.com` 为例：
+
+1. OmO Web 保持默认本机监听 `127.0.0.1:4317`，设置密码。启动器中把「代理入口」设为 `https://web.example.com`。用 `omo-web serve` 时，设置 `OMO_WEB_PROXY_ORIGIN=https://web.example.com` 与 `OMO_WEB_PASSWORD_FILE` 即可；不要把公网 URL 填进直连 TLS 用的 `OMO_WEB_ORIGIN`。
+2. 代理将 **整个站点根路径** 转到 `http://127.0.0.1:4317`，保留浏览器请求的 `Host`、`Origin`、`Authorization` 及 `X-OmO-Token`。代理若改写 `Host` 为 `localhost` 或上游地址，仍会收到同源拒绝。`Forwarded` / `X-Forwarded-*` 不用于推断来源。
+3. 不缓存或缓冲 `/api/events`，并允许 SSE 长连接。这种模式不是 CORS 白名单：浏览器从配置的外部 HTTPS 地址加载页面、API 和事件流，写入仍需该 origin 与页面 token。
+
+本机 URL 仍可访问。认证失败限速按 OmO Web 所见的连接地址计算；同一个代理后的客户端可能共用一次冷却。不要把回环上游明文端口另外对公网开放。公网访问建议同时启用密码及代理侧访问限制；临时域名变更后要更新配置并重启。
 
 ### 私网内不设密码
 
@@ -160,7 +172,13 @@ omo-web serve
 
 ## 命令
 
-输入 `/` 或 `$` 在对话原处查看候选；用方向键再按 Enter/Tab，或点候选，只填草稿，不直接发送。`/todo`、`/tasks`、`/dag`、`/help` 和 `/hotkeys` 打开本地查看界面；`/reasoning` 和 `/efforts` 的无参数形式只读当前模型读数。普通消息仍支持 `/tmp/foo` 等路径，若要把命令名当文字发给模型，在开头加一个空格。
+输入 `/` 或 `$` 在对话原处查看候选；用方向键再按 Enter/Tab，或点候选，只填草稿，不直接发送。
+
+- `/compact [压缩指示]` 在会话空闲时调用原生压缩；它不会把斜杠文本发给模型。压缩本身使用当前模型；原生拒绝（例如会话太短）会显示错误。
+- `/settings` 或 `/setting` 打开当前会话管理面板，可调整可用的运行选项。全局配置、账户和凭据仍在本机终端管理。
+- `/todo`、`/tasks`、`/dag`、`/help` 和 `/hotkeys` 打开本地查看界面；`/reasoning` 和 `/efforts` 的无参数形式只读当前模型读数。`/login`、`/trust`、`/reload` 等只在终端执行的命令会给出提示，不会作为命令转发。
+
+普通消息仍支持 `/tmp/foo` 等路径，若要把命令名当文字发给模型，在开头加一个空格。
 
 ## 排查
 

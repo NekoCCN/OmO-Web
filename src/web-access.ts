@@ -3,7 +3,7 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { isIP } from "node:net";
 import { createSecureContext } from "node:tls";
-import { z } from "zod";
+import { parseProxyOrigin, passwordPattern, recommendedPasswordLength } from "../packaging/npm/access-policy.js";
 import { interfaceAddresses, isRemoteAddress, loopbackAddress, wildcardAddress } from "../packaging/npm/listen-address.js";
 import { cliTr } from "../packaging/npm/locale.js";
 import { readWindowsPasswordFile } from "../packaging/npm/windows-password.js";
@@ -28,7 +28,6 @@ export class WebAccessConfigError extends Error {
   }
 }
 
-const passwordSchema = z.string().regex(/^[\x20-\x7e]{20,128}$/);
 const MAX_AUTH_FAILURES = 5;
 const MAX_TRACKED_ADDRESSES = 1024;
 const AUTH_COOLDOWN_MS = 30_000;
@@ -130,14 +129,21 @@ export async function loadWebAccess(env: Readonly<NodeJS.ProcessEnv>, port: numb
       "请选择 127.0.0.1、0.0.0.0 或本机网卡已分配的 IPv4 地址。",
       "Use 127.0.0.1, 0.0.0.0, or an IPv4 address assigned to a local interface."));
   }
-  const { OMO_WEB_PASSWORD_FILE: passwordFile, OMO_WEB_ORIGIN: originSetting,
+  const { OMO_WEB_PASSWORD_FILE: passwordFile, OMO_WEB_ORIGIN: originSetting, OMO_WEB_PROXY_ORIGIN: proxySetting,
     OMO_WEB_TLS_CERT: certFile, OMO_WEB_TLS_KEY: keyFile } = env;
   const publicBinding = isRemoteAddress(host);
-  const unprotected = publicBinding && passwordFile === undefined;
+  const proxyOrigin = proxySetting === undefined ? undefined : parseProxyOrigin(proxySetting);
+  if (proxySetting !== undefined && !proxyOrigin) {
+    throw new WebAccessConfigError("OMO_WEB_PROXY_ORIGIN", cliTr(
+      "填写代理对外的完整 HTTPS origin，不能含路径、尾部斜杠或凭据。",
+      "Use the proxy's canonical HTTPS origin, without a path, trailing slash, or credentials."));
+  }
+  const exposed = publicBinding || proxyOrigin !== undefined;
+  const unprotected = exposed && passwordFile === undefined;
   if (unprotected && env.OMO_WEB_ALLOW_UNAUTHENTICATED !== "1") {
     throw new WebAccessConfigError("OMO_WEB_PASSWORD_FILE", cliTr(
-      "非本机监听必须配置密码文件，或显式设置 OMO_WEB_ALLOW_UNAUTHENTICATED=1。",
-      "Non-loopback listening requires a password file or explicit OMO_WEB_ALLOW_UNAUTHENTICATED=1."));
+      "非本机监听或代理入口必须配置密码文件，或显式设置 OMO_WEB_ALLOW_UNAUTHENTICATED=1。",
+      "Non-loopback listening or a proxy origin requires a password file or explicit OMO_WEB_ALLOW_UNAUTHENTICATED=1."));
   }
 
   let origin: string | undefined;
@@ -162,24 +168,29 @@ export async function loadWebAccess(env: Readonly<NodeJS.ProcessEnv>, port: numb
   }
 
   let digest: Buffer | undefined;
+  let weakPassword = false;
   if (passwordFile !== undefined) {
     const bytes = await fileBytes(passwordFile, "OMO_WEB_PASSWORD_FILE");
-    const password = passwordSchema.safeParse(bytes.toString("latin1").replace(/(?:\r\n|\n|\r)$/, ""));
-    if (!password.success) {
+    const password = bytes.toString("latin1").replace(/(?:\r\n|\n|\r)$/, "");
+    if (!passwordPattern.test(password)) {
       throw new WebAccessConfigError("OMO_WEB_PASSWORD_FILE", cliTr(
-        "密码必须是 20–128 个可打印 ASCII 字符，只允许单个末尾换行。",
-        "The password must be 20–128 printable ASCII characters with at most one trailing line ending."));
+        "密码必须是 1–128 个可打印 ASCII 字符，只允许单个末尾换行。",
+        "The password must be 1–128 printable ASCII characters with at most one trailing line ending."));
     }
-    const credentials = Buffer.from(`omo:${password.data}`).toString("base64");
+    weakPassword = password.length < recommendedPasswordLength;
+    const credentials = Buffer.from(`omo:${password}`).toString("base64");
     digest = createHash("sha256").update(credentials).digest();
   }
-  const limiter = publicBinding && digest ? authFailureLimiter() : undefined;
+  const limiter = exposed && digest ? authFailureLimiter() : undefined;
 
   return {
-    hostname: host, origin, tls, unprotected,
+    hostname: host, origin, tls, unprotected, weakPassword, proxyOrigin,
     authorize(request: Request, expected: URL, token: Buffer, address?: string): Response | undefined {
       const requestOrigin = request.headers.get("Origin");
-      if (request.headers.get("Host") !== expected.host || (requestOrigin !== null && requestOrigin !== expected.origin) ||
+      const authority = request.headers.get("Host");
+      const matches = (url: URL) => authority === url.host && (requestOrigin === null || requestOrigin === url.origin);
+      // The explicitly configured proxy must preserve Host. Forwarded metadata is never authoritative.
+      if ((!matches(expected) && !(proxyOrigin && matches(proxyOrigin))) ||
           ["cross-site", "same-site"].includes(request.headers.get("Sec-Fetch-Site") ?? "")) {
         throw new WebError(403, "origin_refused", "只接受同源请求。");
       }
@@ -194,7 +205,7 @@ export async function loadWebAccess(env: Readonly<NodeJS.ProcessEnv>, port: numb
           return new Response(null, { status: 429, headers: { ...headers, "Retry-After": String(retryAfter) } });
         }
         // Only plausible encodings reach the fixed-length digest comparison.
-        if (!encoded || encoded.length < 30 || encoded.length > 178 ||
+        if (!encoded || encoded.length < 8 || encoded.length > 176 ||
             !timingSafeEqual(createHash("sha256").update(encoded).digest(), digest)) {
           if (source) limiter?.record(source);
           return new Response(null, { status: 401, headers: { ...headers, "WWW-Authenticate": 'Basic realm="OmO Web"' } });
@@ -203,7 +214,7 @@ export async function loadWebAccess(env: Readonly<NodeJS.ProcessEnv>, port: numb
       if (request.method === "POST") {
         const provided = request.headers.get("X-OmO-Token") ?? "";
         const bytes = provided.length === token.length ? Buffer.from(provided) : undefined;
-        if (requestOrigin !== expected.origin || bytes?.length !== token.length || !timingSafeEqual(bytes, token)) {
+        if (requestOrigin === null || bytes?.length !== token.length || !timingSafeEqual(bytes, token)) {
           throw new WebError(403, "token_refused", "请刷新页面后重试。");
         }
       } else if (request.method !== "GET") {

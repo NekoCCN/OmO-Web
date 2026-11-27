@@ -1,4 +1,5 @@
 import { tr, uiLocale } from "./locale.ts";
+import { terminalOnlyCommands } from "../command-ownership.ts";
 
 export type BuiltinCommandName = BuiltinCommand["name"];
 
@@ -34,6 +35,10 @@ export const BUILTIN_COMMANDS: readonly BuiltinEntry[] = [
   { name: "clone", invocation: "/clone", label: tr("副本", "Clone"), description: tr("复制当前会话为新会话并切换过去。", "Copy the current session and switch to the copy.") },
   { name: "compact", invocation: "/compact", label: tr("压缩上下文", "Compact context"), description: tr(`手动压缩上下文（指示可选，最长 ${compactLimit} 字）。`,
     `Compact context manually. Optional instructions can be up to ${compactLimit} characters.`) },
+  { name: "settings", invocation: "/settings", label: tr("会话设置", "Session settings"),
+    description: tr("打开当前会话的运行设置；全局配置请在本机终端修改。", "Open this session's run settings. Change global configuration in the local terminal.") },
+  { name: "setting", invocation: "/setting", label: tr("会话设置（别名）", "Session settings (alias)"),
+    description: tr("与 /settings 相同。", "Alias for /settings.") },
   { name: "model", invocation: "/model", label: tr("模型", "Model"), description: tr("切换本会话的模型（只对当前会话有效）。", "Change the model for this session only.") },
   { name: "thinking", invocation: "/thinking", label: tr("思考档位", "Thinking level"), description: tr("设置思考档位（可选；档位按实际可选值校验）。", "Set a thinking level. If specified, it must be one of the available levels.") },
   { name: "reasoning", invocation: "/reasoning", label: tr("推理状态", "Reasoning status"), description: tr("查看当前模型是否启用推理。持久设置在本机修改。", "Check whether reasoning is enabled for the current model. Change persistent settings in the native client.") },
@@ -43,28 +48,7 @@ export const BUILTIN_COMMANDS: readonly BuiltinEntry[] = [
 ] as const;
 export const BUILTIN_COMMAND_NAMES: readonly BuiltinCommandName[] = BUILTIN_COMMANDS.map(entry => entry.name);
 
-/** 已知但浏览器不支持的 TUI 命令名：只提示，不转发。 */
-const TUI_ONLY_NAMES = [
-  "settings",
-  "scoped-models",
-  "favorite-models",
-  "task-kill",
-  "login",
-  "logout",
-  "trust",
-  "export",
-  "import",
-  "share",
-  "reload",
-  "keybindings",
-  "changelog",
-  "quit",
-  "exit",
-  "bug",
-  "debug",
-] as const;
-
-type TuiOnlyName = (typeof TUI_ONLY_NAMES)[number];
+type TuiOnlyName = (typeof terminalOnlyCommands)[number];
 
 export type BuiltinCommand =
   | { readonly name: "new" }
@@ -76,6 +60,7 @@ export type BuiltinCommand =
   | { readonly name: "fork" }
   | { readonly name: "clone" }
   | { readonly name: "copy" }
+  | { readonly name: "settings" | "setting" }
   | { readonly name: "rename"; readonly value?: string }
   | { readonly name: "name"; readonly value?: string }
   | { readonly name: "compact"; readonly instructions?: string }
@@ -96,7 +81,7 @@ export type BuiltinParseResult =
 export function opensReadOnlyView(text: string): boolean {
   const parsed = parseBuiltinInput(text);
   return parsed.kind === "builtin" &&
-    ["session", "tree", "todo", "tasks", "dag", "help", "hotkeys", "reasoning", "efforts"].includes(parsed.command.name);
+    ["session", "tree", "todo", "tasks", "dag", "help", "hotkeys", "reasoning", "efforts", "settings", "setting"].includes(parsed.command.name);
 }
 
 const HEAD_PATTERN = /^\/[A-Za-z][A-Za-z0-9_-]*/;
@@ -113,7 +98,7 @@ export function parseBuiltinInput(text: string): BuiltinParseResult {
   const rest = text.slice(head.length);
   const token = head.slice(1);
   const name = BUILTIN_COMMAND_NAMES.find(candidate => candidate === token);
-  const tuiOnly = TUI_ONLY_NAMES.find(candidate => candidate === token);
+  const tuiOnly = terminalOnlyCommands.find(candidate => candidate === token);
   if (name === undefined && tuiOnly === undefined) return { kind: "plain" };
   if (rest !== "" && !/^[ \t\r\n]/.test(rest)) {
     return HAS_CONTROL.test(rest[0])
@@ -139,6 +124,8 @@ export function parseBuiltinInput(text: string): BuiltinParseResult {
     case "fork":
     case "clone":
     case "copy":
+    case "settings":
+    case "setting":
       if (args !== "") return malformed(tr(`“/${name}”不带参数。`, `/${name} does not take arguments.`));
       return { kind: "builtin", command: { name } };
     case "reasoning":

@@ -4,7 +4,7 @@ import { request as httpsRequest } from "node:https";
 import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import { checkServerIdentity } from "node:tls";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { stripVTControlCharacters } from "node:util";
 import { readWindowsPasswordFile } from "../packaging/npm/windows-password.js";
 
@@ -14,6 +14,7 @@ const evidence = process.env.OMO_TUI_EVIDENCE;
 const launcher = new URL("../packaging/npm/tui.js", import.meta.url).href;
 const cli = fileURLToPath(new URL("../packaging/npm/omo-web.js", import.meta.url));
 const sourceServer = fileURLToPath(new URL("../src/main.ts", import.meta.url));
+const installedCli = process.env.OMO_TUI_INSTALLED_CLI;
 
 async function terminalFixture(
   cols: number, rows: number, color: boolean,
@@ -63,8 +64,7 @@ async function terminalFixture(
       stream += decoder.decode(bytes, { stream: true });
       for (const check of listeners) check();
     } });
-    const installedCli = settings.real ? process.env.OMO_TUI_INSTALLED_CLI : undefined;
-    const command = installedCli ? [node, installedCli, "tui"] : [node, "--input-type=module", "-e",
+    const command = settings.real && installedCli ? [node, installedCli, "tui"] : [node, "--input-type=module", "-e",
       `import { startTui } from ${JSON.stringify(launcher)};
        process.exitCode = await startTui({ entry: ${JSON.stringify(settings.real ? sourceServer : entry)}, version: "test" });`,
     ];
@@ -201,7 +201,7 @@ test.skipIf(!supported)("A Chinese PTY defaults the remote risk confirmation to 
 
 test.skipIf(!supported)("Password changes and its toggle control real HTTP authorization without echoing the secret", async () => {
   const password = "terminal fixture secret 42";
-  const replacement = "terminal rotated secret 79";
+  const replacement = "rotated-fixture";
   await terminalFixture(84, 24, false, async view => {
     await view.after(/> Start web/u);
     let mark = view.mark();
@@ -248,6 +248,8 @@ test.skipIf(!supported)("Password changes and its toggle control real HTTP autho
     mark = view.mark();
     view.keys(`${replacement}\r`);
     await view.after(/Password: On/u, mark);
+    await view.after(/at least 20/u, mark);
+    await view.capture("84-short-password-saved");
     const rotated = await startHttp();
     expect((await rotated(password)).status).toBe(401);
     expect((await rotated(replacement)).status).toBe(200);
@@ -281,6 +283,44 @@ test.skipIf(!supported)("Password changes and its toggle control real HTTP autho
     expect(await view.exited).toBe(0);
   }, { real: true });
 }, 27_000);
+
+test.skipIf(!supported)("The launcher saves a proxy origin and the real listener accepts it after restart", async () => {
+  const external = new URL("https://workbench.example.test");
+  await terminalFixture(90, 24, false, async view => {
+    await view.after(/> Start web/u);
+    let mark = view.mark();
+    view.keys("\x1b[B\x1b[B\r");
+    await view.after(/> Listen address/u, mark);
+    mark = view.mark();
+    view.keys("\x1b[B\x1b[B\r");
+    await view.after(/New password/u, mark);
+    const password = "separate fixture credential";
+    view.keys(`${password}\r`);
+    await view.after(/Password: On/u, mark);
+    mark = view.mark();
+    view.keys("\x1b[B\x1b[B\x1b[B\r");
+    await view.after(/External HTTPS origin/u, mark);
+    await view.capture("90-proxy-origin");
+    mark = view.mark();
+    view.keys(`${external.origin}\r`);
+    await view.after(/Proxy origin: https:\/\/workbench\.example\.test/u, mark);
+    view.keys("q");
+    mark = view.mark();
+    await view.restart();
+    await view.after(/> Start web/u, mark);
+    view.keys("\r");
+    const [, url] = await view.after(/(http:\/\/127\.0\.0\.1:\d+\/)/u, mark);
+    if (!url) throw new Error("Missing local upstream URL.");
+    const request = await fetch(url, {
+      headers: { Host: external.host, Origin: external.origin, Authorization: `Basic ${Buffer.from(`omo:${password}`).toString("base64")}` },
+      signal: AbortSignal.timeout(2000),
+    });
+    expect(request.status).toBe(200);
+    await request.body?.cancel();
+    view.keys("q");
+    expect(await view.exited).toBe(0);
+  }, { real: true });
+}, 15_000);
 
 test.skipIf(!supported || process.env.OMO_WEB_TEST_TLS !== "1")(
   "TUI generates trusted HTTPS, binds only the chosen IPv4, and confirms unauthenticated wildcard access", async () => {
@@ -552,5 +592,82 @@ test.skipIf(!node)("password-file creates private random files exclusively witho
     }
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test.if(Boolean(node && installedCli))("Installed launcher rotates a short password and starts the protected proxy listener", async () => {
+  if (!node || !installedCli) throw new Error("Install the npm candidate first.");
+  const root = await mkdtemp(join(tmpdir(), "omo-web-installed-"));
+  const data = join(root, "私有 data");
+  const path = join(data, "launcher", "password.txt");
+  const origin = new URL("https://package.example.test");
+  const launcherCommand = process.env.OMO_WEB_NPM_LAUNCHER;
+  const env = {
+    ...process.env, LC_ALL: "en_US.UTF-8", OMO_WEB_PORT: "0", OMO_WEB_HOST: "127.0.0.1", OMO_WEB_WORKSPACES: root,
+    OMO_WEB_DATA: data, OMO_WEB_PASSWORD_FILE: path, OMO_WEB_PROXY_ORIGIN: origin.origin,
+  };
+  const module = new URL("launcher-settings.js", pathToFileURL(installedCli)).href;
+  const passwords = ["long fixture credential", "new-7"] as const;
+  try {
+    const setup = Bun.spawn([node, "--input-type=module", "-e", `
+      import { loadLauncherSettings } from ${JSON.stringify(module)};
+      for (const value of ${JSON.stringify(passwords)}) {
+        const settings = await loadLauncherSettings(process.env);
+        await settings.changePassword(value);
+      }
+    `], { cwd: root, env, stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 15_000 });
+    const [prepared, setupError] = await Promise.all([setup.exited, new Response(setup.stderr).text()]);
+    expect(prepared, setupError).toBe(0);
+    if (process.platform === "win32") expect(String(await readWindowsPasswordFile(path))).toBe(`${passwords[1]}\n`);
+    // Exercise the same npm-generated executable users invoke, including the
+    // Windows .cmd shim, which CreateProcess cannot execute directly.
+    const installedCommand = !launcherCommand ? [node, installedCli, "serve"]
+      : process.platform !== "win32" ? [launcherCommand, "serve"]
+      : [join(process.env.SystemRoot || "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        Buffer.from("& $env:OMO_WEB_NPM_LAUNCHER serve; exit $LASTEXITCODE", "utf16le").toString("base64")];
+    const child = Bun.spawn(installedCommand, {
+      cwd: root, env, stdin: "ignore", stdout: "pipe", stderr: "pipe",
+    });
+    const stderr = new Response(child.stderr).text();
+    const reader = child.stdout.pipeThrough(new TextDecoderStream()).getReader();
+    const deadline = AbortSignal.timeout(15_000);
+    async function listenerUrl() {
+      let output = "";
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) throw new Error(`Installed service did not start: ${await stderr}`);
+        output += chunk.value;
+        const url = /^OmO Web: (http:\/\/127\.0\.0\.1:\d+\/)\r?$/m.exec(output)?.[1];
+        if (url) return url;
+      }
+    }
+    try {
+      const url = await Promise.race([listenerUrl(), new Promise<never>((_, reject) =>
+        deadline.addEventListener("abort", () => reject(deadline.reason), { once: true }))]);
+      for (const [index, password] of passwords.entries()) {
+        const response = await fetch(url, { headers: { Host: origin.host, Origin: origin.origin,
+          Authorization: `Basic ${Buffer.from(`omo:${password}`).toString("base64")}` }, signal: AbortSignal.timeout(3000) });
+        expect(response.status).toBe(index === 0 ? 401 : 200);
+        await response.body?.cancel();
+      }
+    } finally {
+      if (child.exitCode === null) {
+        if (process.platform === "win32") {
+          const taskkill = join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe");
+          const cleanup = Bun.spawn([taskkill, "/PID", String(child.pid), "/T", "/F"], {
+            env: process.env, stdin: "ignore", stdout: "ignore", stderr: "ignore", timeout: 5000,
+          });
+          if (await cleanup.exited !== 0 && child.exitCode === null) child.kill();
+        } else child.kill("SIGTERM");
+      }
+      await child.exited;
+      await reader.cancel();
+    }
+    const warning = await stderr;
+    expect(warning).toContain("OmO Web warning:");
+    for (const password of passwords) expect(warning).not.toContain(password);
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 });
   }
 }, 30_000);

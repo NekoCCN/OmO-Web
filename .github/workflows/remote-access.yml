@@ -47,6 +47,7 @@ jobs:
           bun-version: "1.4.5"
       - run: bun install --frozen-lockfile
       - run: bun run check
+      - run: bun run build
       - name: Test direct HTTPS, password handling and launcher
         shell: pwsh
         run: |
@@ -70,9 +71,17 @@ jobs:
           $path = Join-Path $env:RUNNER_TEMP 'private password.txt'
           & $launcher password-file $path
           if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $path)) { throw 'Installed omo-web failed to create its password file' }
-          if (-not $IsWindows) {
+          $env:OMO_TUI_INSTALLED_CLI = if ($IsWindows) {
+            Join-Path $prefix 'node_modules/omo-web/bin/omo-web.js'
+          } else {
+            Join-Path $prefix 'lib/node_modules/omo-web/bin/omo-web.js'
+          }
+          $env:OMO_WEB_NPM_LAUNCHER = $launcher
+          if ($IsWindows) {
+            bun test ./test/npm-tui.test.ts -t 'Installed launcher' --timeout 30000
+            exit $LASTEXITCODE
+          } else {
             $env:OMO_WEB_TEST_TLS = '1'
-            $env:OMO_TUI_INSTALLED_CLI = Join-Path $prefix 'lib/node_modules/omo-web/bin/omo-web.js'
-            bun test ./test/npm-tui.test.ts -t 'Password changes|TUI generates' --timeout 30000
+            bun test ./test/npm-tui.test.ts -t 'Installed launcher|Password changes|saves a proxy origin|TUI generates' --timeout 30000
             exit $LASTEXITCODE
           }

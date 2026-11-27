@@ -26,6 +26,8 @@ ${cliTr("需要 Bun 和 OmO Native (omo)。默认使用当前目录。", "Requir
 ${cliTr("用 OMO_WEB_WORKSPACES 和 OMO_WEB_PORT 设置目录和端口。", "Set directories and port with OMO_WEB_WORKSPACES and OMO_WEB_PORT.")}
 ${cliTr("在「访问设置」中选择网卡、设置密码和生成 SSL 自签证书。",
     "Use Access settings in the launcher to choose an interface, set a password, or generate an SSL certificate.")}
+${cliTr("内网穿透或反代可设置 OMO_WEB_PROXY_ORIGIN；代理需保留浏览器的 Host。",
+    "Set OMO_WEB_PROXY_ORIGIN for a tunnel or reverse proxy. Preserve the browser's Host.")}
 ${cliTr("非本机监听必须使用 HTTPS。建议设置访问密码。",
     "Non-loopback listening requires HTTPS. Set an access password for protection.")}
 ${cliTr("仅在受限私网或 VPN 使用无密码模式；脚本需显式设置 OMO_WEB_ALLOW_UNAUTHENTICATED=1。",

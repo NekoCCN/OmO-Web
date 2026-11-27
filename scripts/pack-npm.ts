@@ -19,7 +19,7 @@ try {
   await Promise.all([mkdir(join(packageDir, "bin")), mkdir(output, { recursive: true })]);
   await Promise.all([
     copyFile(join(root, "packaging/npm/omo-web.js"), bin),
-    ...["tui.js", "locale.js", "windows-password.js", "launcher-settings.js", "launcher-tls.js", "listen-address.js"]
+    ...["tui.js", "locale.js", "windows-password.js", "launcher-settings.js", "launcher-tls.js", "listen-address.js", "access-policy.js"]
       .map(file => copyFile(join(root, "packaging/npm", file), join(packageDir, "bin", file))),
     copyFile(join(root, "packaging/npm/README.md"), join(packageDir, "README.md")),
     Bun.write(join(packageDir, "package.json"), `${JSON.stringify({ ...manifest, version }, null, 2)}\n`),

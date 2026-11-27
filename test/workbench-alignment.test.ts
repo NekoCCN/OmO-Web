@@ -605,6 +605,35 @@ browserTest("slash DAG opens a read-only wave view and never sends a model promp
   });
 });
 
+browserTest("slash settings opens native-session controls locally and slash compact uses its dedicated action", async () => {
+  for (const [width, height] of [[1440, 900], [390, 720]]) await workbench(width, height, async (browser, actions) => {
+    const enter = async (value: string) => {
+      await browser.evaluate(`(() => {
+        const prompt = document.querySelector("#prompt");
+        prompt.value = ${JSON.stringify(value)}; prompt.focus(); prompt.dispatchEvent(new InputEvent("input", { bubbles: true }));
+      })()`);
+      await browser.click("#send-command");
+    };
+    await enter("/settings");
+    await visible(browser, "#manage-dialog[open] [data-key=compact]");
+    expect(await browser.evaluate(`document.activeElement.matches('[data-key="run-settings"]')`)).toBe(true);
+    await captureAlignment(browser, `slash-session-settings-${width}`);
+    expect(actions).toEqual([]);
+    await browser.press("Escape");
+    await enter("/compact preserve decisions");
+    await browser.evaluate(`new Promise((resolve, reject) => {
+      const watch = new MutationObserver(check);
+      const timeout = setTimeout(() => { watch.disconnect(); reject(new Error("No compaction completion")); }, 3500);
+      function check() {
+        if (document.querySelector("#prompt").value || document.querySelector("#composer-hint").classList.contains("sr-only")) return;
+        clearTimeout(timeout); watch.disconnect(); resolve(true);
+      }
+      watch.observe(document.body, { subtree: true, attributes: true, childList: true }); check();
+    })`);
+    expect(actions).toEqual([{ action: "compact", instructions: "preserve decisions" }]);
+  });
+});
+
 browserTest("busy sessions allow local reasoning inspection but keep native commands blocked", async () => {
   await workbench(320, 640, async (browser, actions) => {
     const fill = (value: string) => browser.evaluate(`(() => {

@@ -321,6 +321,8 @@ export async function startApp(settings: AppSettings) {
   return {
     url: new URL(url),
     unprotected: access.unprotected,
+    weakPassword: access.weakPassword,
+    proxyOrigin: access.proxyOrigin?.origin,
     fetch,
     stop() {
       closing ??= (async () => {

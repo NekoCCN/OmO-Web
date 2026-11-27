@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
 import { join, resolve } from "node:path";
+import { passwordPattern } from "./access-policy.js";
 
 const identity = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -56,7 +57,7 @@ export function readWindowsPasswordFile(path) {
 }
 
 export async function createWindowsPasswordFile(path, password) {
-  if (!/^[\x20-\x7e]{20,128}$/.test(password) || /[\r\n]/.test(password)) throw new Error("Invalid password.");
+  if (!passwordPattern.test(password)) throw new Error("Invalid password.");
   await createWindowsPrivateFile(path, Buffer.from(`${password}\n`, "ascii"));
 }
 

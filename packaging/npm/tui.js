@@ -4,6 +4,7 @@ import { statSync } from "node:fs";
 import { delimiter, join, resolve } from "node:path";
 import { emitKeypressEvents } from "node:readline";
 import { stripVTControlCharacters } from "node:util";
+import { parseProxyOrigin, passwordPattern, recommendedPasswordLength } from "./access-policy.js";
 import { loadLauncherSettings } from "./launcher-settings.js";
 import { generateCertificate } from "./launcher-tls.js";
 import { interfaceAddresses, isRemoteAddress, loopbackAddress, wildcardAddress } from "./listen-address.js";
@@ -15,6 +16,7 @@ const SHOW_CURSOR = `${CSI}?25h`;
 const HIDE_CURSOR = `${CSI}?25l`;
 const MAX_RECEIPT = 4096;
 const CONFIG_PREFIX = "OmO Web config: ";
+const WARNING_PREFIX = "OmO Web warning: ";
 const START_MS = 30_000;
 const STOP_MS = 4_000;
 const REMOTE_WARNING = cliTr("警告：无密码保护", "Warning: No password protection");
@@ -143,7 +145,8 @@ export async function startTui({ entry, version }) {
   const settings = await loadLauncherSettings(process.env);
   let env = settings.effectiveEnv();
   const address = () => env.OMO_WEB_HOST ?? loopbackAddress;
-  const unprotected = () => isRemoteAddress(address()) && !env.OMO_WEB_PASSWORD_FILE;
+  const proxyOrigin = () => env.OMO_WEB_PROXY_ORIGIN;
+  const unprotected = () => (isRemoteAddress(address()) || Boolean(proxyOrigin())) && !env.OMO_WEB_PASSWORD_FILE;
   const optedIn = () => env.OMO_WEB_ALLOW_UNAUTHENTICATED === "1";
   const hasPassword = () => Boolean(env.OMO_WEB_PASSWORD_FILE);
   const hasHttps = () => Boolean(env.OMO_WEB_TLS_CERT && env.OMO_WEB_TLS_KEY && env.OMO_WEB_ORIGIN);
@@ -156,6 +159,7 @@ export async function startTui({ entry, version }) {
   let selected = 0;
   let server;
   let url;
+  let startupWarning = "";
   let phase = "idle";
   let stopped = false;
   let notice = settings.warning;
@@ -197,7 +201,7 @@ export async function startTui({ entry, version }) {
     width: Math.min(72, (output.columns || 80) - 4),
     height: Math.max(1, (output.rows || 24) - 1),
   });
-  const riskLines = width => [cliTr(`${address()} 无密码访问`, `${address()} without a password`), REMOTE_RISK]
+  const riskLines = width => [cliTr(`${proxyOrigin() || address()} 无密码访问`, `${proxyOrigin() || address()} without a password`), REMOTE_RISK]
     .flatMap(line => fold(line, width));
   const confirmationFits = ({ width, height }) => width >= 32 && riskLines(width).length + 2 <= height;
   function activeMenu(dimensions) {
@@ -210,6 +214,7 @@ export async function startTui({ entry, version }) {
       [cliTr("设置 / 修改密码", "Set / change password"), editPassword],
       [cliTr(`HTTPS：${switchLabel(hasHttps())}`, `HTTPS: ${switchLabel(hasHttps())}`), toggleHttps],
       [cliTr("生成 SSL 自签证书", "Generate self-signed SSL certificate"), editCertificate],
+      [cliTr(`代理入口：${proxyOrigin() || "关"}`, `Proxy origin: ${proxyOrigin() || "Off"}`), editProxyOrigin],
       backAction,
     ];
     if (phase === "networks") return [
@@ -251,6 +256,7 @@ export async function startTui({ entry, version }) {
     const message = notice ? fold(notice, width).slice(0, 2).map(line => ink("33;1", line)) : [];
     const warning = unprotected() && (optedIn() || server) && phase !== "confirming"
       ? fold(REMOTE_WARNING, width).map(line => ink("33;1", line)) : [];
+    if (phase === "ready" && startupWarning) warning.push(...fold(startupWarning, width).map(line => ink("33;1", line)));
     const risk = phase === "confirming" && menu.length > 1
       ? riskLines(width).map(line => ink("33;1", line)) : [];
     let editor;
@@ -357,14 +363,40 @@ export async function startTui({ entry, version }) {
   function editPassword() {
     draft = {
       masked: true, text: "", cursor: 0, title: cliTr("新密码", "New password"),
-      hint: cliTr("20–128 个可打印 ASCII 字符，输入仅显示星号。", "20–128 printable ASCII characters. Input is masked."),
+      hint: cliTr("1–128 个可打印 ASCII 字符，建议至少 20 个。输入仅显示星号。",
+        "1–128 printable ASCII characters. Aim for at least 20; input is masked."),
       submit(password) {
-        if (!/^[\x20-\x7e]{20,128}$/u.test(password)) {
-          notice = cliTr("请使用 20–128 个可打印 ASCII 字符。", "Use 20–128 printable ASCII characters.");
+        if (!passwordPattern.test(password)) {
+          notice = cliTr("请使用 1–128 个可打印 ASCII 字符。", "Use 1–128 printable ASCII characters.");
           return;
         }
         runSetting(async () => {
           await settings.changePassword(password);
+          draft = undefined;
+          if (password.length < recommendedPasswordLength) return cliTr(
+            "已保存。密码较短，建议使用至少 20 个字符。",
+            "Saved. Short password; use at least 20 characters for better protection.");
+        });
+      },
+    };
+    notice = "";
+  }
+
+  function editProxyOrigin() {
+    const text = proxyOrigin() ?? "";
+    draft = {
+      text, cursor: text.length, title: cliTr("外部 HTTPS 入口", "External HTTPS origin"),
+      hint: cliTr("例如 https://web.example.com；代理保留 Host。清空可关闭。",
+        "E.g. https://web.example.com. Preserve Host. Empty disables."),
+      submit(value) {
+        const origin = value === "" ? null : parseProxyOrigin(value);
+        if (origin === undefined) {
+          notice = cliTr("请输入不含路径或尾部斜杠的 HTTPS origin。",
+            "Enter an HTTPS origin without a path or trailing slash.");
+          return;
+        }
+        runSetting(async () => {
+          await settings.save({ OMO_WEB_PROXY_ORIGIN: origin?.origin ?? null, OMO_WEB_ALLOW_UNAUTHENTICATED: null });
           draft = undefined;
         });
       },
@@ -480,6 +512,7 @@ export async function startTui({ entry, version }) {
     phase = "starting";
     selected = 0;
     notice = "";
+    startupWarning = "";
     redraw();
     const serverEnv = {
       ...env,
@@ -506,6 +539,10 @@ export async function startTui({ entry, version }) {
       redraw();
     });
     receiveLines(child.stderr, line => {
+      if ((phase === "starting" || phase === "ready") && line.startsWith(WARNING_PREFIX)) {
+        startupWarning = safeText(stripVTControlCharacters(line.slice(WARNING_PREFIX.length))).trim();
+        redraw();
+      }
       if (phase !== "starting" || configMessage || !line.startsWith(CONFIG_PREFIX)) return;
       configMessage = safeText(stripVTControlCharacters(line.slice(CONFIG_PREFIX.length))).trim();
     });

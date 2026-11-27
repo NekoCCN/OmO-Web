@@ -7,7 +7,7 @@ import { createWindowsPasswordFile } from "./windows-password.js";
 
 const envKeys = [
   "OMO_WEB_HOST", "OMO_WEB_PASSWORD_FILE", "OMO_WEB_ALLOW_UNAUTHENTICATED",
-  "OMO_WEB_ORIGIN", "OMO_WEB_TLS_CERT", "OMO_WEB_TLS_KEY",
+  "OMO_WEB_ORIGIN", "OMO_WEB_TLS_CERT", "OMO_WEB_TLS_KEY", "OMO_WEB_PROXY_ORIGIN",
 ];
 const keys = new Set([...envKeys, "savedPassword", "httpsEnabled"]);
 

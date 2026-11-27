@@ -120,12 +120,57 @@ test("anonymous loopback is not flagged as unprotected public access", async () 
   expect(await response.json()).toHaveProperty("unprotected", false);
 });
 
+test("configured HTTPS proxy preserves the browser origin without trusting forwarded authority", async () => {
+  const { settings, passwordFile, authorization, track } = await fixture();
+  const external = new URL("https://workbench.example.test");
+  const app = await startApp({ ...settings, webEnv: { OMO_WEB_PASSWORD_FILE: passwordFile, OMO_WEB_PROXY_ORIGIN: external.origin } });
+  track(app);
+  const request = (path: string, headers: Record<string, string> = {}, body?: string) =>
+    fetch(new URL(path, app.url), { method: body === undefined ? "GET" : "POST", body,
+      headers: { Host: external.host, Authorization: authorization, ...headers }, signal: AbortSignal.timeout(3000) });
+  expect((await request("/", { Authorization: "" })).status).toBe(401);
+  expect((await request("/", { Host: "other.example.test", "X-Forwarded-Host": external.host,
+    "X-Forwarded-Proto": "https", Forwarded: `host=${external.host};proto=https` })).status).toBe(403);
+  const bootstrap = await request("/api/bootstrap");
+  expect(bootstrap.status).toBe(200);
+  const { token, workspaces } = z.object({ token: z.string(), workspaces: z.array(z.string()).length(1) }).parse(await bootstrap.json());
+  const body = JSON.stringify({ cwd: workspaces[0] });
+  const post = (headers: Record<string, string>) => request("/api/sessions",
+    { "Content-Type": "application/json", "X-OmO-Token": token, ...headers }, body);
+  expect((await post({ Origin: app.url.origin })).status).toBe(403);
+  expect((await post({ Origin: external.origin, "X-OmO-Token": "wrong" })).status).toBe(403);
+  expect((await post({ Origin: external.origin, "Sec-Fetch-Site": "cross-site" })).status).toBe(403);
+  expect((await post({ Origin: external.origin })).status).toBe(201);
+  expect((await request("/", { Host: app.url.host })).status).toBe(200);
+});
+
+test("a one-character private password authenticates without weakening the Basic challenge", async () => {
+  const { root, settings, track } = await fixture();
+  const path = join(root, "short password");
+  if (process.platform === "win32") await createWindowsPasswordFile(path, "7");
+  else await writeFile(path, "7\n", { mode: 0o600 });
+  const app = await startApp({ ...settings, webEnv: { OMO_WEB_PASSWORD_FILE: path } });
+  track(app);
+  const get = (password: string) => fetch(app.url, {
+    headers: { Authorization: `Basic ${Buffer.from(`omo:${password}`).toString("base64")}` },
+    signal: AbortSignal.timeout(2000),
+  });
+  expect((await get("6")).status).toBe(401);
+  expect((await get("7")).status).toBe(200);
+  expect(app.weakPassword).toBe(true);
+});
+
 test("invalid listen config fails before inspecting workspaces", async () => {
   const { root, settings, passwordFile } = await fixture();
   const wildcard = { OMO_WEB_HOST: "0.0.0.0", OMO_WEB_ORIGIN: "https://localhost:4431",
     OMO_WEB_PASSWORD_FILE: passwordFile, OMO_WEB_TLS_CERT: passwordFile, OMO_WEB_TLS_KEY: passwordFile };
   const cases: { env: NodeJS.ProcessEnv; key: string; port?: number }[] = [
     { env: { OMO_WEB_HOST: "localhost" }, key: "OMO_WEB_HOST" },
+    { env: { OMO_WEB_PROXY_ORIGIN: "https://workbench.example.test" }, key: "OMO_WEB_PASSWORD_FILE" },
+    ...["http://workbench.example.test", "https://workbench.example.test/", "https://u@workbench.example.test",
+      "https://workbench.example.test/path", "*", "null"].map(value => ({
+      env: { OMO_WEB_PROXY_ORIGIN: value, OMO_WEB_PASSWORD_FILE: passwordFile }, key: "OMO_WEB_PROXY_ORIGIN",
+    })),
     { env: { ...wildcard, OMO_WEB_PASSWORD_FILE: undefined }, key: "OMO_WEB_PASSWORD_FILE" },
     ...["", "0", "true", " 1", "1 "].map(value => ({
       env: { ...wildcard, OMO_WEB_PASSWORD_FILE: undefined, OMO_WEB_ALLOW_UNAUTHENTICATED: value }, key: "OMO_WEB_PASSWORD_FILE",
@@ -151,11 +196,11 @@ test("invalid listen config fails before inspecting workspaces", async () => {
   }
 });
 
-test.if(process.platform !== "win32")("POSIX password files fail closed unless private and 20–128 printable ASCII bytes with at most one line ending", async () => {
+test.if(process.platform !== "win32")("POSIX password files fail closed unless private and 1–128 printable ASCII bytes with at most one line ending", async () => {
   const { root, settings, password } = await fixture();
   const cases = [
     { content: password, mode: 0o644 },
-    { content: "a".repeat(19), mode: 0o600 },
+    { content: "\n", mode: 0o600 },
     { content: "a".repeat(129), mode: 0o600 },
     { content: `${password}\n\n`, mode: 0o600 },
     { content: `${password}\u00a0`, mode: 0o600 },

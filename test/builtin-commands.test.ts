@@ -6,8 +6,8 @@ import {
 } from "../src/web/builtin-commands.ts";
 
 describe("builtin command allowlist", () => {
-  test("allowlist holds twenty-one names", () => {
-    expect(BUILTIN_COMMAND_NAMES).toHaveLength(21);
+  test("allowlist includes the two settings entries alongside the existing commands", () => {
+    expect(BUILTIN_COMMAND_NAMES).toHaveLength(23);
   });
 
   test("every picker entry invokes its own parse path", () => {
@@ -203,7 +203,6 @@ describe("fast parameters", () => {
 
 describe("known TUI-only commands never reach the model", () => {
   test.each([
-    ["/settings"],
     ["/scoped-models"],
     ["/reasoning off"],
     ["/efforts high"],
@@ -228,11 +227,18 @@ describe("known TUI-only commands never reach the model", () => {
   });
 
   test("unsupported form carries the name for the UI report", () => {
-    expect(parseBuiltinInput("/settings")).toEqual({
+    expect(parseBuiltinInput("/scoped-models")).toEqual({
       kind: "tui-only",
-      name: "settings",
+      name: "scoped-models",
     });
   });
+});
+
+test("settings and its singular alias are explicit, zero-argument Web commands", () => {
+  for (const name of ["setting", "settings"] as const) {
+    expect(parseBuiltinInput(`/${name}`)).toEqual({ kind: "builtin", command: { name } });
+    expect(parseBuiltinInput(`/${name} --global`).kind).toBe("malformed");
+  }
 });
 
 describe("malformed builtin attempts never fall through", () => {
@@ -242,7 +248,7 @@ describe("malformed builtin attempts never fall through", () => {
     ["control code is rejected", "/rename \u0001"],
     ["control glued to a builtin head is refused", "/model\u0000"],
     ["vertical tab glued to a builtin head is refused", "/copy\u000b"],
-    ["control glued to a TUI-only head is refused", "/settings\u0000"],
+    ["control glued to a TUI-only head is refused", "/scoped-models\u0000"],
     ["persistence flag is rejected", "/model --default"],
     ["extra arguments are rejected", "/copy all"],
   ])("%s", (_label, text) => {

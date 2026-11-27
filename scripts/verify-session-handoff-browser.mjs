@@ -150,7 +150,10 @@ export async function openBrowserProof() {
       await ready("#branch-dialog[open]");
       await ready("#branch-message:not(:disabled)");
       await click("#branch-close");
-      const localOnly = "/settings SYNTHETIC-LOCAL-ONLY";
+      await submit("/settings");
+      await ready('#manage-dialog[open] [data-key="run-settings"]');
+      await click("#manage-dialog button[data-close]");
+      const localOnly = "/scoped-models SYNTHETIC-LOCAL-ONLY";
       await submit(localOnly);
       const refused = await ready("#compose-error:not([hidden])", "本机 OmO 终端");
       assert(!refused.text.includes("SYNTHETIC-LOCAL-ONLY"), "Local-only guidance must not echo the typed arguments");

@@ -100,12 +100,13 @@ Type `/` or `$` in the input, pick with the arrow keys, and press Enter, Tab, or
 | Inspect a session or branch it | `/session`, `/tree` |
 | Try another line from here | `/fork`, `/clone` |
 | Switch models or free context | `/model`, `/thinking`, `/compact` |
+| Open this session's settings | `/settings` (also `/setting`) |
 | See todos, subagents, dependencies | `/todo`, `/tasks`, `/dag` |
 | Find commands and keys | `/help`, `/hotkeys` |
 
 ## Access and safety
 
-The default is loopback with no password. In **Access settings**, you can set or change the password, toggle password protection and HTTPS, generate a self-signed SSL certificate, and bind to loopback, a specific IPv4 interface or `0.0.0.0`. Certificate generation requires OpenSSL 1.1.1+ on `PATH`; use the printed HTTPS address and verify the certificate on the client. The browser username is `omo`.
+The default is loopback with no password. In **Access settings**, you can set or change the password, toggle password protection and HTTPS, generate a self-signed SSL certificate, and bind to loopback, a specific IPv4 interface or `0.0.0.0`. Certificate generation requires OpenSSL 1.1.1+ on `PATH`; use the printed HTTPS address and verify the certificate on the client. The browser username is `omo`. Short passwords are accepted with a warning; use at least 20 characters for remote access.
 
 For direct server startup (`omo-web serve`), use environment variables:
 
@@ -114,7 +115,8 @@ For direct server startup (`omo-web serve`), use environment variables:
 | `OMO_WEB_WORKSPACES` | Project directories allowed to host sessions; defaults to the launch directory |
 | `OMO_WEB_PORT` | Listen port, default `4317` |
 | `OMO_WEB_PASSWORD_FILE` | Password file (`0600` on POSIX, user-private ACL on Windows), login name `omo` |
-| `OMO_WEB_ALLOW_UNAUTHENTICATED` | Explicit opt-in to passwordless non-loopback access; HTTPS still required |
+| `OMO_WEB_PROXY_ORIGIN` | Exact external HTTPS origin for a tunnel or reverse proxy; the proxy must preserve `Host` |
+| `OMO_WEB_ALLOW_UNAUTHENTICATED` | Explicit opt-in to passwordless remote access; HTTPS still required at the browser |
 | `OMO_WEB_DATA` | Web session index and private logs, default `~/.omo-web` |
 | `OMO_WEB_CLI_AGENT_DIR` | Shared OmO profile directory for the engine, CLI history, and snapshots |
 | `OMO_WEB_BIN` | Native CLI binary, default `omo` |
@@ -127,6 +129,8 @@ OMO_WEB_WORKSPACES="$dirs" bun start
 ```
 
 Non-loopback listeners require HTTPS. Binding to an interface does not configure a firewall or restrict which source addresses can connect. Use a VPN where possible and set a password. Passwordless mode is an explicit opt-in for restricted networks: anyone who can connect can read sessions and run tools through OmO. See [Linux and Windows remote setup](docs/usage.md#密码与远程访问).
+
+For a tunnel or reverse proxy that terminates HTTPS, keep OmO Web on `127.0.0.1`, configure **Access settings → Proxy origin** (or `OMO_WEB_PROXY_ORIGIN`), and use the [proxy setup checklist](docs/usage.md#内网穿透与反向代理). This option is available in source builds and is not part of the published `0.1.1` package.
 
 ## Platform limits
 

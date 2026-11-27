@@ -1,4 +1,5 @@
 import { WebError, array, record } from "./protocol.ts";
+import { dedicatedCommands, terminalOnlyCommands } from "./command-ownership.ts";
 
 const str = (value: unknown): string => typeof value === "string" ? value : "";
 
@@ -16,15 +17,13 @@ export type NativeCommand = {
 const SHORT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const SKILL_NAME = /^skill:[A-Za-z0-9-]{1,64}$/;
 const SKILL_SHORT = /^[A-Za-z0-9-]{1,64}$/;
-const localRuntimeCommands = new Set([
-  "/dag", "/tasks", "/task-kill", "/todo", "/reasoning", "/efforts", "/scoped-models", "/favorite-models",
-]);
+const reservedCommands = new Set([...dedicatedCommands, ...terminalOnlyCommands].map(name => `/${name}`));
 
-/** These native names belong to local views or device-level actions, not the command relay. */
+/** These names have a dedicated Web path or require the local terminal, not the command relay. */
 export function refuseRuntimeCommandRelay(text: string): void {
   const head = text.split(/\s/u, 1)[0];
-  if (head && localRuntimeCommands.has(head)) {
-    throw new WebError(400, "runtime_command_local", "该命令由 Web 本地查看入口处理；原生修改请在本机 OmO 终端操作。");
+  if (head && reservedCommands.has(head)) {
+    throw new WebError(400, "runtime_command_local", "请在 Web 使用该命令的专用入口，或在本机 OmO 终端执行终端专用命令。");
   }
 }
 

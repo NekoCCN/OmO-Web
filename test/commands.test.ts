@@ -102,11 +102,12 @@ describe("native command contracts", () => {
     expect(await assistantTexts(client, id)).toEqual([]);
   });
 
-  test("registered runtime-view names cannot relay native task, DAG or persistent reasoning commands", async () => {
+  test("registered names owned by Web or reserved to the terminal cannot enter the generic relay", async () => {
     const client = await launch(true);
     const id = await create(client);
     for (const [invocation, args] of [
       ["/reasoning", "off"], ["/efforts", "high"], ["/todo", "rm"], ["/tasks", "--all"], ["/dag", "any"], ["/task-kill", ""],
+      ["/compact", "keep this"], ["/settings", ""], ["/reload", ""],
     ]) {
       const command = await client.post(`/api/sessions/${id}/actions`, { action: "command", invocation, arguments: args });
       const direct = await client.post(`/api/sessions/${id}/actions`, { action: "prompt", message: `${invocation} ${args}` });
@@ -128,6 +129,17 @@ describe("native command contracts", () => {
     expect((await client.post(`/api/sessions/${id}/actions`, { action: "abort" })).status).toBe(200);
     expect((await client.post(`/api/sessions/${id}/actions`, { action: "command", invocation: "/echo", arguments: "after" })).status).toBe(200);
     expect(await assistantTexts(client, id)).toEqual(["Ran #1: /echo after"]);
+  });
+
+  test("manual compaction refuses a running session without stopping its turn", async () => {
+    const client = await launch();
+    const id = await create(client);
+    expect((await client.post(`/api/sessions/${id}/actions`, { action: "command", invocation: "/hang-start" })).status).toBe(200);
+    const compact = await client.post(`/api/sessions/${id}/actions`, { action: "compact" });
+    expect(compact.status).toBe(409);
+    expect(await compact.json()).toHaveProperty("code", "session_busy");
+    const snapshot = await (await fetch(`${client.origin}/api/sessions/${id}`)).json();
+    expect(snapshot.state.isStreaming).toBe(true);
   });
 
   test("plain prompts still flow as text without the legacy fallback flag", async () => {

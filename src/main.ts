@@ -40,10 +40,15 @@ const app = await startApp({
   process.exit(1);
 });
 if (app.unprotected) console.warn(cliTr(
-  "警告：非本机监听未设密码。能访问此地址的人都能读取会话并通过 OmO 操作本机。仅在受限私网或 VPN 内使用。",
-  "Warning: non-loopback listening without a password. Anyone who can reach this address can read sessions and run tools through OmO. Use only on a restricted private network or VPN.",
+  "警告：非本机入口未设密码。能访问此地址的人都能读取会话并通过 OmO 操作本机。仅在受限私网或 VPN 内使用。",
+  "Warning: remote access without a password. Anyone who can reach this address can read sessions and run tools through OmO. Use only on a restricted private network or VPN.",
+));
+if (app.weakPassword) console.warn(cliTr(
+  "OmO Web warning: 密码较短，建议使用至少 20 个字符。",
+  "OmO Web warning: short password. Use at least 20 characters for better protection.",
 ));
 console.log(`OmO Web: ${app.url.href}`);
+if (app.proxyOrigin) console.log(`${cliTr("代理入口", "Proxy origin")}: ${app.proxyOrigin}`);
 console.log(`${cliTr("工作目录", "Working directories")}: ${workspaces.join(", ")}`);
 const halt = () => { void app.stop().catch(error => { console.error(error); process.exitCode = 1; }); };
 process.once("SIGINT", halt);

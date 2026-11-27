@@ -13,9 +13,11 @@ const modelId = "web-smoke";
 const permissionMarker = "Please test the write approval flow.";
 const cliMarker = "CLI history smoke test.";
 const commandMarker = "Native template expansion for workbench smoke.";
+const compactMarker = "Keep the isolated compaction verification marker.";
 const blockedFile = join(workspace, "should-not-exist.txt");
 let received = 0;
 let expandedCommand = false;
+let compactInstructionsSeen = false;
 const provider = Bun.serve({
   hostname: "127.0.0.1",
   port: 0,
@@ -25,6 +27,7 @@ const provider = Bun.serve({
     assert.equal(params.model, modelId);
     received++;
     if (JSON.stringify(params.messages.at(-1)).includes(commandMarker)) expandedCommand = true;
+    if (JSON.stringify(params.messages.at(-1)).includes(compactMarker)) compactInstructionsSeen = true;
     const data = (delta: object, finish_reason: string | null) => `data: ${JSON.stringify({
       id: "chatcmpl-web-smoke", object: "chat.completion.chunk", created: 1795460000, model: modelId,
       choices: [{ index: 0, delta, finish_reason }],
@@ -52,7 +55,8 @@ try {
     baseUrl: `${provider.url.origin}/v1`, api: "openai-completions", apiKey: "local-dummy",
     models: [{ id: modelId, name: "Web Smoke Model", input: ["text"], contextWindow: 128000, maxTokens: 4000 }],
   } } }));
-  await writeFile(join(profile, "settings.json"), JSON.stringify({ defaultProvider: "web-test", defaultModel: modelId }));
+  await writeFile(join(profile, "settings.json"), JSON.stringify({ defaultProvider: "web-test", defaultModel: modelId,
+    compaction: { enabled: false, keepRecentTokens: 1 } }));
   process.env.OMO_CODING_AGENT_DIR = profile;
   const settings: AppSettings = {
     dataDir: join(directory, "web"), workspaces: [workspace], port: 0,
@@ -164,6 +168,13 @@ try {
     await later.post(`${commandPath}/actions`, { action: "command", invocation: "/web-workbench-smoke" });
     await readUntil(commandReader, '"type":"agent_settled"');
     assert(expandedCommand, "The native provider should receive the expanded template, not its invocation");
+    approvalWire = "";
+    await later.post(`${commandPath}/actions`, { action: "prompt", message: "Add a second turn for manual compaction." });
+    await readUntil(commandReader, '"type":"agent_settled"');
+    approvalWire = "";
+    await later.post(`${commandPath}/actions`, { action: "compact", instructions: compactMarker });
+    await readUntil(commandReader, '"type":"compaction_end"');
+    assert(compactInstructionsSeen, "The native model should receive the custom compaction instructions");
   } finally {
     await commandReader.cancel();
   }
@@ -180,7 +191,7 @@ try {
   assert(cliSnapshot.messages.some((m: { role: string; content: { text?: string }[] }) =>
     m.role === "assistant" && m.content.some(block => block.text === answer)));
   assert(!(await later.get("/api/sessions")).sessions.some((row: { name: string }) => row.name === "CLI smoke history"));
-  console.log(`NATIVE PASS · ${later.boot.engine.version} · stream, explicit tool denial, restart and resume, template execution, CLI-created read-only history`);
+  console.log(`NATIVE PASS · ${later.boot.engine.version} · stream, explicit tool denial, restart and resume, template execution, manual compaction, CLI-created read-only history`);
 } finally {
   await app?.stop();
   await provider.stop(true);

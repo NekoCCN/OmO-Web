@@ -1607,6 +1607,11 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
     case "session":
       openDetails();
       return inspector.open;
+    case "settings":
+    case "setting":
+      btn("manage-button").click();
+      manager.querySelector<HTMLElement>('[data-key="run-settings"]')?.focus();
+      return manager.open;
     case "tree":
       openDetails("overview", prompt, "tree");
       return inspector.open;
@@ -1648,9 +1653,12 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
     case "fork":
       btn("web-branch-button").click();
       return dialog("branch-dialog").open;
-    case "compact":
-      return action({ action: "compact", ...(command.instructions ? { instructions: command.instructions } : {}) },
+    case "compact": {
+      const completed = await action({ action: "compact", ...(command.instructions ? { instructions: command.instructions } : {}) },
         tr("压缩上下文", "Compact context"));
+      if (completed) draftFor(id).commandStatus = tr("上下文已压缩。", "Context compaction completed.");
+      return completed;
+    }
     case "model": {
       if (!command.reference) {
         if (usesComposeOptionsPopover() && !sel("model").disabled) setComposeOptions(true);
@@ -1913,7 +1921,10 @@ function renderManager(view: View): void {
     "fast", { action: "fast", enabled: !fast }));
   if (typeof auto === "boolean") flags.append(row(auto ? tr("关闭自动压缩", "Turn off auto-compaction") : tr("开启自动压缩", "Turn on auto-compaction"),
     "auto", { action: "autoCompaction", enabled: !auto }));
-  runtime.append(el("h3", "", tr("运行设置", "Run settings")));
+  const runtimeHeading = el("h3", "", tr("运行设置", "Run settings"));
+  runtimeHeading.dataset.key = "run-settings";
+  runtimeHeading.tabIndex = -1;
+  runtime.append(runtimeHeading);
   if (flags.childElementCount) runtime.append(flags);
   const compactForm = el("form", "stack stack--tight");
   const instructions = el("input");
@@ -1968,6 +1979,10 @@ function insertCommand(view: View, invocation: string): void {
 }
 
 function renderCommandOptions(view: View): void {
+  const results = box("command-list");
+  const focused = document.activeElement;
+  const invocationToRestore = focused instanceof HTMLButtonElement && results.contains(focused) ? focused.dataset.invocation : undefined;
+  let restored: HTMLButtonElement | undefined;
   const query = inp("command-search").value.trim().toLocaleLowerCase();
   const nodes = commandOptions.flatMap(command => {
     const invocation = str(command.invocation);
@@ -1979,12 +1994,14 @@ function renderCommandOptions(view: View): void {
     const row = el("li", "stack stack--tight");
     const insert = button(invocation, () => insertCommand(view, invocation), "button--quiet path");
     insert.dataset.invocation = invocation;
+    if (invocation === invocationToRestore) restored = insert;
     insert.setAttribute("aria-label", tr(`插入命令：${invocation}`, `Insert command: ${invocation}`));
     row.append(insert, el("p", "small muted break", [sourceLabel, description].filter(Boolean).join(" · ")));
     return [row];
   });
-  box("command-list").replaceChildren(...nodes);
-  box("command-list").hidden = !nodes.length;
+  results.replaceChildren(...nodes);
+  results.hidden = !nodes.length;
+  restored?.focus({ preventScroll: true });
   notice(box("command-status"), nodes.length ? "" : query ? tr("没有匹配的命令。", "No matching commands.")
     : tr("此会话没有可用命令。", "This session has no listed commands."));
 }
@@ -1993,7 +2010,7 @@ async function openCommandPicker(view: View, help = false): Promise<void> {
   if (commandDialog.open || btn("command-picker").disabled) return;
   commandRequest?.abort();
   const request = commandRequest = new AbortController();
-  commandOptions = [];
+  commandOptions = commandCatalog([]);
   const filter = inp("command-search");
   const shortcuts = byId("command-shortcuts", HTMLDetailsElement);
   shortcuts.open = help;
@@ -2001,8 +2018,8 @@ async function openCommandPicker(view: View, help = false): Promise<void> {
   box("command-list").replaceChildren();
   box("command-list").hidden = true;
   notice(box("command-error"));
-  notice(box("command-status"), tr("正在读取命令…", "Loading commands…"));
   commandDialog.showModal();
+  renderCommandOptions(view);
   if (help) shortcuts.querySelector("summary")?.focus();
   const live = () => !request.signal.aborted && commandDialog.open && view === current;
   try {
@@ -2012,9 +2029,8 @@ async function openCommandPicker(view: View, help = false): Promise<void> {
     renderCommandOptions(view);
   } catch (error) {
     if (!live()) return;
-    notice(box("command-status"));
-    notice(box("command-error"), tr(`无法读取命令：${errorText(error)}。也可以直接输入。`,
-      `Couldn't load commands: ${errorText(error)}. You can still type a command directly.`));
+    notice(box("command-error"), tr(`无法读取扩展命令：${errorText(error)}。内置命令仍可用。`,
+      `Couldn't load extension commands: ${errorText(error)}. Built-in commands remain available.`));
   } finally {
     if (commandRequest === request) commandRequest = undefined;
   }

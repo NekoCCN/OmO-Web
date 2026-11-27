@@ -1114,7 +1114,15 @@ export class Sessions {
       }
       case "fast": await request("set_fast_mode", { enabled: action.enabled }); break;
       case "autoCompaction": await request("set_auto_compaction", { enabled: action.enabled }); break;
-      case "compact": await request("compact", { customInstructions: action.instructions }, 180_000); break;
+      case "compact": {
+        const current = state(await request("get_state"));
+        if (row.archived || current.isStreaming === true || current.isCompacting === true ||
+          (typeof current.pendingMessageCount === "number" && current.pendingMessageCount > 0) || this.#live.get(id)?.running) {
+          throw new WebError(409, "session_busy", "请等会话空闲且队列清空后再压缩，或先取消归档。");
+        }
+        await request("compact", { customInstructions: action.instructions }, 180_000);
+        break;
+      }
       case "clearQueue": await request("clear_queue"); break;
       case "navigate": {
         const current = await request("get_tree");
