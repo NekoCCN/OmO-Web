@@ -1,6 +1,6 @@
 import { expect, onTestFinished, setSystemTime, spyOn, test } from "bun:test";
 import { randomBytes, X509Certificate } from "node:crypto";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import type { IncomingHttpHeaders } from "node:http";
 import { tmpdir } from "node:os";
@@ -12,8 +12,15 @@ import { startApp } from "../src/server.ts";
 import { loadWebAccess, WebAccessConfigError } from "../src/web-access.ts";
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), "omo-web-access-"));
-  onTestFinished(() => rm(root, { recursive: true, force: true }));
+  const temporary = await mkdtemp(join(tmpdir(), "omo-web-access-"));
+  const listeners: { stop(): Promise<void> }[] = [];
+  onTestFinished(async () => {
+    try { await Promise.all(listeners.map(listener => listener.stop())); }
+    finally { await rm(temporary, { recursive: true, force: true, maxRetries: 4, retryDelay: 100 }); }
+  });
+  // The Windows runner's TEMP can use a short-name alias. Submit the same
+  // canonical working directory that Web bootstrap advertises.
+  const root = await realpath(temporary);
   const password = randomBytes(24).toString("base64url");
   const passwordFile = join(root, "password");
   if (process.platform === "win32") await createWindowsPasswordFile(passwordFile, password);
@@ -24,13 +31,14 @@ async function fixture() {
     engineCommand: [process.execPath, fileURLToPath(new URL("./engine-fixture.ts", import.meta.url))] as const,
     port: 0,
   };
-  return { root, settings, password, passwordFile, authorization: `Basic ${Buffer.from(`omo:${password}`).toString("base64")}` };
+  return { root, settings, password, passwordFile, authorization: `Basic ${Buffer.from(`omo:${password}`).toString("base64")}`,
+    track: (listener: { stop(): Promise<void> }) => { listeners.push(listener); } };
 }
 
 test("password-protected loopback challenges before serving files, running API routes, or opening SSE", async () => {
-  const { settings, passwordFile, password } = await fixture();
+  const { settings, passwordFile, password, track } = await fixture();
   const app = await startApp({ ...settings, webEnv: { OMO_WEB_PASSWORD_FILE: passwordFile } });
-  onTestFinished(() => app.stop());
+  track(app);
   for (const [path, authorization, method] of [
     ["/", "", "GET"],
     ["/styles.css", "Basic @@@", "GET"],
@@ -53,9 +61,9 @@ test("password-protected loopback challenges before serving files, running API r
 });
 
 test("authenticated loopback retains root, bootstrap, same-origin POST and the SSE ready frame", async () => {
-  const { root, settings, passwordFile, authorization } = await fixture();
+  const { root, settings, passwordFile, authorization, track } = await fixture();
   const app = await startApp({ ...settings, webEnv: { OMO_WEB_PASSWORD_FILE: passwordFile } });
-  onTestFinished(() => app.stop());
+  track(app);
   expect(app.unprotected).toBe(false);
   const request = (path: string, init?: RequestInit) => fetch(new URL(path, app.url), {
     ...init, headers: { Authorization: authorization, ...init?.headers }, signal: AbortSignal.timeout(3000),
@@ -74,10 +82,10 @@ test("authenticated loopback retains root, bootstrap, same-origin POST and the S
     await styles.body?.cancel();
   }
   const bootstrap = await request("/api/bootstrap");
-  const { token } = z.object({ token: z.string(), unprotected: z.literal(false),
+  const { token, workspaces } = z.object({ token: z.string(), workspaces: z.array(z.string()).length(1), unprotected: z.literal(false),
     engine: z.object({ online: z.literal(true) }) }).parse(await bootstrap.json());
   const post = (headers: Record<string, string>) => request("/api/sessions", {
-    method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify({ cwd: root }),
+    method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify({ cwd: workspaces[0] }),
   });
   const refusedHeaders: readonly Record<string, string>[] = [
     { Origin: app.url.origin },
@@ -91,7 +99,7 @@ test("authenticated loopback retains root, bootstrap, same-origin POST and the S
     await refused.body?.cancel();
   }
   const created = await post({ Origin: app.url.origin, "X-OmO-Token": token });
-  expect(created.status).toBe(201);
+  expect(created.status, await created.clone().text()).toBe(201);
   await created.body?.cancel();
   const events = await request("/api/events");
   expect(events.status).toBe(200);
@@ -103,9 +111,9 @@ test("authenticated loopback retains root, bootstrap, same-origin POST and the S
 });
 
 test("anonymous loopback is not flagged as unprotected public access", async () => {
-  const { settings } = await fixture();
+  const { settings, track } = await fixture();
   const app = await startApp({ ...settings, webEnv: { OMO_WEB_ALLOW_UNAUTHENTICATED: "1" } });
-  onTestFinished(() => app.stop());
+  track(app);
   expect(app.unprotected).toBe(false);
   const response = await fetch(new URL("/api/bootstrap", app.url), { signal: AbortSignal.timeout(3000) });
   expect(response.status).toBe(200);
@@ -207,10 +215,10 @@ async function tlsFixture(san = "DNS:localhost,IP:127.0.0.1") {
 }
 
 tlsTest("protected wildcard serves verified TLS and rejects untrusted TLS, plaintext and forwarded authority", async () => {
-  const { settings, passwordFile, authorization, origin, webEnv, request } = await tlsFixture();
+  const { settings, passwordFile, authorization, origin, webEnv, request, track } = await tlsFixture();
   const app = await startApp({ ...settings, webEnv: { ...webEnv, OMO_WEB_PASSWORD_FILE: passwordFile,
     OMO_WEB_ALLOW_UNAUTHENTICATED: "1" } });
-  onTestFinished(() => app.stop());
+  track(app);
   expect(app.url.origin).toBe(origin);
   expect(app.unprotected).toBe(false);
   const anonymous = await request("/api/bootstrap");
@@ -230,30 +238,32 @@ tlsTest("protected wildcard serves verified TLS and rejects untrusted TLS, plain
 });
 
 tlsTest("unprotected wildcard still needs TLS and retains the origin and token fences", async () => {
-  const { root, settings, origin, webEnv, request } = await tlsFixture();
+  const { root, settings, origin, webEnv, request, track } = await tlsFixture();
   const confirmed = { ...webEnv, OMO_WEB_ALLOW_UNAUTHENTICATED: "1" };
   for (const passwordFile of ["", join(root, "absent")]) {
     await expect(startApp({ ...settings, webEnv: { ...confirmed, OMO_WEB_PASSWORD_FILE: passwordFile } })
       .then(async app => app.stop())).rejects.toThrow("OMO_WEB_PASSWORD_FILE");
   }
   const app = await startApp({ ...settings, webEnv: confirmed });
-  onTestFinished(() => app.stop());
+  track(app);
   expect(app.unprotected).toBe(true);
   const bootstrap = await request("/api/bootstrap");
   expect(bootstrap.status).toBe(200);
-  const { token } = z.object({ token: z.string(), unprotected: z.literal(true) }).parse(JSON.parse(bootstrap.body));
+  const { token, workspaces } = z.object({ token: z.string(), workspaces: z.array(z.string()).length(1),
+    unprotected: z.literal(true) }).parse(JSON.parse(bootstrap.body));
   for (let i = 0; i < 7; i++) {
     const response = await request("/api/sessions", { headers: { Authorization: "Basic b21vOndyb25n" } });
     expect(response.status).toBe(200);
     expect(response.headers["retry-after"]).toBeUndefined();
   }
   const post = (headers: Record<string, string>) =>
-    request("/api/sessions", { headers, body: JSON.stringify({ cwd: root }) });
+    request("/api/sessions", { headers, body: JSON.stringify({ cwd: workspaces[0] }) });
   expect((await post({ Origin: origin })).status).toBe(403);
   expect((await post({ "X-OmO-Token": token })).status).toBe(403);
   expect((await post({ Origin: "https://foreign.invalid", "X-OmO-Token": token })).status).toBe(403);
   expect((await post({ Origin: origin, "X-OmO-Token": token, "Sec-Fetch-Site": "cross-site" })).status).toBe(403);
-  expect((await post({ Origin: origin, "X-OmO-Token": token })).status).toBe(201);
+  const created = await post({ Origin: origin, "X-OmO-Token": token });
+  expect(created.status, created.body).toBe(201);
   await expect(fetch(`http://127.0.0.1:${settings.port}`, { signal: AbortSignal.timeout(2000) })).rejects.toBeInstanceOf(Error);
 });
 
@@ -312,9 +322,9 @@ tlsTest("a full authentication tracker preserves active cooldowns and reuses exp
 });
 
 tlsTest("wildcard limits wrong supplied Basic credentials by transport IP, with a nonextending cooldown", async () => {
-  const { settings, passwordFile, authorization, webEnv, request } = await tlsFixture();
+  const { settings, passwordFile, authorization, webEnv, request, track } = await tlsFixture();
   const app = await startApp({ ...settings, webEnv: { ...webEnv, OMO_WEB_PASSWORD_FILE: passwordFile } });
-  onTestFinished(() => app.stop());
+  track(app);
   const wrong = (forwarded: number, localAddress = "127.0.0.1") => request("/api/sessions", { localAddress,
     headers: { Authorization: "Basic b21vOndyb25n", Forwarded: `for=192.0.2.${forwarded}`,
       "X-Forwarded-For": `192.0.2.${forwarded}`, "X-Real-IP": `192.0.2.${forwarded}` } });
