@@ -41,8 +41,8 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 把 `VERSION` 和 `TAG` 换成实际发布的版本和标签。可从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 页面直接下载两个文件。已安装并登录 `gh` 的用户也可执行下例。
 
 ```sh
-VERSION="0.1.3"
-TAG="v0.1.3"
+VERSION="0.1.4"
+TAG="v0.1.4"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 gh release download "$TAG" --repo NekoCCN/OmO-Web --pattern "$ARCHIVE" --pattern "$ARCHIVE.sha256" &&
   sha256sum -c "$ARCHIVE.sha256" &&
@@ -74,7 +74,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 npm install -g omo-web
 ```
 
-要安装 GitHub 发行的 `0.1.3`，从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.3) 下载 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.3.tgz`。下载需要仓库访问权限；公开 npm 的 `latest` 独立更新。从同版本源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.3.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 安装格式，与不依赖 Node.js 的 Bun `.tar.gz` 不同。
+不使用 registry 时，从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.4) 下载 `0.1.4` 的 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.4.tgz`。下载需要仓库访问权限；公开 npm 的 `latest` 独立更新。从同版本源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.4.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 安装格式，与不依赖 Node.js 的 Bun `.tar.gz` 不同。
 
 在实际项目目录运行 `omo-web`。用方向键移动，Enter 选择工作目录、访问设置或开始监听。密码、HTTPS、证书和网卡详见 [TUI 配置](usage.md#通过-tui-配置)。`omo-web serve` 不读取启动器设置，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
 
@@ -112,7 +112,7 @@ npm install -g omo-web
 
 macOS 校验可用 `(cd dist && shasum -a 256 -c "$ARCHIVE.sha256")` 等效。
 
-为每个版本准备 `docs/releases/$VERSION.md`，例如 [0.1.3 发行说明](releases/0.1.3.md)。校验文件只记录文件名，请在相应包所在目录执行。`--verify-tag` 不创建标签；上传后先下载校验草稿资产，再发布。如另行发布到 npm，必须使用与 GitHub 同一份已验证的 `.tgz`，不要重新打包。其他渠道见[分发选型](distribution.md)。
+为每个版本准备 `docs/releases/$VERSION.md`，例如 [0.1.4 发行说明](releases/0.1.4.md)。校验文件只记录文件名，请在相应包所在目录执行。`--verify-tag` 不创建标签；上传后先下载校验草稿资产，再发布。发布到 npm 时，使用与 GitHub 同一份已验证的 `.tgz`，不要重新打包。其他渠道见[分发选型](distribution.md)。
 
 ## 剩余缺口
 
