@@ -1,0 +1,159 @@
+# 使用详解
+
+本文收录 OmO Web 的完整使用与参考信息，首页 [README](../README.md) 只保留摘要。安装与发版步骤见 [install-release.md](install-release.md)。
+
+- [工作区与文件浏览](#工作区与文件浏览) · [环境变量](#环境变量) · [密码与远程访问](#密码与远程访问) · [会话、执行与模型](#会话执行与模型) · [引擎与审批](#引擎与审批) · [CLI 互操作](#cli-互操作) · [命令](#命令) · [排查](#排查) · [开发与验证](#开发与验证)
+
+## 启动方式
+
+需要 Bun 1.3+（安装见 https://bun.sh）。运行会话还需要已安装并配置模型凭据的 [OmO Native](https://github.com/code-yeongyu/oh-my-openagent)。Linux 上已实测 OmO **5.1.83**（Senpi **2026.11.23**）。这里的 `omo` 是 Native CLI，不是旧版 OpenCode 插件。Windows 的文件浏览与目录授权单独验证，不代表完整 CLI 功能可用。
+
+Bun 运行 Web 服务；OmO CLI（默认 `OMO_WEB_BIN=omo`）负责模型、工具与权限。程序目录可以替换，`OMO_WEB_WORKSPACES` 指定可用的项目目录。升级时保留 `OMO_WEB_DATA` 和 OmO profile。
+
+### 方式 A：源码 checkout
+
+```sh
+git clone https://github.com/NekoCCN/OmO-Web.git
+cd OmO-Web
+omo --version
+bun install --frozen-lockfile
+OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
+```
+
+把示例目录换成真实存在的项目。`bun start` 等于先 `bun run build` 再跑 `src/main.ts`；重复启动可用 `bun run serve` 跳过重构建（`dist/app.js` 缺失时会直接报错退出，先补一次 `bun run build`）。用浏览器打开终端打印的地址，默认是 **http://127.0.0.1:4317**。不设置工作目录时使用启动目录。打开多个项目时，在 Linux/macOS 用 `:` 分隔绝对路径。
+
+### 方式 B：发行包解压运行
+
+登录有仓库访问权限的 GitHub 账户，从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`（版本号如 `0.1.0`；若该版本尚无资产，回退到方式 A 源码安装）。校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
+
+```sh
+VERSION="0.1.0"
+ARCHIVE="omo-web-$VERSION.tar.gz"
+sha256sum -c "$ARCHIVE.sha256" &&
+  tar xzf "$ARCHIVE" &&
+  OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun --no-env-file "$PWD/omo-web-$VERSION/dist/server.js"
+```
+
+macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
+
+发行包根为解压出的 `omo-web-$VERSION/` 目录，内含 `dist/server.js`、`dist/app.js`、`public/` 运行资产与第三方许可证，不含源码、`node_modules`、`.env` 与本机数据。可从任意工作目录启动，工作目录与数据目录仍由环境变量决定；缺静态资源时同样拒绝启动（重新校验并解压，而非 `bun run build`）。升级时保留 `OMO_WEB_DATA`（Web 会话索引与私有日志）和已配置的 CLI profile（原生配置与默认共享的会话日志）。
+
+`Ctrl+C` 停止服务及其 OmO 子进程。关闭页面或刷新不会停止生成；停止 Web 服务会结束这个 Web 引擎上的运行任务。重启后可使用原来的数据目录和 OmO profile 恢复会话。
+
+## 工作区与文件浏览
+
+配置多个目录后，左栏可切换工作区。Web 会话和 CLI 列表随之筛选，新会话默认使用当前目录。切换只改变视图，不移动旧会话，也不会自动恢复或停止会话。
+
+左栏的「浏览工作区」可查看已授权目录下的文件名和子目录，不读取文件内容。要使用未授权的位置，在文件浏览器输入绝对目录路径，选择使用该目录，再核对完整路径并确认。确认后工作区立即可用；取消不授权。浏览过的子目录不自动变成可执行的工作区。新增授权只在当前 Web 服务运行期间有效；要长期保留，请把目录写入启动时的 `OMO_WEB_WORKSPACES`。
+
+文件浏览器按 **Web 服务所在机器** 的路径规则工作：Linux 用 `/home/you/project`；Windows 用本机盘符绝对路径，如 `C:\Users\you\project`，多目录环境变量用 `;` 分隔。不接受 UNC、设备路径或将目标指向外部的符号链接／junction。文件浏览和目录授权不依赖 CLI 的实时控制；Windows 若还要运行会话，需要一个可由服务启动、支持多会话 RPC 的原生 OmO 可执行文件，当前版本不在 Windows 开放基于 TUI socket 的 CLI 实时／跟随。
+
+## 环境变量
+
+| 环境变量 | 默认值 | 用途 |
+| --- | --- | --- |
+| `OMO_WEB_WORKSPACES` | 启动目录 | 允许新建和恢复会话的工作目录 |
+| `OMO_WEB_PORT` | `4317` | 非 TLS 模式可用 `0` 分配随机端口 |
+| `OMO_WEB_HOST` | `127.0.0.1` | 仅接受 `127.0.0.1` 或 `0.0.0.0`；全接口监听必须同时配置密码和 HTTPS |
+| `OMO_WEB_PASSWORD_FILE` | 未设置 | 启用密码；仅属主可访问的常规文件，用户名固定为 `omo` |
+| `OMO_WEB_ORIGIN` | 未设置 | 启用 TLS 时必填；无路径、尾部斜杠或凭据的 HTTPS 访问地址，端口与监听端口一致 |
+| `OMO_WEB_TLS_CERT` / `OMO_WEB_TLS_KEY` | 未设置 | 与访问地址匹配且被浏览器信任的 PEM 证书，以及对应的未加密 PEM 私钥 |
+| `OMO_WEB_BIN` | `omo` | 对应的 Native CLI 可执行文件 |
+| `OMO_WEB_DATA` | `~/.omo-web` | Web 会话索引和私有日志；默认共享的原生会话日志位于 OmO profile。一个数据目录只开一个服务实例 |
+| `OMO_WEB_CLI_AGENT_DIR` | `OMO_CODING_AGENT_DIR` → `SENPI_CODING_AGENT_DIR` → `PI_CODING_AGENT_DIR` → `~/.omo/agent` | 选择 Web 原生引擎、本机 CLI 历史、实时发现及快照使用的同一个 OmO 配置目录；设为 `""` 关闭 CLI 数据入口，Web 引擎仍使用继承的 OmO profile。 |
+
+## 密码与远程访问
+
+默认仍为本机免密。仅给本机加密码时，启动前设置 `OMO_WEB_PASSWORD_FILE="$HOME/.omo-web-password"` 即可。建议用密码管理器生成并保存随机密码，再写入权限为 `0600` 的独立文件；不要放进项目、URL 或启动命令。密码为 20–128 个可打印 ASCII 字符，允许一个末尾换行。
+
+要从另一台设备访问，准备与实际访问域名或 IP 匹配、被浏览器信任的证书，再启动：
+
+```sh
+OMO_WEB_HOST=0.0.0.0 \
+OMO_WEB_PORT=8443 \
+OMO_WEB_ORIGIN=https://omo.example.net:8443 \
+OMO_WEB_PASSWORD_FILE="$HOME/.omo-web-password" \
+OMO_WEB_TLS_CERT="$HOME/.omo-web-cert.pem" \
+OMO_WEB_TLS_KEY="$HOME/.omo-web-key.pem" \
+OMO_WEB_WORKSPACES="$HOME/path/to/your-project" \
+bun start
+```
+
+替换示例域名和文件路径。在浏览器打开 `OMO_WEB_ORIGIN` 指定的地址，**不要访问 `0.0.0.0`**；在浏览器原生登录提示里输入用户名 `omo` 和配置的密码。启用密码后，网页、静态资源、API 和 SSE 都要求同一凭据；写入仍需同源及页面 token。服务直接终止 TLS，不依赖 `X-Forwarded-*`，未实现反向代理代为终止 TLS 的部署模式。配置不完整时拒绝启动，不会回退到明文。修改密码或证书需要重启；Basic 凭据由浏览器缓存，没有应用内登出。
+
+**这是单操作者工作台，不是多用户权限系统。** 拿到密码就能使用整个控制面，包含读取会话和经 OmO 操作工作区、运行命令。没有应用级登录限流，不建议直接暴露到互联网；优先用私有网络、VPN 或入站 IP 白名单，并使用专用 OS 账号、最小工作区授权。POSIX 只检查密码文件的模式位，部署者还需保证 ACL 和目录访问权限。密码和全接口监听目前仅在 POSIX 实现，实测为 Linux；Windows 仍保留默认本机模式。
+
+## 会话、执行与模型
+
+| 领域 | Web 支持 |
+| --- | --- |
+| 会话 | 新建、搜索、重命名、归档/取消归档、完成标记、保存及恢复 Web 会话 |
+| 文件浏览 | 已授权范围内看文件名和子目录；明确确认后可把新目录加入本次服务的工作区 |
+| 执行 | 流式回复、停止、运行中修正/后续输入、队列查看和清空、PNG/JPEG/GIF/WebP 图片输入（每张约 2 MiB，最多 4 张） |
+| 模型 | 原生模型列表、仅切换当前会话、思考档、快速模式、上下文用量、手动与自动压缩 |
+| 可观测性 | 工作台状态行显示运行、排队、待答与当前待办；桌面还显示原生上下文与最新缓存命中率。运行详情可查看只读子代理、DAG 波次与依赖、会话树、长期记忆计数和完整用量 |
+| CLI 历史 | 普通侧栏默认发现未被 Web 打开的本机 CLI 会话（约 30 秒刷新，进页面即读一次）；点选只读预览，显式「在 Web 继续」才受持有者接纳；已打开的会话合并到 Web 别名，不重复列出 |
+| CLI 实时 | 显式连接已开启原生控制的本机 CLI；查看实时文字对话、发送普通消息、停止可核验的当前回合 |
+| 跟随 CLI | 显式开启后，只读查看唯一可核验的本机 CLI 对话；CLI 切换对话时，Web 跟随其所在的已授权工作区。不接管、不发送；多个终端时不猜前台焦点 |
+| 分支 / 复制 | 从所选 Web 会话、CLI 历史或已连接 CLI 创建独立 Web 会话；分支只回填草稿，复制保留来源上下文 |
+| 命令 | 输入 `/` 或 `$` 在对话原处查看候选；用方向键再按 Enter/Tab，或点候选，只填草稿。`/todo`、`/tasks`、`/dag`、`/help` 和 `/hotkeys` 打开本地查看界面；`/reasoning` 和 `/efforts` 的无参数形式只读当前模型读数 |
+| 人工交互 | 支持确认、选择、文本输入和结构化问题；工具审批可选「询问」「Auto」「无审批」 |
+
+长对话先渲染最近 80 条，可分批向前加载。CLI 历史只读最后保存分支，单条记录最多展示最近 1,000 条可见消息；过大的日志不会被加载。同一轮中连续且已确认成功的探查可合成一条工具摘要，展开仍可逐个查看参数与结果。运行中、失败和待答仍各自显示。
+
+## 引擎与审批
+
+**Web 专用会话宿主。** Web 启动一个独立的 `omo --mode rpc --multi-session --offline --no-approve --session-runtime in-process` 子进程：私有、非监听的本机 stdio 宿主，不发布可被其他 stock TUI 附着的端点；同一份日志的第二个打开者会被原生持有者检查拒绝。浏览器不接触 socket、凭据或通用 RPC。`--offline` 只关闭启动阶段的联网操作，不阻止模型请求；`--no-approve` 忽略未经信任的项目本地配置，不等于工具沙箱。会话默认采用原生 `ask` 预设，原生允许规则和已保存的批准仍可能生效。
+
+**工具审批模式。** 在输入框旁选择「询问」「Auto」或「无审批」。Auto 由原生判断能否自动放行，并非沙箱；无审批为显式确认的 `full-access`，默认允许工具操作，原生权限规则仍有效。用户问题仍要回答，私密输入不转发到 Web。当前 Web 会话重开时回到询问，不修改全局设置或 CLI 默认值。
+
+## CLI 互操作
+
+**继续同一段对话。** 默认共享同一套原生日志：Web 新建的会话直接落在所配置 profile 的原生目录，原生 CLI 选择器可直接列出、恢复；本机 CLI 新建的会话会出现在 Web 普通侧栏，点选只读预览，显式「在 Web 继续」才打开同一份日志（已有进程持有时被拒绝，不关闭它）。要从 Web 回到终端，点「会话管理 → 转到 CLI」释放会话，复制显示的本机命令到终端运行。不要提前启动第二个写入者：Web 在原生回合、待答交互、真实附着或其他未结束工作时不会强制交接；仅当原生把调用者自身的单连接误报为附着时，才用一次不带打断的受控 `force` 重试，并核验释放回执与零丢弃。CLI 退出后，可从同一个 Web 会话恢复。需要当前 OmO 支持原生持有者检查和安静释放，且 Web 引擎与 CLI 历史使用同一 profile。自定义 `sessionDir`（`settings.json` 绝对路径或单次 `--session-dir`）不受支持：无路径 RPC 仍走默认按工作目录分桶，Web 只发现该布局，位置不符会明确失败而不静默迁移。
+
+**CLI 实时与分支。** 在侧栏选择「CLI 实时」，挑选会话后点击「连接」。这里只发现所配置 profile、所授权工作目录下已开启原生控制的本机 TUI，不会替你启动控制服务。断开或关闭弹窗仅释放 Web 的连接，不会关闭 CLI 或停止生成；停止当前回合是单独的操作。消息结果未知时请先在 CLI 核对，页面不会自动重发；如显示「暂存」，由 CLI 处理。工具审批、权限弹窗和私密交互仍由 CLI 上的人处理。实时、历史或 Web 会话选定后可点「分支 / 复制」：实时模式必须能核验当前分支位置，历史使用最后保存的分支；两者都不会切换、接管或修改来源。
+
+分支 / 复制基于原生 v3 会话日志；不复制日志之外的媒体附件文件。实时视图只同步近期可显示文字，过大的原生响应会拒绝读取。
+
+**不是完整 TUI 替代品。** Web 的直接查看命令不发送给模型，任务与 DAG 页面没有写操作。运行详情在打开、刷新或页面重新可见时读取宿主；只有宿主明确不支持读取时才用标为非实时的磁盘快照。Web 不展示任务与 DAG 的自由文本标题、私密字段或原生 ID。原生 `/reasoning on|off` 与 `/efforts <档位>` 的持久设置、默认/收藏模型、私密凭据、任意 TUI 组件、跨设备、调度和全局管理留在本机。Web 的会话级模型与思考档仍可调；已注册的扩展命令、模板和技能尽力兼容。普通消息仍支持 `/tmp/foo` 等路径，若要把命令名当文字发给模型，在开头加一个空格。逐项见 [当前 CLI 对齐矩阵](parity/local-cli-web-matrix.md)。同一操作系统账户内的其他进程不属于安全隔离边界。
+
+## 命令
+
+输入 `/` 或 `$` 在对话原处查看候选；用方向键再按 Enter/Tab，或点候选，只填草稿，不直接发送。`/todo`、`/tasks`、`/dag`、`/help` 和 `/hotkeys` 打开本地查看界面；`/reasoning` 和 `/efforts` 的无参数形式只读当前模型读数。普通消息仍支持 `/tmp/foo` 等路径，若要把命令名当文字发给模型，在开头加一个空格。
+
+## 排查
+
+- **OmO 未连接**：在同一个终端确认 `omo --version` 能运行；必要时设置 `OMO_WEB_BIN`，再刷新页面。
+- **模型不存在或认证失败**：先用 Native CLI 配置模型和登录。Web 端不会收集或转存密钥。
+- **会话无法恢复**：确认保存的工作目录仍存在，并且依旧在 `OMO_WEB_WORKSPACES` 中；已经保存的记录不会被自动挪到其他目录。
+
+## 开发与验证
+
+```sh
+bun run check           # TypeScript
+bun test                # HTTP、RPC、SSE、持久化及权限边界回归
+bun run build           # 构建浏览器资源（dist/app.js）
+bun run serve           # 不重构建，直接跑 src/main.ts
+bun run release:pack    # 构建浏览器与服务端包，产出 dist/omo-web-$VERSION.tar.gz + .sha256
+bun run verify:native   # 真实 OmO，经本地模拟模型验证，无外部模型请求
+```
+
+发版流程（打 tag、draft 发布）见 [install-release.md](install-release.md)；若 Release 尚无对应资产，用源码安装。
+
+验证本机安装的原生 CLI 联动时，把 `SENPI_CLI_MAIN` 设为该安装里的 `dist/cli-main.js` 的绝对路径：
+
+```sh
+bun --no-orphans scripts/verify-cli-live.ts "$SENPI_CLI_MAIN"
+bun --no-orphans scripts/verify-session-branches.ts "$SENPI_CLI_MAIN"
+bun --no-orphans scripts/verify-session-handoff.ts "$SENPI_CLI_MAIN"
+```
+
+默认共享存储的端到端验收直接使用已安装的 `omo`（或 `OMO_WEB_BIN`），经生产入口、隔离 profile 与回环模型验证持有者双向拒绝、原生落盘、安静释放与自定义目录行为：
+
+```sh
+bun scripts/verify-shared-store.ts
+```
+
+原生验证覆盖真实模型流、工具审批拒绝、重启恢复、原生提示模板执行，以及独立 CLI 进程生成的历史。Linux 上还用真实 Chromium、真实 OmO 终端和本地模拟模型验收了同一会话的顺序换端、流式同步、精确中断和独立 Fork / Clone。见 [CLI 能力覆盖](parity/sequential-coverage.md)；本地截图位于 `artifacts/qa/`，不纳入版本控制。覆盖范围不等同于对所有 OmO 版本、操作系统、模型供应商、浏览器或辅助技术的认证。
+
+接口见 [web-api.md](web-api.md)，布局见 [../DESIGN.md](../DESIGN.md)。RPC 来源见 [Senpi 上游 RPC 文档](https://github.com/code-yeongyu/senpi/blob/main/packages/coding-agent/docs/rpc.md)；版本差异以本机随运行时发放的 `docs/rpc.md` 和真实协议探针为准。

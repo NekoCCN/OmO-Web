@@ -1,6 +1,6 @@
 # 安装与发版
 
-面向本地使用者与项目维护者。安全边界与完整环境变量表以 [README](../README.md) 为准，本页只讲“怎么装、怎么起、怎么发”。
+面向本地使用者与项目维护者。安全边界摘要见 [README](../README.md)，完整环境变量表与密码/远程访问见 [使用详解](usage.md#环境变量)，本页只讲“怎么装、怎么起、怎么发”。
 
 ## 前提
 
@@ -59,7 +59,7 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 
 ## 环境与访问（摘要）
 
-完整表与禁区见 [README](../README.md)，这里只记安装相关的默认值：
+完整表见 [使用详解](usage.md#环境变量)，密码与远程访问见 [使用详解](usage.md#密码与远程访问)，禁区摘要见 [README](../README.md)；这里只记安装相关的默认值：
 
 - 默认本机免密（`127.0.0.1`）；仅本机加密码时设置 `OMO_WEB_PASSWORD_FILE`（`0600` 独立文件，用户名固定 `omo`，20–128 个可打印 ASCII，允许一个末尾换行）。
 - 对外访问必须同时配密码与 HTTPS（`OMO_WEB_HOST=0.0.0.0` + `OMO_WEB_ORIGIN` + `OMO_WEB_TLS_CERT/KEY`），服务直接终止 TLS，不支持反向代理代终止；配置不完整拒绝启动，不回退明文。
@@ -87,15 +87,15 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
   bun run release:pack
   tar tzf "dist/$ARCHIVE"
   (cd dist && sha256sum -c "$ARCHIVE.sha256")
-  gh release create "$TAG" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" --repo NekoCCN/OmO-Web --draft --verify-tag
+  gh release create "$TAG" "dist/$ARCHIVE" "dist/$ARCHIVE.sha256" \
+    --repo NekoCCN/OmO-Web --draft --verify-tag \
+    --title "OmO Web $VERSION" --notes-file "docs/releases/$VERSION.md"
 )
 ```
 
 macOS 校验可用 `(cd dist && shasum -a 256 -c "$ARCHIVE.sha256")` 等效。
 
-约定与检查：
-
-`release:pack` 构建浏览器与服务端并生成两个文件。校验文件记录包的文件名，不含目录前缀，所以要在 `dist/` 内执行校验。`--verify-tag` 不创建标签；上传后先在 GitHub 审查草稿，再明确发布。
+为每个版本准备 `docs/releases/$VERSION.md`，例如 [0.1.0 发行说明](releases/0.1.0.md)。`release:pack` 构建浏览器与服务端并生成两个文件。校验文件只记录包的文件名，所以在包所在目录执行校验（本地构建时是 `dist/`）。`--verify-tag` 不创建标签；上传后先在 GitHub 审查草稿，再手动发布。其他渠道见[分发选型](distribution.md)。
 
 ## 剩余缺口
 
