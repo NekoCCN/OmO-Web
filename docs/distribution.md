@@ -18,11 +18,11 @@
 
 参考：[GitHub Packages npm registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry)。
 
-## npm：本地候选包
+## npm 安装格式
 
 - 公开作用域包的发布流程见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages)；私有 npm 包是付费套餐，见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-private-packages)。
-- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。使用 `npm install --global ./dist/npm/omo-web-0.1.0.tgz` 本地安装，再在自己的项目目录运行 `omo-web`。交互终端会打开启动器；`omo-web serve` 直接启动，可用于脚本。启动器需要 Node 和 Bun，运行会话还需要 OmO Native。默认仍只监听本机。
-- 候选名为 `omo-web`，尚未在 npm 注册或发布。同名查询返回 404 不表示已预留。候选包包含 MIT 与第三方许可；正式发布前须由维护者登录 npm、核对包名和发布权限。不要直接发布源码根目录。
+- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。[GitHub 发行页](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0)提供 `.tgz`，可以直接用 `npm install -g <下载地址>` 安装，再在项目目录运行 `omo-web`。交互终端会打开启动器；`omo-web serve` 直接启动。启动器需要 Node.js 18+ 和 Bun，运行会话还需要 OmO Native。
+- 独立 npm 包包含 MIT 与第三方许可；源码根目录保持私有标记，不直接向 registry 发布。维护者正式发布时应核对 SHA-256、登录的账号及 npm 的 2FA 要求，发布验证过的 `.tgz`。
 
 ## Homebrew：tap 与 core 是两回事
 
@@ -41,6 +41,6 @@
 | --- | --- |
 | GitHub Releases + SHA-256 | v0.1.0 已公开，可匿名下载 |
 | GitHub Packages 私有 registry | 下一步候选，接受认证负担时 |
-| 公开 npm | 有 MIT 候选包；待维护者确认并登录 npm |
+| npm 安装 | GitHub 上的 MIT `.tgz` 可直接安装 |
 | Homebrew tap | 维护者自建 tap，不进 core；暂不做 |
 | Docker / GHCR | 有项目需要才评估 |

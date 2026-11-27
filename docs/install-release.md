@@ -65,9 +65,15 @@ macOS 可用 `shasum -a 256 -c "$ARCHIVE.sha256"` 等效校验。
 - 全接口需要直接 HTTPS（`OMO_WEB_HOST=0.0.0.0`、`OMO_WEB_ORIGIN` 和证书/私钥）；配置不完整不回退到明文。优先配置密码，无密码只在确认风险后用于受限私网。
 - 单操作者工作台：密码或 HTTPS 本身都不是多用户权限系统。完整 Linux 与 PowerShell 示例见[远程配置](usage.md#密码与远程访问)。
 
-## npm 候选包：终端启动器
+## 用 npm 安装终端启动器
 
-从源码执行 `bun run npm:pack` 后，可在本机用 `npm install --global ./dist/npm/omo-web-0.1.0.tgz` 安装。它不是已经上架的 npm 包。启动器需要 Node；Web 服务仍需要 Bun 和 OmO Native。
+无需登录 npm，可直接用 npm 安装 [GitHub Release 的 `.tgz`](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.0)：
+
+```sh
+npm install -g https://github.com/NekoCCN/OmO-Web/releases/download/v0.1.0/omo-web-0.1.0.tgz
+```
+
+从源码构建时，执行 `bun run npm:pack`，再用 `npm install -g ./dist/npm/omo-web-0.1.0.tgz` 安装。启动器需要 Node.js 18+；Web 服务仍需要 Bun 和 OmO Native。`.tgz` 是 npm 包，与原先不依赖 Node.js 的 Bun `.tar.gz` 不同。
 
 在实际项目目录运行 `omo-web`。用方向键移动、Enter 选择工作目录或启动。服务启动后可以打开浏览器、停止服务或退出；目录编辑只影响本次启动。`omo-web serve` 不进入交互界面，适合脚本；没有交互终端时，`omo-web` 也直接启动。CLI 和 TUI 跟随系统语言，简体中文和英语之外默认使用英文。
 
