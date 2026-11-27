@@ -2,7 +2,7 @@
 
 默认仅接受本机回环请求；显式启用全接口时，`Host` 和可选 `Origin` 必须匹配配置的 HTTPS 访问地址。不接受跨站或不同源的同站请求，也不信任代理转发头。配置密码后，静态资源、API 和 SSE 都先校验 HTTP Basic 凭据，缺少或凭据不正确时返回空正文的 `401` 和 `WWW-Authenticate`。
 
-API 成功返回 JSON（SSE 除外），其余错误为非 2xx `{error: string, code: string}`。POST 还要求 `Content-Type: application/json`、同源 `Origin` 和 `X-OmO-Token`（从 `/api/bootstrap` 获取）。密码鉴权不替代同源校验或 POST token。部署见 [README](../README.md#密码与全接口-https可选)。
+API 成功返回 JSON（SSE 除外），其余错误为非 2xx `{error: string, code: string}`。POST 还要求 `Content-Type: application/json`、同源 `Origin` 和 `X-OmO-Token`（从 `/api/bootstrap` 获取）。密码鉴权不替代同源校验或 POST token。部署见[密码与远程访问](usage.md#密码与远程访问)。
 
 ## 读取
 
