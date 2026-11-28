@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import type { Stats } from "node:fs";
-import { lstat, mkdir, open, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { Database } from "bun:sqlite";
@@ -58,7 +58,16 @@ export class AttachmentStore {
     try { if (!(await lockFile.stat()).isFile()) throw refused(); } finally { await lockFile.close(); }
     const lock = new Database(lockPath);
     try {
-      lock.exec("BEGIN EXCLUSIVE");
+      lock.exec("PRAGMA busy_timeout = 300");
+      try {
+        lock.exec("BEGIN EXCLUSIVE");
+      } catch (error) {
+        if (!(error instanceof Error && "code" in error && error.code === "SQLITE_BUSY")) throw error;
+        let pid = "";
+        try { pid = (await readFile(join(dirname(this.#directory), "omo-web.pid"), "utf8")).trim().match(/^\d+$/)?.[0] ?? ""; } catch { /* no pidfile yet */ }
+        throw new WebError(409, "data_dir_in_use",
+          `数据目录 ${dirname(this.#directory)} 已被另一个 OmO Web 进程占用${pid ? `（PID ${pid}）` : ""}。请先停止已在运行的 omo-web serve，再重新启动；如需并行运行，可用 OMO_WEB_DATA 指定别的目录。另一个进程已在运行的话，也可以直接打开它输出的网址。`);
+      }
       this.#used = 0n;
       for (const entry of await readdir(this.#directory, { withFileTypes: true })) {
         if (!entry.isFile()) throw refused();
@@ -69,6 +78,8 @@ export class AttachmentStore {
       this.#identity = { dev: directory.dev, ino: directory.ino };
       await this.#verifyDirectory();
       this.#lock = lock;
+      try { await writeFile(join(dirname(this.#directory), "omo-web.pid"), `${process.pid}\n`, { mode: 0o600 }); }
+      catch { /* pidfile is a hint only; the SQLite lock above is the real guard */ }
     } catch (error) {
       lock.close();
       throw error;
@@ -80,6 +91,10 @@ export class AttachmentStore {
     this.#lock?.close();
     this.#lock = undefined;
     this.#identity = undefined;
+    const pidPath = join(dirname(this.#directory), "omo-web.pid");
+    try {
+      if ((await readFile(pidPath, "utf8")).trim() === String(process.pid)) await unlink(pidPath);
+    } catch { /* already gone */ }
   }
 
   async #verifyDirectory(): Promise<void> {

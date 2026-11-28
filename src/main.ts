@@ -2,6 +2,7 @@ import { homedir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import { cliTr } from "../packaging/npm/locale.js";
 import { startApp } from "./server.ts";
+import { WebError } from "./protocol.ts";
 import { WebAccessConfigError } from "./web-access.ts";
 import { missingWebAssets } from "./web-assets.ts";
 
@@ -36,9 +37,15 @@ const app = await startApp({
   engineCommand: [process.env.OMO_WEB_BIN || "omo", "--mode", "rpc", "--multi-session",
     "--offline", "--no-approve", "--session-runtime", "in-process"],
 }).catch(error => {
-  if (!(error instanceof WebAccessConfigError)) throw error;
-  console.error(`OmO Web config: ${error.message}`);
-  process.exit(1);
+  if (error instanceof WebAccessConfigError) {
+    console.error(`OmO Web config: ${error.message}`);
+    process.exit(1);
+  }
+  if (error instanceof WebError) {
+    console.error(cliTr(`OmO Web 无法启动：${error.message}`, `OmO Web cannot start: ${error.message}`));
+    process.exit(1);
+  }
+  throw error;
 });
 if (app.unprotected) console.warn(cliTr(
   "警告：非本机入口未设密码。能访问此地址的人都能读取会话并通过 OmO 操作本机。仅在受限私网或 VPN 内使用。",
