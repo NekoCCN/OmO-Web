@@ -22,7 +22,7 @@ cd /path/to/your/project
 omo-web
 ```
 
-The npm command installs the registry's `latest`. To install `0.1.4` without the registry, [download the `.tgz` and its checksum from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.4), verify it, and run `npm install -g ./omo-web-0.1.4.tgz`. GitHub downloads require repository access.
+The npm command installs the registry's `latest`. To install `0.1.5` without the registry, [download the `.tgz` and its checksum from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5), verify it, and run `npm install -g ./omo-web-0.1.5.tgz`. GitHub downloads require repository access.
 
 In an interactive terminal, `omo-web` opens a launcher. Use the arrow keys and Enter to pick a working directory, edit **Access settings**, or start the service. Open the printed address (default `http://127.0.0.1:4317`). Stop the service from the launcher before changing settings. Access settings persist; directory edits apply only to the current launcher session. For scripts use `omo-web serve`. The launcher follows the system language (English / 简体中文, English fallback).
 
@@ -38,10 +38,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 Replace the example path with a directory that exists. `bun start` builds first and then starts; repeat runs can use `bun run serve` to skip the rebuild.
 
-Prefer the Bun-only archive? If you have repository access, download `omo-web-0.1.4.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
+Prefer the Bun-only archive? If you have repository access, download `omo-web-0.1.5.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
 
 ```sh
-VERSION="0.1.4"
+VERSION="0.1.5"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
@@ -67,6 +67,8 @@ Sessions can be searched, renamed, marked done, archived, and restored. In a Web
 ### Send messages and handle approvals
 
 Replies stream in. To change direction mid-run, steer the current turn; to queue the next thing, send after this turn. Watch or clear the queue in the right column, or press Stop to end the turn. Attach up to 4 PNG, JPEG, GIF, or WebP images per message (about 2 MiB each) when the agent needs to see a UI or an error.
+
+Assistant replies render Markdown with TeX math, highlighted code, tables, and clickable links. Ask the assistant to send a workspace file and it can post a downloadable attachment. Downloads support resuming; there's no fixed per-file limit. The optional server storage quota is separate from the input-image limit above.
 
 Model, thinking level, and fast mode sit next to the input. Options come from native OmO and switch only the current session. On long tasks, watch context usage and compact manually, or turn on auto-compaction.
 
@@ -118,6 +120,7 @@ For direct server startup (`omo-web serve`), use environment variables:
 | `OMO_WEB_PROXY_ORIGIN` | Exact external HTTPS origin for a tunnel or reverse proxy; the proxy must preserve `Host` |
 | `OMO_WEB_ALLOW_UNAUTHENTICATED` | Explicit opt-in to passwordless remote access; HTTPS still required at the browser |
 | `OMO_WEB_DATA` | Web session index and private logs, default `~/.omo-web` |
+| `OMO_WEB_ATTACHMENT_QUOTA_BYTES` | Optional total storage quota for sent attachments, in bytes; unset by default |
 | `OMO_WEB_CLI_AGENT_DIR` | Shared OmO profile directory for the engine, CLI history, and snapshots |
 | `OMO_WEB_BIN` | Native CLI binary, default `omo` |
 
@@ -149,7 +152,7 @@ bun run build     # browser assets
 bun run serve     # start without rebuilding
 ```
 
-[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.4 notes](docs/releases/0.1.4.md) · [Distribution options](docs/distribution.md)
+[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.5 notes](docs/releases/0.1.5.md) · [Distribution options](docs/distribution.md)
 
 [Web API](docs/web-api.md) · [CLI parity matrix](docs/parity/local-cli-web-matrix.md) · [Interface conventions](DESIGN.md)
 

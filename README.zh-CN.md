@@ -20,11 +20,11 @@ cd /path/to/your/project
 omo-web
 ```
 
-上面的命令安装公开 [npm](https://www.npmjs.com/package/omo-web) 的 `latest`。若不走 npm registry，可从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.4) 下载 `0.1.4` 的 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.4.tgz`。下载需要仓库访问权限。
+上面的命令安装公开 [npm](https://www.npmjs.com/package/omo-web) 的 `latest`。若不走 npm registry，可从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5) 下载 `0.1.5` 的 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.5.tgz`。下载需要仓库访问权限。
 
 在交互终端运行 `omo-web`，用方向键和回车选择工作目录、进入「访问设置」或启动服务。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。运行中要改设置，先停止服务；访问设置会保留，工作目录编辑只对本次 TUI 会话有效。脚本用 `omo-web serve` 直接启动。
 
-有仓库访问权限时，也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.4) 下载 Bun 运行包，或从源码运行：
+有仓库访问权限时，也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5) 下载 Bun 运行包，或从源码运行：
 
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
@@ -52,6 +52,8 @@ OMO_WEB_WORKSPACES="$HOME/projects/demo" bun start
 ### 发消息和处理审批
 
 普通回复实时显示；运行中可选「引导当前轮」或「本轮后发送」。右栏可以查看或清空队列。输入区支持停止、附件、模型、思考档和快速模式。
+
+助手回复支持 Markdown、TeX 公式、代码高亮、表格和可点击链接。让助手发送工作区文件，即可在对话里下载；下载支持断点续传，不设固定单文件上限。需要限制附件总占用时，配置 `OMO_WEB_ATTACHMENT_QUOTA_BYTES`。
 
 工具审批默认「询问」。浏览器可回复确认、选择和结构化问题；私密输入仍回到本机 CLI。工具卡按类型显示摘要：Todo 列变更，Agent 卡可读提示词，原始参数和回执按需展开。运行侧栏可看上下文、用量、会话树、待办、子代理和只读 DAG。
 
@@ -93,6 +95,6 @@ bun run release:pack
 bun run npm:pack
 ```
 
-[使用详解](docs/usage.md) · [安装与升级](docs/install-release.md) · [0.1.4 发行说明](docs/releases/0.1.4.md) · [发行方式](docs/distribution.md) · [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md)
+[使用详解](docs/usage.md) · [安装与升级](docs/install-release.md) · [0.1.5 发行说明](docs/releases/0.1.5.md) · [发行方式](docs/distribution.md) · [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md)
 
 OmO Web 采用 [MIT 许可证](LICENSE)。构建产物也包含所用第三方组件的许可。
