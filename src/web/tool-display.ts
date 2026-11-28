@@ -1,6 +1,7 @@
 import { codeBlock, el, list, notice, object, pretty, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { tr } from "./locale.ts";
+import { attachmentLink } from "./tool-attachment.ts";
 import { projectToolCard, renderToolCard } from "./tool-card.ts";
 import { ToolGroupView } from "./tool-group-view.ts";
 import { createToolScene, toolOutputLabels } from "./tool-scenes.ts";
@@ -75,6 +76,7 @@ export class ToolDisplay {
   private lastArgs?: unknown;
   private lastOutput?: unknown;
   private group?: ToolGroupView;
+  private attachment?: HTMLAnchorElement;
 
   constructor(private readonly renderOutputPart: RenderOutputPart) {
     const summary = el("summary", "tool-summary");
@@ -131,11 +133,18 @@ export class ToolDisplay {
     this.card = card;
   }
 
-  update(call?: Wire, trace?: ToolTrace, result?: Wire): void {
+  update(call?: Wire, trace?: ToolTrace, result?: Wire, sessionId?: string): void {
     const name = str(call?.name) || trace?.name || str(result?.toolName);
     const args = call?.arguments === undefined ? trace?.args : call.arguments;
     const output = result?.content ?? trace?.output;
     const state = toolState(call, trace, result);
+    const attachment = name === "send_file" && state === "success" && result?.role === "toolResult" &&
+      result.toolName === name && result.isError === false ? attachmentLink(sessionId, result.content) : undefined;
+    if (attachment?.href !== this.attachment?.href || attachment?.textContent !== this.attachment?.textContent) {
+      this.attachment?.remove();
+      this.attachment = attachment;
+      if (attachment) this.node.append(attachment);
+    }
     const stateLabel = state === "unknown" && result ? tr("状态未知", "Unknown status") : states[state].label;
     const recap = recapTool(name, args);
     const { kind, label, operation, target, preview, group } = recap;

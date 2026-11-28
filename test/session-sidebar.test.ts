@@ -753,6 +753,8 @@ browserTest("a held session snapshot cannot restore generation speed after engin
 browserTest("settled turns update the open dock's Todo and retain disclosure focus and newer speed", async () => {
   await sidebar(1440, async ({ browser, events, setSnapshot, setTodo }) => {
     const todo = `document.querySelector("#runtime-todo [data-runtime-branch]")`;
+    // The overview load is lazy and leaving its tab cancels an unfinished read.
+    await wait(browser, `document.querySelector("#runtime-metrics").textContent.includes("52.1 token/s")`);
     await browser.click("#runtime-open-todo");
     await wait(browser, `${todo}?.textContent.includes("数量未知")`);
     expect(await browser.evaluate(`${todo}.querySelector("summary") === null`)).toBe(true);

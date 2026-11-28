@@ -117,13 +117,17 @@ browserTest("Chromium coalesces live bursts, retains settled Markdown, and follo
     }
     if (scroller.scrollTop !== reading) throw new Error(`Scrolled away from the reader: ${reading} → ${scroller.scrollTop}`);
 
-    update("Live draft 39\n\n`safe` <img src=x> [link](https://example.invalid)", false, true);
+    const final = "Live draft 39\n\n`safe` <img src=x> [link](https://example.invalid) [unsafe](javascript:alert%281%29)";
+    update(final, false, true);
     await frame();
     const remaining = () => scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
-    if (remaining() > 1 || !live.textContent?.includes("<img src=x>") || live.querySelector("img, a") || !live.querySelector("code")) {
+    const links = [...live.querySelectorAll<HTMLAnchorElement>("a[href]")];
+    if (remaining() > 1 || !live.textContent?.includes("<img src=x>") || live.querySelector("img") ||
+      links.length !== 1 || links[0].href !== "https://example.invalid/" ||
+      !links[0].relList.contains("noreferrer") || !live.querySelector("code")) {
       throw new Error("Forced follow or safe final Markdown rendering failed");
     }
-    update("Live draft 39\n\n`safe` <img src=x> [link](https://example.invalid)\n\nNew line", false);
+    update(`${final}\n\nNew line`, false);
     await frame();
     if (remaining() > 1) throw new Error("Reader at the bottom did not follow new content");
     update("Queued before reset");

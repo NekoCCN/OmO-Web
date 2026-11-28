@@ -12,7 +12,7 @@ const row = (id: string, text: string, cursor?: string) => ({
 const initial = () => [row("first", "Current preview", "part + /?"), row("latest", "Latest record")];
 const approval = { id: "approval", method: "confirm", title: "Synthetic approval", message: "Proceed?", toolCallId: "tool" };
 
-async function fixture() {
+async function fixture(content = ["Current preview · First chunk α", " second chunk 🧪"]) {
   const build = await Bun.build({ entrypoints: [fromRoot("src/web/app.ts")], target: "browser" });
   const [script] = build.outputs;
   if (!build.success || !script) throw new Error("Couldn't bundle browser fixture");
@@ -69,8 +69,8 @@ async function fixture() {
     if (target === `${path}/transcript/content`) {
       const cursor = url.searchParams.get("cursor");
       reads.push(`content:${cursor}`);
-      if (cursor === "part + /?") return Response.json({ text: "Current preview · First chunk α", nextCursor: "part-2" });
-      if (cursor === "part-2") return Response.json({ text: " second chunk 🧪" });
+      if (cursor === "part + /?") return Response.json({ text: content[0], nextCursor: "part-2" });
+      if (cursor === "part-2") return Response.json({ text: content[1] });
     }
     if (target === `${path}/options`) return Response.json({ models: [], levels: [], commands: [] });
     if (target === `${path}/workbench-status`) return Response.json({ status: "unavailable" });
@@ -107,7 +107,7 @@ function visible(view: Bun.WebView, selector: string, text = "") {
 
 const frames = (view: Bun.WebView) => view.evaluate("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))");
 const older = "#messages > .transcript-load:not([hidden])";
-const chunk = ".transcript-content button:not([hidden])";
+const chunk = ".transcript-content > button:not([hidden])";
 const draft = "An unsent synthetic draft";
 
 async function scrollClick(view: Bun.WebView, selector: string) {
@@ -215,6 +215,37 @@ test.skipIf(!chromium)("foreign and stale read receipts do not cross the current
     })`)).toEqual({ stale: false, old: false, draft });
     expect(f.posts).toEqual([]);
   } finally { f.held.resolve(); f.close(); }
+});
+
+test.skipIf(!chromium)("rich history joins explicitly loaded chunks through open math, fences and reference links", async () => {
+  const f = await fixture([
+    "Current preview. See [reference][ref].\n\n$$\n\\frac{",
+    "1}{2}\n$$\n\n```js\nconst result = 0.5;\n```\n\n[ref]: https://example.invalid/reference\n",
+  ]);
+  try {
+    await using view = new Bun.WebView({ backend: { type: "chrome", url: false, path: chromium }, width: 390, height: 844 });
+    await open(view, f, true);
+    expect(f.reads).toEqual(["snapshot"]);
+    await scrollClick(view, chunk);
+    await visible(view, ".transcript-content .prose p", "See [reference][ref]");
+    expect(f.reads).toEqual(["snapshot", "content:part + /?"]);
+    await scrollClick(view, chunk);
+    await visible(view, ".transcript-content math");
+    expect(await view.evaluate(`(() => {
+      const rich = document.querySelector(".transcript-content .prose");
+      return {
+        fraction: Boolean(rich.querySelector("math mfrac")),
+        reference: rich.querySelector("a")?.href,
+        source: rich.querySelector("pre code")?.textContent,
+        highlighted: Boolean(rich.querySelector(".hljs-keyword")),
+        draft: document.querySelector("#prompt").value
+      };
+    })()`)).toEqual({
+      fraction: true, reference: "https://example.invalid/reference", source: "const result = 0.5;\n", highlighted: true, draft,
+    });
+    expect(f.reads).toEqual(["snapshot", "content:part + /?", "content:part-2"]);
+    expect(f.posts).toEqual([]);
+  } finally { f.close(); }
 });
 
 test.skipIf(!chromium)("overflow defers transcript correction until settlement, but reads actionable state without replay", async () => {

@@ -27,6 +27,7 @@ const app = await startApp({
   webEnv: process.env,
   dataDir: resolve(process.env.OMO_WEB_DATA ?? join(homedir(), ".omo-web")),
   workspaces,
+  sendFile: true,
   ...(cliProfile.trim() ? { cliAgentDir: resolve(cliProfile) } : {}),
   // Private non-listening stdio host with the in-process runtime: the only
   // host shape whose holder guard refuses a second opener in both directions.

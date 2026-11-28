@@ -56,6 +56,26 @@
 .tool-state-text { min-inline-size: 0; }
 .tool-details[data-state="success"] > .tool-summary .tool-state { color: var(--muted); }
 
+.tool-attachment {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 var(--s1);
+  min-block-size: 44px;
+  max-inline-size: calc(100% - 2 * var(--s2));
+  inline-size: fit-content;
+  margin: var(--s1) var(--s2);
+  padding: var(--s1) var(--s2);
+  border-radius: var(--r1);
+  color: var(--accent);
+  background: var(--accent-tint);
+  text-underline-offset: 0.18em;
+  overflow-wrap: anywhere;
+}
+
+.tool-attachment:hover { background: var(--hover); }
+.tool-attachment:focus-visible { outline: var(--focus) solid var(--accent); }
+
 .message--tool:not(.tool-group *):has(> .tool-card-preview) {
   --tool-card-tint: var(--accent-tint);
   position: relative;

@@ -12,6 +12,7 @@ import { readNativeSurfaces } from "./native-surfaces.ts";
 import { WebError, array, browserEvent, model, pick, record, sessionKey, state } from "./protocol.ts";
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
 import type { Engine } from "./engine.ts";
+import type { AttachmentBinding } from "./send-file.ts";
 import { readOwnedJournalHeader, sessionDirName } from "./cli-history.ts";
 import type { ScopedBranchSource } from "./cli-history.ts";
 import { projectSessionMemory } from "./runtime-metrics.ts";
@@ -152,6 +153,16 @@ export class Sessions {
     return row;
   }
 
+  async authorizeAttachment(id: SessionKey): Promise<void> {
+    try { await this.#requireRowWorkspace(this.#row(id)); }
+    catch (error) {
+      if (error instanceof WebError && error.code === "workspace_refused") {
+        throw new WebError(404, "session_not_found", "找不到这个会话。");
+      }
+      throw error;
+    }
+  }
+
   #route(id: SessionKey): string {
     return this.#binding(id).route;
   }
@@ -161,6 +172,24 @@ export class Sessions {
     const live = this.#live.get(id);
     if (!live) throw new WebError(409, "session_not_open", "会话未接入引擎，请先恢复会话。");
     return live;
+  }
+
+  async attachmentBinding(input: { readonly sessionId: string; readonly sessionFile: string; readonly cwd: string }): Promise<AttachmentBinding> {
+    const matches = [...this.#live.entries()].filter(([, live]) =>
+      live.runtime?.sessionId === input.sessionId && live.runtime.sessionFile === input.sessionFile && live.runtime.cwd === input.cwd);
+    if (matches.length !== 1) throw new WebError(403, "attachment_refused", "无法从此会话发送该文件。");
+    const [id, live] = matches[0];
+    const row = this.#row(id);
+    const verify = async () => {
+      const current = () => !this.#stopping && this.engine.status.online && this.#live.get(id) === live &&
+        this.#rows.get(id) === row && !this.#releasing.has(id) && live.runtime !== undefined &&
+        !this.#treeWrites.get(live.runtime)?.pending;
+      if (!current()) throw new WebError(403, "attachment_refused", "无法从此会话发送该文件。");
+      await this.#requireRowWorkspace(row);
+      if (!current()) throw new WebError(403, "attachment_refused", "无法从此会话发送该文件。");
+    };
+    await verify();
+    return { id, verify };
   }
 
   #workspaceKeyForRow(row: SavedSession): string | undefined {

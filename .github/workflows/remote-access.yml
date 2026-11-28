@@ -11,6 +11,8 @@ on:
       - "test/web-access.test.ts"
       - "test/windows-password.test.ts"
       - "test/npm-tui.test.ts"
+      - "test/attachment-range.test.ts"
+      - "test/send-file-server.test.ts"
       - "package.json"
       - "bun.lock"
   pull_request:
@@ -23,6 +25,8 @@ on:
       - "test/web-access.test.ts"
       - "test/windows-password.test.ts"
       - "test/npm-tui.test.ts"
+      - "test/attachment-range.test.ts"
+      - "test/send-file-server.test.ts"
       - "package.json"
       - "bun.lock"
 
@@ -56,6 +60,8 @@ jobs:
           $env:OMO_WEB_TEST_TLS = '1'
           bun test ./test/web-access.test.ts ./test/windows-password.test.ts ./test/npm-tui.test.ts --timeout 30000
           exit $LASTEXITCODE
+      - name: Test resumable attachment downloads
+        run: bun test ./test/attachment-range.test.ts ./test/send-file-server.test.ts --timeout 30000
       - name: Install npm candidate and run CLI
         shell: pwsh
         run: |

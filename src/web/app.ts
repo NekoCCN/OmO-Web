@@ -1120,7 +1120,7 @@ function renderMessages(view: View, bottom = false): void {
 function renderTranscript(view: View, bottom = false, added?: number): void {
   const history = view.history;
   const entries = history?.entries.length ? [...history.entries, ...view.messages] : view.messages;
-  stream.render(entries, view.liveKey, view.tools, bottom, history?.render(), added);
+  stream.render(entries, view.liveKey, view.tools, bottom, history?.render(), added, view.session.id);
 }
 
 function updateHistory(view: View, page: ReturnType<typeof readPage>): void {
@@ -1389,6 +1389,8 @@ function updateMessage(view: View, event: Wire, type: string): void {
   const message = object(event.message);
   const role = roleOf(message);
   if (!role) return;
+  // An in-progress tool message isn't a file-delivery receipt.
+  if (role === "toolResult" && message.toolName === "send_file" && type !== "message_end") return;
   const before = view.messages[view.messages.length - 1];
   const base = messageKey(message);
   const active = role === "assistant" && view.liveKey;

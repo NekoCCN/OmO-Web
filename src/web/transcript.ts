@@ -1,96 +1,11 @@
 import { button, codeBlock, el, fold, isImageType, list, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { tr, uiLocale } from "./locale.ts";
+import { markdownRichLimit, prose } from "./markdown.ts";
 import { groupToolCalls, ToolDisplay, visibleToolTarget } from "./tool-display.ts";
 import type { ToolTrace } from "./tool-display.ts";
 import type { HistoryContent, HistoryControl, HistoryRender } from "./transcript-history.ts";
 export type { ToolTrace } from "./tool-display.ts";
-
-// Only static element names and text nodes are emitted. Raw HTML, links and remote images stay text.
-function inline(parent: HTMLElement, text: string): void {
-  const token = /`([^`\n]+)`|\*\*([^*\n]+)\*\*/g;
-  let from = 0;
-  for (const match of text.matchAll(token)) {
-    const at = match.index ?? 0;
-    parent.append(text.slice(from, at), match[1] ? el("code", "", match[1]) : el("strong", "", match[2]));
-    from = at + match[0].length;
-  }
-  parent.append(text.slice(from));
-}
-
-const proseProgress = new WeakMap<HTMLElement, { readonly text: string; readonly end: number; readonly children: number }>();
-
-function prose(text: string, node: HTMLElement = el("div", "prose")): HTMLElement {
-  const before = proseProgress.get(node);
-  if (before?.text === text) return node;
-  const keep = before && text.startsWith(before.text.slice(0, before.end)) ? before : undefined;
-  const output = document.createDocumentFragment();
-  let offset = keep?.end ?? 0;
-  let end = offset;
-  let children = keep?.children ?? 0;
-  let paragraph: string[] = [];
-  let code: string[] | null = null;
-  let fence = "";
-  let items: HTMLOListElement | HTMLUListElement | null = null;
-  const flush = () => {
-    if (paragraph.length) {
-      const p = el("p");
-      inline(p, paragraph.join("\n"));
-      output.append(p);
-      paragraph = [];
-    }
-    items = null;
-  };
-  const seal = () => {
-    // An unterminated line can still change its Markdown meaning.
-    if (offset <= text.length) {
-      end = offset;
-      children = (keep?.children ?? 0) + output.childElementCount;
-    }
-  };
-  for (const line of text.slice(offset).split("\n")) {
-    offset += line.length + 1;
-    if (code) {
-      if (line.trim() === fence) {
-        output.append(codeBlock(code.join("\n")));
-        code = null;
-        seal();
-      } else code.push(line);
-    } else if (/^\s*(`{3,}|~{3,})/.test(line)) {
-      flush();
-      fence = line.match(/^\s*(`{3,}|~{3,})/)?.[1] ?? "```";
-      code = [];
-    } else if (!line.trim()) {
-      flush();
-      seal();
-    } else {
-      const heading = line.match(/^#{1,6}\s+(.+)$/);
-      const item = line.match(/^\s*([-*+]|\d+[.)])\s+(.+)$/);
-      if (heading) {
-        flush();
-        const h = el("h4");
-        inline(h, heading[1] ?? "");
-        output.append(h);
-      } else if (item) {
-        const ordered = /^\d/.test(item[1] ?? "");
-        if (!items || items.tagName !== (ordered ? "OL" : "UL")) {
-          flush();
-          items = el(ordered ? "ol" : "ul");
-          output.append(items);
-        }
-        const li = el("li");
-        inline(li, item[2] ?? "");
-        items.append(li);
-      } else paragraph.push(line);
-    }
-  }
-  if (code) output.append(codeBlock(code.join("\n")));
-  flush();
-  while (node.childElementCount > (keep?.children ?? 0)) node.lastElementChild?.remove();
-  node.append(output);
-  proseProgress.set(node, { text, end, children });
-  return node;
-}
 
 function parts(content: unknown): readonly unknown[] {
   return typeof content === "string" ? [{ type: "text", text: content }] : list(content);
@@ -242,10 +157,11 @@ type Cached = { readonly message: Wire; readonly live: boolean; readonly view: M
 type RenderInput = {
   readonly entries: readonly TranscriptEntry[]; readonly liveKey: string; readonly tools: ReadonlyMap<string, ToolTrace>;
   readonly history?: HistoryRender;
+  readonly sessionId?: string;
 };
 type ContentView = {
   readonly key: string; readonly node: HTMLElement; readonly output: HTMLElement;
-  readonly button: HTMLButtonElement; readonly status: HTMLElement; count: number; control?: HistoryControl;
+  readonly button: HTMLButtonElement; readonly status: HTMLElement; count: number; length: number; control?: HistoryControl;
 };
 const pageSize = 80;
 const loadOlderLabel = tr("加载更早消息", "Load older messages");
@@ -322,8 +238,8 @@ export class Transcript {
   }
 
   render(entries: readonly TranscriptEntry[], liveKey: string, tools: ReadonlyMap<string, ToolTrace>, forceBottom = false,
-    history?: HistoryRender, prepended?: number): void {
-    this.latest = { entries, liveKey, tools, history };
+    history?: HistoryRender, prepended?: number, sessionId?: string): void {
+    this.latest = { entries, liveKey, tools, history, sessionId };
     this.forceBottom ||= forceBottom;
     if (prepended !== undefined) this.prepended = (this.prepended ?? 0) + prepended;
     this.frame ??= requestAnimationFrame(() => {
@@ -350,14 +266,14 @@ export class Transcript {
     if (!this.latest || (expandLocal && !this.start)) return;
     if (this.frame !== undefined) cancelAnimationFrame(this.frame);
     this.frame = undefined;
-    const { entries, liveKey, tools, history } = this.latest;
+    const { entries, liveKey, tools, history, sessionId } = this.latest;
     const prepended = this.prepended;
     this.prepended = undefined;
     const expand = expandLocal || prepended !== undefined;
     const { scrollTop, scrollHeight, clientHeight } = this.scroller;
     const active = document.activeElement;
     const rowFocus = active instanceof HTMLElement && this.root.contains(active)
-      && (active.closest(".tool-details, .tool-group, .transcript-content") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
+      && (active.closest(".tool-details, .tool-group, .tool-attachment, .transcript-content, .prose") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
     const toolFocus = rowFocus?.matches(".tool-group-summary")
       ? rowFocus.parentElement?.querySelector<HTMLElement>(".tool-summary")
       : rowFocus?.querySelector<HTMLElement>(".tool-summary");
@@ -435,7 +351,7 @@ export class Transcript {
         view.open = this.openTools.delete(key);
         this.toolViews.set(key, view);
       }
-      view.update(call, tool, result);
+      view.update(call, tool, result, sessionId);
       const body = view.node.querySelector<HTMLElement>(":scope > .tool-details > .fold-body");
       if (body) this.renderHistoryContent(body, result && history?.content(result));
       if (this.trace && (tool?.id || str(call?.id) || str(call?.name) || str(result?.toolCallId) || str(result?.toolName))) {
@@ -484,7 +400,7 @@ export class Transcript {
           const textParts = messageView.parts.filter(({ part }) => part.type === "text");
           // Text cursors read from the start of the original, not from the end of the preview.
           if (textParts.length === 1 && textParts[0]?.node) textParts[0].node.hidden = Boolean(content?.chunks.length);
-          this.renderHistoryContent(messageView.body, content);
+          this.renderHistoryContent(messageView.body, content, message.role === "assistant" && textParts.length === 1);
         }
         if (groupedElsewhere && node.classList.contains("message--tool-only") && !this.cache.get(row.key)?.view.body.childElementCount) {
           node.remove();
@@ -534,7 +450,7 @@ export class Transcript {
     if (!expand && active === this.older && this.older.hidden) this.scroller.focus({ preventScroll: true });
   }
 
-  private renderHistoryContent(host: HTMLElement, content?: HistoryContent): void {
+  private renderHistoryContent(host: HTMLElement, content?: HistoryContent, markdown = false): void {
     let view = this.contentViews.get(host);
     if (view && (!content || view.key !== content.key)) {
       const focused = view.node.contains(document.activeElement);
@@ -546,30 +462,51 @@ export class Transcript {
     if (!content) return;
     if (!view) {
       const node = el("div", "transcript-content stack stack--tight");
-      const output = el("div", "plain break");
+      const output = el("div", markdown ? "prose" : "plain break");
       const status = el("p", "small muted");
       status.setAttribute("role", "status");
       const load = button("", () => activateHistory(this.contentViews.get(host)?.control), "button--quiet");
       node.append(output, status, load);
       host.append(node);
-      view = { key: content.key, node, output, status, button: load, count: 0 };
+      view = { key: content.key, node, output, status, button: load, count: 0, length: 0 };
       this.contentViews.set(host, view);
     }
     view.control = content.control;
-    if (content.chunks.length < view.count) { view.count = 0; view.output.replaceChildren(); }
-    const chunks = content.chunks.slice(view.count).map(chunk => el("span", "", chunk));
-    view.output.append(...chunks);
+    if (content.chunks.length < view.count) {
+      view.count = view.length = 0;
+      view.output.replaceChildren();
+      view.output.className = markdown ? "prose" : "plain break";
+    }
+    const additions = content.chunks.slice(view.count);
+    let target: HTMLElement | undefined;
+    if (additions.length) {
+      const previousLength = view.length;
+      view.length += additions.reduce((size, chunk) => size + chunk.length, 0);
+      if (markdown && view.length <= markdownRichLimit) {
+        prose(content.chunks.join(""), view.output);
+        target = view.output;
+      } else {
+        const beyond = markdown && previousLength <= markdownRichLimit;
+        if (beyond) {
+          view.output.className = "plain break";
+          view.output.replaceChildren(el("p", "small muted",
+            tr("正文过长，已按纯文本显示。", "This long message is displayed as plain text.")));
+        }
+        const chunks = (beyond ? content.chunks : additions).map(chunk => el("span", "", chunk));
+        view.output.append(...chunks);
+        target = chunks.find(chunk => chunk.textContent);
+      }
+    }
     view.count = content.chunks.length;
     view.output.hidden = !view.count;
     const label = content.control?.reload ? reloadLabel : content.control?.busy ? tr("正在读取…", "Loading…")
       : view.count ? tr("加载下一段正文", "Load next content chunk") : tr("加载正文", "Load message content");
     historyButton(view.button, content.control, label);
     const status = content.control?.reload ? tr("记录版本已失效。", "This transcript page expired.") :
-      content.control?.error ?? (chunks.length ? tr("已加载正文。", "Message content loaded.") :
+      content.control?.error ?? (additions.length ? tr("已加载正文。", "Message content loaded.") :
         content.control?.busy || !view.count ? "" : view.status.textContent);
     if (view.status.textContent !== status) view.status.textContent = status;
     view.status.hidden = !status;
-    const target = chunks.find(chunk => chunk.textContent);
     if (target && document.activeElement === view.button) {
       target.tabIndex = -1;
       target.focus({ preventScroll: true });

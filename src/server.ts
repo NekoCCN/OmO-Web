@@ -1,5 +1,6 @@
 import { createHmac } from "node:crypto";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z, ZodError } from "zod";
 import { CliHistory } from "./cli-history.ts";
 import type { CliSessionSummary } from "./cli-history.ts";
@@ -13,11 +14,12 @@ import type { WireObject } from "./protocol.ts";
 import { branchSelection } from "./session-branches.ts";
 import { treeCursor } from "./session-entry-pages.ts";
 import { Sessions } from "./sessions.ts";
+import { startSendFile } from "./send-file.ts";
 import { TerminalSessions } from "./terminal-sessions.ts";
 import { terminalInput } from "./terminal-view.ts";
 import type { TerminalTranscript } from "./terminal-view.ts";
 import { TRANSCRIPT_PAGE_BYTES } from "./transcript-pages.ts";
-import { headers, loadWebAccess } from "./web-access.ts";
+import { headers, loadWebAccess, WebAccessConfigError } from "./web-access.ts";
 import { webAsset } from "./web-assets.ts";
 import { WorkspaceAccess, workspacePlatform } from "./workspace-access.ts";
 
@@ -28,6 +30,7 @@ export type AppSettings = {
   readonly port: number;
   readonly cliAgentDir?: string;
   readonly webEnv?: Readonly<NodeJS.ProcessEnv>;
+  readonly sendFile?: boolean;
 };
 
 const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
@@ -175,10 +178,31 @@ export async function startApp(settings: AppSettings) {
   // the Web host instead of being refused by the native holder guard.
   const cliProfileDir = profile === undefined ? undefined : resolve(profile);
   const { OMO_WEB_PASSWORD_FILE: _passwordFile, ...engineEnv } = process.env;
-  const engine = new Engine(settings.engineCommand, root, event => sessions.event(event), status => {
+  let extensionPath: string | undefined;
+  let attachmentQuota: number | undefined;
+  if (settings.sendFile) {
+    const raw = settings.webEnv?.OMO_WEB_ATTACHMENT_QUOTA_BYTES;
+    if (raw !== undefined) {
+      const bytes = Number(raw);
+      if (!/^[0-9]+$/u.test(raw) || bytes < 1 || !Number.isSafeInteger(bytes)) {
+        throw new WebAccessConfigError("OMO_WEB_ATTACHMENT_QUOTA_BYTES", "Expected a positive whole number of bytes, or leave it unset.");
+      }
+      attachmentQuota = bytes;
+    }
+    const extension = new URL("../native/web-send-file.mjs", import.meta.url);
+    if (!(await Bun.file(extension).exists())) throw new WebError(500, "missing_extension", "缺少文件发送扩展。");
+    extensionPath = fileURLToPath(extension);
+  }
+  const sendFile = extensionPath
+    ? await startSendFile(settings.dataDir, input => sessions.attachmentBinding(input), attachmentQuota) : undefined;
+  const command: readonly [string, ...string[]] = extensionPath
+    ? [...settings.engineCommand, "--extension", extensionPath]
+    : settings.engineCommand;
+  const sendFileEnv = sendFile ? { OMO_WEB_SEND_FILE_BRIDGE: sendFile.url, OMO_WEB_SEND_FILE_SECRET: sendFile.secret } : {};
+  const engine: Engine = new Engine(command, root, event => sessions.event(event), status => {
     if (!status.online) sessions.disconnected();
     if (clients.size) fanout({ type: "engine", engine: browserEngineStatus(status) });
-  }, undefined, cliProfileDir === undefined ? { env: engineEnv } : { privateHost: true, env: { ...engineEnv,
+  }, undefined, cliProfileDir === undefined ? { env: { ...engineEnv, ...sendFileEnv } } : { privateHost: true, env: { ...engineEnv, ...sendFileEnv,
     OMO_CODING_AGENT_DIR: cliProfileDir, SENPI_CODING_AGENT_DIR: cliProfileDir, PI_CODING_AGENT_DIR: cliProfileDir,
     // Controlled client capability, not user config: private in-process stdio
     // ignores `question` from set_client_info, so native ask_user_question
@@ -186,11 +210,11 @@ export async function startApp(settings: AppSettings) {
     // omo 5.1.81: this env restores real pendingQuestions with explicit settle.
     OMO_RPC_CLIENT_CAPABILITIES: "question", SENPI_RPC_CLIENT_CAPABILITIES: "question",
     PI_RPC_CLIENT_CAPABILITIES: "question" } });
-  const sessions = new Sessions(settings.dataDir, workspaces, engine, fanout,
+  const sessions: Sessions = new Sessions(settings.dataDir, workspaces, engine, fanout,
     async (nativeSessionId, cwd) => history.branchSource(nativeSessionId, cwd),
     { sameProfile: cliProfileDir !== undefined,
       ...(cliProfileDir === undefined ? {} : { profileDir: cliProfileDir }) });
-  await sessions.load();
+  try { await sessions.load(); } catch (error) { await sendFile?.stop(); throw error; }
   async function selectedHistory(id: string | undefined) {
     const selected = id === undefined ? undefined : historySessions.get(id);
     if (!selected || selected.workspaceKey === undefined || await workspaces.exact(selected.cwd) !== selected.workspaceKey) {
@@ -345,6 +369,12 @@ export async function startApp(settings: AppSettings) {
       }
       const dag = /^\/api\/sessions\/([a-z0-9-]+)\/native-runtime\/dag\/([a-f0-9]{64})$/u.exec(pathname);
       if (request.method === "GET" && dag?.[2]) return json(await sessions.nativeDag(sessionKey.parse(dag[1]), dag[2]));
+      const attachment = /^\/api\/sessions\/([a-z0-9-]+)\/attachments\/([a-f0-9-]+)$/u.exec(pathname);
+      if (request.method === "GET" && attachment?.[2] && sendFile) {
+        const id = sessionKey.parse(attachment[1]);
+        await sessions.authorizeAttachment(id);
+        return await sendFile.store.download(id, attachment[2], request.headers);
+      }
       const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|queue|tree|branch-runtime|instructions|capabilities|activity|native-runtime|workbench-status|actions|branch-options|branches|handoff|last-assistant|transcript(?:\/content)?))?$/i.exec(pathname);
       if (route) {
         const id = sessionKey.parse(route[1]);
@@ -422,14 +452,20 @@ export async function startApp(settings: AppSettings) {
     }
   };
 
-  const server = Bun.serve({
-    hostname: access.hostname,
-    port: settings.port,
-    ...(access.tls === undefined ? {} : { tls: access.tls }),
-    idleTimeout: 10,
-    maxRequestBodySize: MAX_REQUEST_BYTES,
-    fetch,
-  });
+  let server: Bun.Server<undefined>;
+  try {
+    server = Bun.serve({
+      hostname: access.hostname,
+      port: settings.port,
+      ...(access.tls === undefined ? {} : { tls: access.tls }),
+      idleTimeout: 10,
+      maxRequestBodySize: MAX_REQUEST_BYTES,
+      fetch,
+    });
+  } catch (error) {
+    await sendFile?.stop();
+    throw error;
+  }
   const url = access.origin === undefined ? server.url : new URL(access.origin);
   const heartbeat = setInterval(() => publish(encoder.encode(": keepalive\n\n")), 15_000);
   let closing: Promise<void> | undefined;
@@ -445,7 +481,7 @@ export async function startApp(settings: AppSettings) {
         terminals.stop();
         sessions.stop();
         for (const client of clients) disconnect(client);
-        await Promise.all([server.stop(true), engine.stop()]);
+        await Promise.all([server.stop(true), engine.stop(), sendFile?.stop()]);
       })();
       return closing;
     },
