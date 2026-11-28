@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFile, link, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,7 +31,7 @@ const nameEntry = (parentId: string | null, name: string) =>
   ({ type: "session_info", id: crypto.randomUUID(), parentId, timestamp: iso, name });
 
 async function journal(agent: string, cwd: string, id: string, title: string, seed: string): Promise<string> {
-  const dir = join(agent, "sessions", `--${cwd.slice(1).replace(/[/\\:]/g, "-")}--`);
+  const dir = join(agent, "sessions", sessionDirName(cwd));
   await mkdir(dir, { recursive: true });
   const path = join(dir, `history-${id.slice(0, 8)}.jsonl`);
   await writeFile(path, line(headerOf(id, cwd)) + line(userEntry("u1", null, seed)) +
@@ -40,7 +40,7 @@ async function journal(agent: string, cwd: string, id: string, title: string, se
 }
 
 async function bigJournal(agent: string, cwd: string, id: string, title: string): Promise<string> {
-  const dir = join(agent, "sessions", `--${cwd.slice(1).replace(/[/\\:]/g, "-")}--`);
+  const dir = join(agent, "sessions", sessionDirName(cwd));
   await mkdir(dir, { recursive: true });
   const path = join(dir, `history-${id.slice(0, 8)}.jsonl`);
   await writeFile(path, line(headerOf(id, cwd)) + line(nameEntry(null, title)) +
@@ -49,7 +49,7 @@ async function bigJournal(agent: string, cwd: string, id: string, title: string)
 }
 
 async function prepareDirs() {
-  const root = await mkdtemp(join(tmpdir(), "omo-handoff-http-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omo-handoff-http-")));
   cleanups.push(() => rm(root, { recursive: true, force: true }));
   const agent = join(root, "agent");
   const cwd = join(root, "workspace");
@@ -163,6 +163,43 @@ describe("sequential handoff HTTP routes", () => {
       .toMatchObject({ active: true, cwd: client.cwd, name: "Oversized HTTP history" });
     const again = await (await client.get("/api/cli-history")).json();
     expect(again.sessions).toMatchObject([{ id: opaque, adopted: true }]);
+  });
+
+  test("CLI history resumes its original journal despite a stale device number on the Web bookmark", async () => {
+    const nativeId = crypto.randomUUID();
+    const staleId = crypto.randomUUID();
+    const client = await launchHttp([], { prime: async ({ root, agent, cwd }) => {
+      await journal(agent, cwd, nativeId, "Still authorized", "original journal");
+      const { dev, ino, birthtimeNs } = await lstat(cwd, { bigint: true });
+      const sessions = join(root, "web", "sessions");
+      await mkdir(sessions, { recursive: true });
+      await writeFile(join(sessions, `${staleId}.json`), JSON.stringify({
+        id: staleId, cwd, nativeId, name: "Previous bookmark", updatedAt: 1, archived: false,
+        settled: false, cliBookmark: true, workspaceKey: `${dev + 1n}:${ino}:${birthtimeNs}`,
+      }));
+      return [];
+    } });
+    const stalePath = join(client.dataDir, `${staleId}.json`);
+    const staleBefore = await readFile(stalePath, "utf8");
+    const source = join(client.agent, "sessions", sessionDirName(client.cwd), `history-${nativeId.slice(0, 8)}.jsonl`);
+    const journalBefore = await readFile(source, "utf8");
+    expect((await client.post(`/api/sessions/${staleId}/actions`, { action: "resume" })).status).toBe(403);
+    const { sessions: [history] } = await (await client.get("/api/cli-history")).json();
+    expect(history).toMatchObject({ name: "Still authorized", cwd: client.cwd, adopted: false });
+    const resume = () => client.post(`/api/cli-history/${history.id}/resume`, {});
+
+    const replies = await Promise.all([resume(), resume()]);
+    const opened = await Promise.all(replies.map(async response => ({ status: response.status, body: await response.json() })));
+
+    expect(opened).toMatchObject([200, 200].map(status => ({ status, body: { session: { active: true, cwd: client.cwd } } })));
+    const id = opened[0].body.session.id;
+    expect(id).not.toBe(staleId);
+    expect(opened[1].body.session.id).toBe(id);
+    expect(await (await client.get("/api/sessions")).json()).toMatchObject({ sessions: [{ id, active: true }] });
+    expect(await (await client.get("/api/cli-history")).json()).toMatchObject({ sessions: [{ id: history.id, adopted: true }] });
+    expect((await (await resume()).json()).session.id).toBe(id);
+    expect(await readFile(source, "utf8")).toBe(journalBefore);
+    expect(await readFile(stalePath, "utf8")).toBe(staleBefore);
   });
 
   test("held oversized journals refuse resume without publishing a bookmark", async () => {

@@ -62,6 +62,8 @@ jobs:
           exit $LASTEXITCODE
       - name: Test resumable attachment downloads
         run: bun test ./test/attachment-range.test.ts ./test/send-file-server.test.ts --timeout 30000
+      - name: Test CLI resume with a stale Web bookmark
+        run: bun test ./test/session-handoff.test.ts -t 'stale device number' --timeout 30000
       - name: Install npm candidate and run CLI
         shell: pwsh
         run: |

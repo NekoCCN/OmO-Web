@@ -526,10 +526,10 @@ export class Sessions {
   }
 
   async #resumeCliSource(source: CliResumeSource, nameHint: string): Promise<SessionView> {
-    const existing = [...this.#rows.values()].find(row => row.cwd === source.cwd && row.nativeId === source.nativeSessionId);
-    if (existing) {
-      await this.#resume(existing);
-      return this.#view(this.#row(existing.id));
+    const existing = this.findAlias(source.nativeSessionId, source.cwd, source.workspaceKey);
+    if (existing !== undefined) {
+      await this.#resume(this.#row(existing));
+      return this.#view(this.#row(existing));
     }
     const id = sessionKey.parse(crypto.randomUUID());
     const trimmed = nameHint.trim().slice(0, 120);
@@ -863,9 +863,9 @@ export class Sessions {
     return readNativeDag(this.#runtimeRead(id), key);
   }
 
-  /** Web alias for a known durable native session in this workspace, if any.
-   * Coalesces logical aliases by native id and cwd so the sidebar and history
-   * enter the same session instead of minting a second bookmark. */
+  /** Web alias for this native session and authorized directory identity.
+   * A stale bookmark in the same path must neither mark history as adopted
+   * nor shadow the currently authorized journal on resume. */
   findAlias(nativeSessionId: string, cwd: string, workspaceKey?: string): SessionKey | undefined {
     for (const row of this.#rows.values()) {
       if (row.cwd === cwd && row.nativeId === nativeSessionId &&
