@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
  * Web bridge can reconcile them from snapshots.
  */
 const sessions = new Map<string, {
+  name?: string;
   messages: unknown[];
   pendingDialogs: Record<string, unknown>[];
   streaming: boolean;
@@ -21,12 +22,27 @@ const send = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\
 const ok = (id: unknown, data: unknown, command: string) =>
   send({ id, type: "response", command, success: true, data });
 const model = { id: "fixture", provider: "local", name: "Fixture model" };
+const phrase = "terminal-evidence";
+const partialLayoutMessages = [
+  { role: "user", timestamp: 1, content: "Check tools with delayed styles." },
+  { role: "assistant", timestamp: 2, stopReason: "toolUse", content: [
+    { type: "toolCall", id: "long-output", name: "bash", arguments: { command: `printf ${"x".repeat(700)}` } },
+    { type: "toolCall", id: "partial-read", name: "read", arguments: { path: `/workspace/${"a".repeat(180)}.txt` } },
+    { type: "toolCall", id: "malformed", name: "synthetic_plugin", arguments: ["raw-input"] },
+    { type: "toolCall", id: "missing", name: "bash" },
+  ] },
+  { role: "toolResult", timestamp: 3, toolCallId: "long-output", toolName: "bash", isError: false,
+    content: `${phrase}\n${"w".repeat(760)}\n${"Log line.\n".repeat(85)}output-end` },
+  { role: "toolResult", timestamp: 4, toolCallId: "partial-read", toolName: "read", content: "partial-evidence" },
+  { role: "toolResult", timestamp: 5, toolCallId: "malformed", toolName: "synthetic_plugin", isError: false,
+    content: { text: "not-a-display-part" } },
+] as const;
 
 const stateOf = (route: string) => {
   const session = sessions.get(route);
   return {
     model,
-    sessionName: "Tool lifecycle",
+    sessionName: session?.name ?? "Tool lifecycle",
     isStreaming: session?.streaming ?? false,
     thinkingLevel: "off",
     permissionPreset: "ask",
@@ -57,6 +73,7 @@ for await (const line of lines) {
       sessions.delete(route);
       break;
     case "set_session_name":
+      if (session && typeof request.name === "string") session.name = request.name;
       break;
     case "get_state":
       data = stateOf(route);
@@ -83,7 +100,8 @@ for await (const line of lines) {
     case "set_session_settled":
       break;
     case "get_messages":
-      data = { messages: session?.messages ?? [] };
+      data = { messages: session?.name === "Partial layout"
+        ? [...partialLayoutMessages, ...session.messages] : session?.messages ?? [] };
       break;
     case "abort":
       if (session) {

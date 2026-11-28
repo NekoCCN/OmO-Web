@@ -57,6 +57,7 @@
   align-content: center;
   justify-items: center;
   gap: .125rem;
+  padding: var(--s1);
   border: var(--stroke) solid var(--line);
   border-radius: var(--r1);
   background: var(--surface);
@@ -65,6 +66,15 @@
   line-height: 1.18;
 }
 
+.dag-graph-node strong {
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.dag-graph-node:hover { background: var(--hover); }
+.dag-graph-node:active { background: var(--selection-surface); }
+.dag-graph-node:focus-visible { outline-offset: calc(-1 * var(--focus)); }
 .dag-graph-node span { color: var(--muted); }
 .dag-graph-node[data-state="running"] { border-color: var(--accent); }
 .dag-graph-node[data-state="failed"] { border-color: var(--error); }
@@ -72,6 +82,42 @@
 .dag-graph-text > summary { cursor: pointer; }
 .dag-graph-text:not([open]) > .dag-readout { display: none; }
 .dag-graph-text > .dag-readout { margin-block-start: var(--s2); }
+
+.dag-roster-progress,
+.dag-roster-counts {
+  display: block;
+  font-size: var(--small);
+  overflow-wrap: anywhere;
+}
+.dag-roster-progress,
+.dag-verified-roster { font-weight: 650; }
+.dag-roster-counts { color: var(--muted); }
+.dag-graph-text[open] .dag-wave-preview { display: none; }
+.dag-node-detail { scroll-margin-block-start: var(--s2); }
+.dag-node-detail + .dag-node-detail {
+  border-block-start: var(--stroke) solid var(--line);
+  padding-block-start: var(--s1);
+}
+
+.runtime-execution > summary,
+.task-run > summary {
+  padding: var(--s1) var(--s2);
+  scroll-margin-block-start: var(--s2);
+}
+.task-run > summary {
+  min-block-size: var(--control);
+  background: var(--page);
+}
+.runtime-execution > summary:hover,
+.task-run > summary:hover { background: var(--hover); }
+.runtime-execution > summary:active,
+.task-run > summary:active { background: var(--selection-surface); }
+.runtime-execution > .fold-body,
+.task-run > .fold-body { padding: var(--s2); }
+.runtime-execution .button,
+.task-run .button { justify-self: start; }
+#details-dialog:modal :is(.runtime-execution, .task-run) > summary,
+#details-dialog:modal :is(.runtime-execution, .task-run) .button { min-block-size: var(--touch); }
 
 @media (forced-colors: active) {
   .dag-graph-edges > path { stroke: CanvasText; }

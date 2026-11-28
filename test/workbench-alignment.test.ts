@@ -62,22 +62,26 @@ async function workbench(width: number, height: number, run: (browser: Bun.WebVi
           stats: { contextUsage: { tokens: 34700, contextWindow: 128000, percent: 27.109 }, cost: read === 1 ? 0 : 0.01234 },
         });
       },
-      [`/api/sessions/${session.id}/branch-runtime`]: Response.json({
-        status: "ok", leafId: "fixture-leaf", todo: { status: "ok", phases: [{ name: "检查",
-          tasks: [{ status: "in_progress", content: "检查窄屏" }, { status: "pending", content: "复查焦点" }] }] },
-      }),
+      [`/api/sessions/${session.id}/branch-runtime`]: (request: Request) => new URL(request.url).search !== "?scope=todo"
+        ? Response.json({ status: "unexpected_scope" }, { status: 400 })
+        : Response.json({
+          status: "ok", leafId: "fixture-leaf", todo: { status: "ok", phases: [{ name: "检查",
+            tasks: [{ status: "in_progress", content: "检查窄屏" }, { status: "pending", content: "复查焦点" }] }] },
+        }),
       [`/api/sessions/${session.id}/native-runtime`]: Response.json({
         tasks: { status: "empty" }, memory: { status: "ok", totalSteps: 0, reflectedSteps: 0 },
-        dag: { status: "ok", limitReached: false, rows: [{
+        dag: { status: "ok", coverage: "native_window", limitReached: false, rows: [{
           status: "running", createdAt: 1795636800000, updatedAt: 1795636800000,
           nodeCount: 2, counts: { running: 1, completed: 1 }, key: "b".repeat(64),
         }] },
       }),
-      [`/api/sessions/${session.id}/native-runtime/dag/${"b".repeat(64)}`]: Response.json({
-        status: "ok", runStatus: "running", waves: [{ index: 0, nodes: [0] }, { index: 1, nodes: [1] }],
-        nodes: [{ id: 0, state: "completed", attempt: 1, upstream: [] },
-          { id: 1, state: "running", attempt: 2, upstream: [0] }],
-      }),
+      [`/api/sessions/${session.id}/native-runtime/dag/${"b".repeat(64)}`]: (request: Request) => new URL(request.url).search !== "?scope=current"
+        ? Response.json({ status: "unexpected_scope" }, { status: 400 })
+        : Response.json({
+          status: "ok", runStatus: "running", waves: [{ index: 0, nodes: [0] }, { index: 1, nodes: [1] }],
+          nodes: [{ id: 0, state: "completed", attempt: 1, upstream: [] },
+            { id: 1, state: "running", attempt: 2, upstream: [0] }],
+        }),
     },
   });
   await using browser = new Bun.WebView({ backend: { type: "chrome", path: chromium ?? undefined, url: false }, width, height });
@@ -602,7 +606,11 @@ browserTest("slash DAG opens a read-only wave view and never sends a model promp
     await visible(browser, "#runtime-dag .dag-wave li");
     expect(await browser.evaluate<string[]>(`[...document.querySelectorAll(".dag-wave li")].map(node => node.textContent)`))
       .toEqual([expect.stringContaining("节点 1"), expect.stringContaining("依赖：节点 1")]);
-    expect(await browser.evaluate(`document.querySelectorAll("#runtime-dag button, #runtime-dag input").length`)).toBe(0);
+    expect(await browser.evaluate(`document.querySelectorAll("#runtime-dag button:not(.dag-graph-node), #runtime-dag input").length`)).toBe(0);
+    await browser.evaluate(`document.querySelector('.dag-graph-node[data-node="1"]').focus()`);
+    await browser.press("Enter");
+    await visible(browser, '[data-node-detail="1"] .runtime-execution[open] > summary');
+    expect(await browser.evaluate(`document.activeElement.matches('[data-node-detail="1"] .runtime-execution > summary:focus-visible')`)).toBe(true);
     expect(actions).toEqual([]);
   });
 });

@@ -1,7 +1,10 @@
 import { el, list, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
 import { knownActivityState, timeText } from "./native-activity.ts";
-import { MAX_DAG_NODES, renderDagGraph } from "./dag-graph.ts";
+import { dagRoster, dagView, taskDetail, taskExecution } from "./dag-readout.ts";
+import type { DagTaskLinks, TaskExecution } from "./dag-readout.ts";
+import { executionTime, runtimeKey } from "./dag-graph.ts";
+import type { DagNode } from "./dag-graph.ts";
 import { tr, uiLocale } from "./locale.ts";
 
 const unavailable = new Map([
@@ -9,6 +12,8 @@ const unavailable = new Map([
   ["binding_unverified", tr("无法验证当前会话的宿主绑定。", "Could not verify which host owns the current session.")],
   ["unsupported", tr("当前宿主或连接方式不支持此读取。", "The current host or connection does not support this read.")],
   ["native_unavailable", tr("宿主未能提供摘要。", "The host could not provide a summary.")],
+  ["native_window_unverified", tr("宿主在读取范围内没有返回匹配的运行。更早的匹配未知。",
+    "The host returned no matching runs within its read window. Older matches are unknown.")],
   ["engine_unavailable", tr("宿主连接忙碌、已断开或读取超时。", "The host is busy, disconnected, or did not respond in time.")],
   ["web_unsupported", tr("当前 Web 服务没有实时摘要入口。", "This Web server does not support live summaries.")],
   ["read_refused", tr("Web 服务未允许此读取，请确认当前会话仍可用。", "The Web server refused this read. Check that the session is still available.")],
@@ -17,7 +22,21 @@ const unavailable = new Map([
 const counts = new Intl.NumberFormat(uiLocale);
 type Pane = "tasks" | "dag";
 type Snapshot = "waiting" | Wire;
-type ReadDag = (key: string) => Promise<Wire>;
+type ReadDag = (key: string, signal: AbortSignal) => Promise<Wire>;
+export type DagRuntimeOptions = {
+  readonly read: ReadDag;
+  readonly links: DagTaskLinks;
+  readonly settled: (key: string, nodes: readonly DagNode[], body: HTMLElement) => void;
+};
+type TaskJump = (key: string) => (() => void) | undefined;
+type PaneOptions = {
+  readonly snapshot?: Snapshot;
+  readonly dag?: DagRuntimeOptions;
+  readonly taskJump?: TaskJump;
+  readonly history?: boolean;
+};
+const currentDagStates = new Set(["pending", "running", "paused"]);
+const terminalDagStates = new Set(["completed", "failed", "cancelled"]);
 
 function count(value: unknown): number | undefined {
   const n = num(value);
@@ -39,65 +58,41 @@ export function canShowSnapshot(data: Wire): boolean {
   return data.status === "unavailable" && data.reason === "unsupported";
 }
 
-const dagKey = /^[a-f0-9]{64}$/u;
+function liveRows(kind: Pane, data: Wire, history: boolean): readonly Wire[] | undefined {
+  if (data.status !== "ok") return;
+  const entries = list(data.rows).map(object);
+  const states = history ? terminalDagStates : currentDagStates;
+  if (!entries.length || entries.length > 256 || !entries.every(row =>
+    knownActivityState(str(row.status)) && executionTime(row.createdAt) !== undefined &&
+    executionTime(row.updatedAt) !== undefined && (kind === "tasks" ||
+      (count(row.nodeCount) !== undefined && states.has(str(row.status)))))) return;
+  if (kind === "tasks" ? count(data.omittedCount) === undefined : data.coverage !== "native_window" ||
+    typeof data.limitReached !== "boolean") return;
+  return entries;
+}
 
-function dagWaves(data: Wire, verified = false): HTMLElement {
+export function runtimeTaskIndex(data: Wire): ReadonlyMap<string, TaskExecution> {
+  const unique = new Map<string, TaskExecution>();
+  const duplicates = new Set<string>();
+  for (const row of liveRows("tasks", data, false) ?? []) {
+    const key = runtimeKey(row.key);
+    if (!key || duplicates.has(key)) continue;
+    if (unique.delete(key)) duplicates.add(key);
+    else unique.set(key, taskExecution(row));
+  }
+  return unique;
+}
+
+function dagLoadError(data: Wire): HTMLElement {
   const content = el("div", "dag-readout stack stack--tight");
-  if (data.status !== "ok") {
-    content.append(el("p", "small muted", data.status === "not_found"
-      ? tr("该运行不在当前列表中，请刷新。", "This run is no longer in the list. Refresh to try again.") : message(data)));
-    return content;
-  }
-  const nodes = new Map(list(data.nodes).slice(0, MAX_DAG_NODES).map(object).flatMap(node => {
-    const id = count(node.id);
-    return id === undefined ? [] : [[id, node] as const];
-  }));
-  for (const raw of list(data.waves).slice(0, MAX_DAG_NODES)) {
-    const wave = object(raw);
-    const index = count(wave.index);
-    if (index === undefined) continue;
-    const section = el("section", "dag-wave stack stack--tight");
-    const items = el("ol", "inline-list numerical");
-    for (const value of list(wave.nodes).slice(0, MAX_DAG_NODES)) {
-      const id = count(value);
-      const node = id === undefined ? undefined : nodes.get(id);
-      if (id === undefined || !node) continue;
-      nodes.delete(id);
-      const upstream = verified ? list(node.upstream).map(count).filter(value => value !== undefined) : [];
-      const route = verified ? str(node.agent) || str(node.category) : "";
-      const state = knownActivityState(str(node.state)) ?? tr("状态未知", "Unknown status");
-      const attempt = count(node.attempt);
-      const line = el("li", "stack stack--tight");
-      line.append(el("p", "small", [tr(`节点 ${counts.format(id + 1)}`, `Node ${counts.format(id + 1)}`), state, route,
-        attempt ? tr(`尝试 ${counts.format(attempt)} 次`, `Attempts: ${counts.format(attempt)}`) : ""].filter(Boolean).join(" · ")));
-      if (upstream.length) line.append(el("p", "small muted", tr(`依赖：${upstream.map(dep => `节点 ${counts.format(dep + 1)}`).join("、")}`,
-        `Depends on: ${upstream.map(dep => `Node ${counts.format(dep + 1)}`).join(", ")}`)));
-      items.append(line);
-    }
-    if (items.childElementCount) {
-      section.append(el("h4", "", tr(`第 ${counts.format(index + 1)} 波`, `Wave ${counts.format(index + 1)}`)), items);
-      content.append(section);
-    }
-  }
-  if (!content.childElementCount) content.append(el("p", "small muted", tr("运行未提供可显示的波次。", "This run did not report any waves to display.")));
+  content.append(el("p", "small muted", data.status === "not_found"
+    ? tr("该运行不在当前列表中，请刷新。", "This run is no longer in the list. Refresh to try again.") : message(data)));
   return content;
 }
 
-function dagView(data: Wire): HTMLElement {
-  if (data.status !== "ok") return dagWaves(data);
-  const graph = renderDagGraph(data);
-  const content = el("div", "dag-graph-view stack stack--tight");
-  if (graph) content.append(graph);
-  else content.append(el("p", "small muted", tr("无法验证完整拓扑；仅显示可识别的节点，不显示依赖连线。",
-    "Could not verify the full graph. Only recognized nodes are shown, without dependency lines.")));
-  const text = el("details", "dag-graph-text");
-  text.open = !graph;
-  text.append(el("summary", "small", tr("文字列表 · 波次与依赖", "Text list · Waves and dependencies")), dagWaves(data, !!graph));
-  content.append(text);
-  return content;
-}
-
-function rows(kind: Pane, data: readonly Wire[], persisted: boolean, readDag?: ReadDag): HTMLElement {
+function rows(kind: Pane, data: readonly Wire[], options: PaneOptions & { readonly taskKeys?: ReadonlyMap<string, TaskExecution> } = {}): HTMLElement {
+  const { dag, taskJump, taskKeys, snapshot } = options;
+  const persisted = snapshot !== undefined;
   const result = el("ol", "inline-list numerical");
   for (const [i, row] of data.entries()) {
     const item = el("li", "stack stack--tight");
@@ -105,44 +100,63 @@ function rows(kind: Pane, data: readonly Wire[], persisted: boolean, readDag?: R
     const created = persisted && kind === "tasks" ? row.startedAt : row.createdAt;
     const updated = persisted && kind === "tasks" ? row.completedAt : row.updatedAt;
     const state = knownActivityState(str(row.status)) ?? tr("状态未知", "Unknown status");
-    const heading = `${kind === "tasks" ? tr("任务", "Task") : tr("运行", "Run")} ${counts.format(i + 1)} · ${state}`;
-    const key = str(row.key);
-    const statusCounts = object(row.counts);
-    const progress = [["completed", tr("完成", "Completed")], ["running", tr("运行中", "Running")],
-      ["failed", tr("失败", "Failed")], ["blocked", tr("阻塞", "Blocked")]].flatMap(([status, label]) => {
-      const value = count(statusCounts[status]);
-      return value ? [`${label} ${counts.format(value)}`] : [];
-    });
-    const recap = nodeCount === undefined ? "" : [
-      tr(`${counts.format(nodeCount)} 个节点`, `${counts.format(nodeCount)} ${nodeCount === 1 ? "node" : "nodes"}`), ...progress].join(" · ");
-    if (readDag && kind === "dag" && !persisted && dagKey.test(key)) {
+    const label = !persisted ? str(kind === "dag" ? row.name : row.title) : "";
+    const title = label || `${kind === "tasks" ? tr("任务", "Task") : tr("运行", "Run")} ${counts.format(i + 1)}`;
+    const heading = `${title} · ${state}`;
+    const key = runtimeKey(row.key);
+    if (kind === "tasks" && !persisted) {
+      item.append(taskDetail(row, [title, state], taskKeys?.has(key) ? { key, openDag: taskJump?.(key) } : undefined));
+      result.append(item);
+      continue;
+    }
+    const recap = nodeCount === undefined ? "" : tr(`${counts.format(nodeCount)} 个节点`,
+      `${counts.format(nodeCount)} ${nodeCount === 1 ? "node" : "nodes"}`);
+    const roster = nodeCount !== undefined && !persisted ? dagRoster(nodeCount, object(row.counts)) : [];
+    if (dag && kind === "dag" && !persisted && key) {
       const details = el("details", "dag-run");
       details.dataset.dagKey = key;
       const body = el("div", "dag-content");
       const loading = el("p", "small muted", tr("正在读取波次与依赖…", "Loading waves and dependencies…"));
       loading.setAttribute("role", "status");
-      details.append(el("summary", "", [heading, recap].filter(Boolean).join(" · ")), body);
-      let reading = false;
+      const summary = el("summary");
+      summary.append(el("strong", "", title), ` · ${[state, recap].filter(Boolean).join(" · ")}`, ...roster);
+      details.append(summary, body);
+      let request: AbortController | undefined;
       let loaded = false;
       details.addEventListener("toggle", () => {
-        if (!details.open || reading || loaded) return;
-        reading = true;
+        if (!details.open) {
+          request?.abort();
+          request = undefined;
+          return;
+        }
+        if (request || loaded || !details.isConnected) return;
+        const run = request = new AbortController();
+        const live = () => request === run && details.isConnected && details.open;
         body.replaceChildren(loading);
-        void readDag(key).then(data => {
-          if (details.isConnected) body.replaceChildren(dagView(data));
+        void dag.read(key, run.signal).then(data => {
+          if (!live()) return;
+          const view = data.status === "ok" ? dagView(data, dag.links, label) : undefined;
+          body.replaceChildren(view?.root ?? dagLoadError(data));
           loaded = data.status === "ok";
+          dag.settled(key, view?.nodes ?? [], body);
         }, (error: unknown) => {
           if (error instanceof DOMException && error.name === "AbortError") return;
-          if (details.isConnected) body.replaceChildren(dagWaves({ status: "unavailable", reason: "read_failed" }));
-        }).finally(() => { reading = false; });
+          if (live()) {
+            body.replaceChildren(dagLoadError({ status: "unavailable", reason: "read_failed" }));
+            dag.settled(key, [], body);
+          }
+        }).finally(() => { if (request === run) request = undefined; });
       });
       item.append(details);
     } else {
       item.append(el("p", "metric-label small", heading));
       if (recap) item.append(el("p", "small muted", recap));
+      if (roster.length) {
+        const progress = el("p", "break numerical");
+        progress.append(...roster);
+        item.append(progress);
+      }
     }
-    const route = kind === "tasks" && !persisted && [str(row.agent), str(row.category), str(row.executionMode)].filter(Boolean).join(" · ");
-    if (route) item.append(el("p", "small muted", route));
     if (num(created) !== undefined) {
       item.append(el("p", "small muted", persisted && kind === "tasks"
         ? tr(`开始：${timeText(created)}`, `Started: ${timeText(created)}`) : tr(`创建：${timeText(created)}`, `Created: ${timeText(created)}`)));
@@ -166,7 +180,7 @@ function snapshotSection(kind: Pane, snapshot: Snapshot): HTMLElement {
   } else if (snapshot.status === "ok") {
     const entries = list(kind === "tasks" ? snapshot.tasks : snapshot.runs).map(object);
     section.append(el("p", "small muted", tr(`保存时间：${timeText(snapshot.updatedAt)} · 非实时`, `Saved: ${timeText(snapshot.updatedAt)} · Not live`)));
-    section.append(entries.length ? rows(kind, entries, true) : el("p", "small muted",
+    section.append(entries.length ? rows(kind, entries, { snapshot }) : el("p", "small muted",
       tr("快照没有此类记录，不代表当前没有。", "No matching records in the snapshot. There may still be live activity.")));
   } else {
     section.append(el("p", "small muted", tr("没有可读取的快照。", "No readable snapshot.")));
@@ -174,32 +188,30 @@ function snapshotSection(kind: Pane, snapshot: Snapshot): HTMLElement {
   return section;
 }
 
-export function renderRuntimePane(kind: Pane, data?: Wire, snapshot?: Snapshot, readDag?: ReadDag): HTMLElement[] {
+export function renderRuntimePane(kind: Pane, data?: Wire, { snapshot, dag, taskJump, history = false }: PaneOptions = {}): HTMLElement[] {
   const section = el("section", "subpanel stack stack--tight");
-  section.append(el("h3", "", kind === "tasks" ? tr("子代理任务", "Subagent tasks") : tr("DAG 运行", "DAG runs")),
+  if (!history) section.append(el("h3", "", kind === "tasks" ? tr("子代理任务", "Subagent tasks") : tr("当前 DAG 运行", "Current DAG runs")),
     el("p", "metric-label small", tr("实时宿主 · 只读", "Live host · Read-only")));
   const status = el("p", "small muted");
   status.setAttribute("role", "status");
   section.append(status);
   if (!data) {
-    status.textContent = tr("正在读取宿主摘要…", "Loading host summary…");
-  } else if (data.status === "empty") {
-    status.textContent = kind === "tasks" ? tr("宿主报告当前没有子代理任务。", "The host reports no current subagent tasks.")
-      : tr("宿主报告当前没有 DAG 运行。", "The host reports no current DAG runs.");
+    status.textContent = history ? tr("正在读取已结束的 DAG 运行…", "Loading finished DAG runs…")
+      : tr("正在读取宿主摘要…", "Loading host summary…");
+  } else if (data.status === "empty" && kind === "tasks") {
+    status.textContent = tr("宿主报告当前没有子代理任务。", "The host reports no current subagent tasks.");
   } else if (data.status === "ok") {
-    const entries = list(data.rows).map(object);
+    const entries = liveRows(kind, data, history);
     const omitted = count(data.omittedCount);
-    if (entries.length && entries.length <= 256 &&
-      entries.every(row => knownActivityState(str(row.status)) && num(row.createdAt) !== undefined &&
-        num(row.updatedAt) !== undefined && (kind !== "dag" || count(row.nodeCount) !== undefined)) &&
-      (kind === "tasks" ? omitted !== undefined : typeof data.limitReached === "boolean")) {
+    if (entries) {
       status.textContent = tr(`读到 ${counts.format(entries.length)} 条摘要。`,
         `${counts.format(entries.length)} ${entries.length === 1 ? "summary" : "summaries"} loaded.`);
-      section.append(rows(kind, entries, false, readDag));
+      section.append(rows(kind, entries, { dag, taskJump, taskKeys: kind === "tasks" ? runtimeTaskIndex(data) : undefined }));
       if (kind === "tasks" && omitted) section.append(el("p", "small muted", tr(`宿主另有 ${counts.format(omitted)} 条未返回。`,
         `The host omitted ${counts.format(omitted)} ${omitted === 1 ? "additional entry" : "additional entries"}.`)));
-      if (kind === "dag" && data.limitReached) section.append(el("p", "small muted",
-        tr("本次读取已达上限，不代表还有下一页。", "The read limit was reached. It is not known whether there are more runs.")));
+      if (kind === "dag") section.append(el("p", "small muted",
+        tr("宿主最多检查最近 256 次运行再筛选，更早的匹配可能未显示。",
+          "The host checks up to 256 recent runs before filtering. Older matches may not appear.")));
     } else status.textContent = message({});
   } else {
     status.textContent = message(data);

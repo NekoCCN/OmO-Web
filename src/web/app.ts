@@ -8,10 +8,13 @@ import { Transcript, messageKey, roleOf } from "./transcript.ts";
 import type { ToolTrace, TranscriptEntry } from "./transcript.ts";
 import { readPage, readTranscriptStatus, TranscriptHistory } from "./transcript-history.ts";
 import type { TranscriptStatus } from "./transcript-history.ts";
-import { branchDialog, createDetailsQueue, refreshDetailsActivity, renderDetails, renderDetailsBranch } from "./details.ts";
+import { branchDialog, createDetailsQueue, refreshDetailsActivity, renderDetails, renderDetailsBranch, renderDetailsBranchMemory,
+  renderTodoHistory } from "./details.ts";
 import { createDetailsTree, isStaleTree } from "./details-tree.ts";
 import { renderCapabilities, renderLocalCompatibility } from "./capabilities.ts";
-import { canShowSnapshot, renderJournal, renderRuntimePane } from "./runtime-summary.ts";
+import { canShowSnapshot, renderJournal, renderRuntimePane, runtimeTaskIndex } from "./runtime-summary.ts";
+import type { DagRuntimeOptions } from "./runtime-summary.ts";
+import { focusExecution, revealDagNode } from "./dag-readout.ts";
 import { cliHistory } from "./cli-history.ts";
 import { cliLive } from "./cli-live.ts";
 import { cliFollow } from "./cli-follow.ts";
@@ -136,14 +139,6 @@ let unprotected = false;
 let bootError = "";
 let listError = "";
 let sessions = new Map<string, Session>();
-type CliRow = { readonly id: string; readonly name: string; readonly cwd: string; readonly updatedAt: number };
-let cliRows: readonly CliRow[] = [];
-let cliError = "";
-// Never fetched: the first update after bootstrap must not be throttled.
-let cliAt = Number.NEGATIVE_INFINITY;
-let cliSeq = 0;
-const CLI_REFRESH_MS = 30_000;
-const cliTime = new Intl.DateTimeFormat(uiLocale, { dateStyle: "medium", timeStyle: "short" });
 let workspaces: readonly string[] = [];
 let workspaceRevision = 0;
 let windowsWorkspaceLabels = false;
@@ -188,7 +183,6 @@ const openBranch = (source: BranchSource) => {
 const follow = cliFollow(api, hasDirectory, () => {
   if (follow.active) current?.history?.invalidate();
   renderSessions();
-  renderCliSessions();
   renderView();
   if (current?.history) renderMessages(current);
 });
@@ -199,21 +193,39 @@ const browser = workspaceBrowser(api, () => ({ roots: workspaces, selected: next
   else btn("workspace-browser-button").focus();
 });
 let leavingHistory = false;
-const history = cliHistory(api, () => {
-  if (!leavingHistory && !document.querySelector("dialog:modal")) focusCliLauncher("cli-history-button");
-  leavingHistory = false;
-}, openBranch, historyResumeUnavailable, (session, show) => {
-  // Adoption changed: a CLI journal gained (or will gain) a Web alias.
-  void fetchCliRows(true);
-  if (!show) { void fetchSessions(); return; }
+let historyOpener = "cli-history-button";
+function enterPickedSession(session: Session, focusComposer: boolean): void {
   leavingHistory = true;
   dialog("cli-history-dialog").close();
   archived = session.archived;
-  if (releases.get(session.id)?.status === "pending" && current?.session.id === session.id) markInactive(current);
-  releases.delete(session.id);
-  remember(session);
-  openSession(session.id, true);
-}, hasDirectory);
+  if (directoryFilter && directoryFilter !== session.cwd) filterDirectory("");
+  openSession(session.id, focusComposer);
+}
+const history = cliHistory(api, {
+  scope: () => ({ paths: workspaces, browse: !btn("workspace-browser-button").hidden }),
+  directoryLabel: workspaceLabel,
+  bookmarks: () => sessions.values(),
+  onDirectory: cwd => { nextCreationDirectory = cwd; },
+  browse: onDismiss => browser.open(onDismiss),
+  onClose: () => {
+    if (!leavingHistory && !document.querySelector("dialog:modal")) {
+      if (historyOpener === "prompt" && prompt.getClientRects().length) prompt.focus();
+      else focusCliLauncher(historyOpener === "workspace-browser-button" && !btn(historyOpener).hidden ? historyOpener : "cli-history-button");
+    }
+    historyOpener = "cli-history-button";
+    leavingHistory = false;
+  },
+  openBookmark: session => enterPickedSession(session, false),
+  openBranch,
+  resumeUnavailable: historyResumeUnavailable,
+  onResumed: (session, show) => {
+    if (!hasDirectory(session.cwd)) return;
+    if (releases.get(session.id)?.status === "pending" && current?.session.id === session.id) markInactive(current);
+    releases.delete(session.id);
+    remember(session);
+    if (show) enterPickedSession(session, true);
+  },
+});
 
 function handoffReason(reason: unknown): string {
   switch (reason) {
@@ -279,6 +291,7 @@ function invalidateHistory(view: View): void {
 function invalidateHistoryOnConnectionChange(view: View): void {
   const hadHistory = Boolean(view.history);
   invalidateHistory(view);
+  if (view === current) invalidateNativeBinding();
   if (hadHistory) {
     view.messages = [];
     view.liveMessageKeys.clear();
@@ -297,7 +310,6 @@ function enterBranch(session: Session, editorText: string, source: BranchSource)
   archived = false;
   draftFor(session.id).text = editorText;
   remember(session);
-  void fetchCliRows(true);
   openSession(session.id, true);
 }
 
@@ -451,66 +463,9 @@ function updateConnection(): void {
   btn("create").disabled = !available || createPending;
   history.update();
   renderSessions();
-  // CLI discovery refreshes on every connection-level update (throttled),
-  // so newly CLI-created journals appear without opening the history dialog.
-  void fetchCliRows();
-  renderCliSessions();
   renderView();
   if (current?.history) renderMessages(current);
   if (!wasOnline && connection === "online" && current && (current.stateRefresh || current.transcriptRefresh)) scheduleSnapshot(current);
-}
-
-async function fetchCliRows(force = false): Promise<void> {
-  // The sidebar list is only meaningful once bootstrap has provided the token
-  // and workspace state; earlier connection updates must not spend a fetch.
-  if (!bootstrapped) return;
-  if (!force && performance.now() - cliAt < CLI_REFRESH_MS) return;
-  const ticket = ++cliSeq;
-  cliAt = performance.now();
-  try {
-    const data = await api.request("/api/cli-history");
-    if (ticket !== cliSeq) return;
-    cliError = data.available === true ? "" : tr("没有可读取的 CLI 历史。", "No CLI history is available.");
-    cliRows = data.available === true ? list(data.sessions).map(object).flatMap(row => {
-      const id = str(row.id);
-      // Adopted rows already appear as Web aliases above; the sidebar only
-      // discovers journals without one. Previewing one never opens a route,
-      // and entering still goes through explicit resume under holder admission.
-      return id && row.adopted !== true
-        ? [{ id, name: str(row.name) || tr("未命名 CLI 会话", "Untitled CLI session"), cwd: str(row.cwd), updatedAt: num(row.updatedAt) ?? 0 }] : [];
-    }) : [];
-  } catch (error) {
-    if (ticket !== cliSeq) return;
-    cliError = tr(`无法读取 CLI 历史：${errorText(error)}`, `Couldn't load CLI history: ${errorText(error)}`);
-  }
-  renderCliSessions();
-}
-
-function renderCliSessions(): void {
-  const section = box("cli-sessions");
-  const host = box("cli-session-list");
-  const focused = document.activeElement instanceof HTMLButtonElement && host.contains(document.activeElement)
-    ? document.activeElement.dataset.cliSession : undefined;
-  const query = inp("search").value.trim().toLocaleLowerCase();
-  const matches = archived ? [] : cliRows
-    .filter(row => matchesDirectoryFilter(row.cwd) && (!query || `${row.name} ${row.cwd}`.toLocaleLowerCase().includes(query)))
-    .sort((a, b) => b.updatedAt - a.updatedAt);
-  section.hidden = matches.length === 0 && !cliError;
-  host.replaceChildren();
-  for (const row of matches) {
-    const item = el("li");
-    const open = button("", () => openCliHistory(row.id), "button--quiet session-link");
-    open.dataset.cliSession = row.id;
-    const stamp = Number.isFinite(new Date(row.updatedAt).getTime()) ? cliTime.format(row.updatedAt) : "";
-    const path = el("span", "small muted path", workspaceLabel(row.cwd));
-    path.title = row.cwd;
-    open.append(el("span", "", row.name), path, el("small", "", stamp));
-    item.append(open);
-    host.append(item);
-  }
-  host.hidden = !matches.length;
-  notice(box("cli-list-empty"), matches.length ? "" : cliError || (bootstrapped ? tr("没有本机 CLI 会话。", "No local CLI sessions.") : ""));
-  if (focused) [...host.querySelectorAll("button")].find(row => row.dataset.cliSession === focused)?.focus({ preventScroll: true });
 }
 
 function applySessions(items: readonly Session[]): void {
@@ -592,10 +547,9 @@ function filterDirectory(cwd: string): void {
   directoryFilter = cwd;
   renderWorkspace();
   renderSessions();
-  renderCliSessions();
 }
 
-function selectBrowsedWorkspace(cwd: string, roots: readonly string[]): void {
+function selectBrowsedWorkspace(cwd: string, roots: readonly string[], fromSidebar: boolean): void {
   workspaceRevision++;
   workspaces = roots;
   nextCreationDirectory = hasDirectory(cwd) ? cwd : "";
@@ -604,10 +558,10 @@ function selectBrowsedWorkspace(cwd: string, roots: readonly string[]): void {
   follow.recheckWorkspace();
   renderWorkspace();
   live.scopeChanged();
-  // The dialog's close handler restores focus using the updated drawer state.
-  toggleNav(false);
+  history.scopeChanged();
+  if (fromSidebar) historyOpener = "workspace-browser-button";
+  openCliHistory(cwd);
   void fetchSessions();
-  void fetchCliRows(true);
   updateConnection();
 }
 
@@ -633,6 +587,7 @@ async function bootstrap(reconcile = false): Promise<void> {
     if (directoryFilter && !hasDirectory(directoryFilter)) directoryFilter = "";
     if (nextCreationDirectory && !hasDirectory(nextCreationDirectory)) nextCreationDirectory = "";
     browser.update(fileBrowser, tokenChanged);
+    history.scopeChanged(tokenChanged);
     if (current && !workspaces.includes(current.session.cwd)) clearCurrentView();
     follow.recheckWorkspace();
     renderWorkspace();
@@ -703,41 +658,66 @@ function renderSessions(): void {
   const focused = document.activeElement instanceof HTMLElement && host.contains(document.activeElement) ? document.activeElement.dataset.session : undefined;
   const items = [...sessions.values()].filter(item => matchesDirectoryFilter(item.cwd) && item.archived === archived && (!query || `${item.name} ${item.cwd}`.toLocaleLowerCase().includes(query)))
     .sort((a, b) => b.updatedAt - a.updatedAt);
-  const existing = new Map([...host.children].flatMap(node => node instanceof HTMLLIElement && node.dataset.session ? [[node.dataset.session, node] as const] : []));
-  let next = host.firstElementChild;
-  for (const session of items) {
-    let li = existing.get(session.id);
-    if (!li) {
-      li = el("li");
-      li.dataset.session = session.id;
-      const row = button("", () => openSession(session.id), "button--quiet session-link");
-      row.dataset.session = session.id;
-      row.append(el("span"), el("span", "small muted path"), el("small"));
-      li.append(row);
+  const groups = new Map<string, Session[]>();
+  for (const item of items) {
+    const group = groups.get(item.cwd);
+    if (group) group.push(item);
+    else groups.set(item.cwd, [item]);
+  }
+  const priorGroups = new Map([...host.querySelectorAll<HTMLElement>(":scope > .session-group")].map(node => [node.dataset.cwd, node]));
+  const priorRows = new Map([...host.querySelectorAll<HTMLLIElement>("li[data-session]")].map(node => [node.dataset.session, node]));
+  let nextGroup = host.firstElementChild;
+  for (const [cwd, group] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+    const section = priorGroups.get(cwd) ?? el("section", "session-group");
+    const heading = section.querySelector("h2") ?? el("h2", "session-group-heading");
+    const path = section.querySelector("p") ?? el("p", "small muted path session-group-path", cwd);
+    const rows = section.querySelector("ul") ?? el("ul");
+    const label = workspaceLabel(cwd);
+    if (heading.textContent !== label) heading.textContent = label;
+    path.hidden = label === cwd;
+    if (!section.isConnected) {
+      section.dataset.cwd = cwd;
+      path.dir = "ltr";
+      path.title = cwd;
+      section.append(heading, path, rows);
     }
-    const row = li.firstElementChild;
-    if (row instanceof HTMLButtonElement) {
-      row.firstElementChild && (row.firstElementChild.textContent = session.name);
-      const path = row.children.item(1);
-      if (path instanceof HTMLElement) { path.textContent = workspaceLabel(session.cwd); path.title = session.cwd; path.hidden = !session.cwd; }
+    if (section !== nextGroup) host.insertBefore(section, nextGroup);
+    nextGroup = section.nextElementSibling;
+    priorGroups.delete(cwd);
+    let nextRow = rows.firstElementChild;
+    for (const session of group) {
+      const li = priorRows.get(session.id) ?? el("li");
+      const row = li.querySelector("button") ?? button("", () => openSession(session.id), "button--quiet session-link");
+      if (!row.parentElement) {
+        li.dataset.session = row.dataset.session = session.id;
+        row.append(el("span"), el("small"));
+        li.append(row);
+      }
+      const name = row.firstElementChild;
+      if (name && name.textContent !== session.name) name.textContent = row.title = session.name;
       const stamp = row.lastElementChild;
-      if (stamp) stamp.textContent = releases.get(session.id)?.status === "released" ? tr("已释放", "Released")
+      const status = releases.get(session.id)?.status === "released" ? tr("已释放", "Released")
         : session.running ? tr("运行中", "Running") : session.settled ? tr("已结清", "Done")
           : session.active ? tr("已打开", "Open") : tr("待恢复", "Resume");
+      if (stamp && stamp.textContent !== status) stamp.textContent = status;
       if (!follow.active && session.id === current?.session.id) row.setAttribute("aria-current", "true");
       else row.removeAttribute("aria-current");
+      if (li !== nextRow) rows.insertBefore(li, nextRow);
+      nextRow = li.nextElementSibling;
+      priorRows.delete(session.id);
     }
-    if (li !== next) host.insertBefore(li, next);
-    next = li.nextElementSibling;
-    existing.delete(session.id);
   }
-  for (const node of existing.values()) node.remove();
-  if (focused && !items.some(item => item.id === focused)) inp("search").focus();
+  for (const node of priorGroups.values()) node.remove();
+  for (const node of priorRows.values()) node.remove();
+  if (focused && document.activeElement === document.body) {
+    ([...host.querySelectorAll("button")].find(row => row.dataset.session === focused) ?? inp("search")).focus({ preventScroll: true });
+  }
   notice(box("list-empty"), items.length ? "" : query ? tr("没有匹配的会话", "No matching sessions")
     : !bootstrapped ? bootError ? tr("暂时无法读取会话", "Couldn't load sessions") : tr("正在读取会话…", "Loading sessions…")
       : archived ? tr("没有已归档的会话", "No archived sessions") : tr("还没有最近会话", "No recent sessions"));
   btn("recent").setAttribute("aria-pressed", String(!archived));
   btn("archived").setAttribute("aria-pressed", String(archived));
+  history.renderBookmarks();
 }
 
 function openSession(id: string, focusComposer = false, focusConversation = true): void {
@@ -1635,6 +1615,7 @@ function onEvent(event: Wire): void {
       scheduleSnapshot(view);
       break;
     case "session_replaced":
+      resetRuntimeHistories();
       resetTranscriptBinding(view);
       view.status = "loading";
       view.running = false;
@@ -1870,7 +1851,8 @@ async function runBuiltin(view: View, command: BuiltinCommand, fail: (text: stri
       return chooser.open;
     case "resume":
     case "sessions":
-      btn("cli-history-button").click();
+      historyOpener = "prompt";
+      openCliHistory();
       return dialog("cli-history-dialog").open;
     case "name":
     case "rename":
@@ -2019,6 +2001,11 @@ async function runAction(view: View, action: Action, label: string, onError: (te
     after?.(data);
     if (action.action === "navigate") {
       if (object(data.result).cancelled === true) return false;
+      resetRuntimeHistories();
+      branchRequest?.abort();
+      branchRequest = undefined;
+      branchData = undefined;
+      memoryData = undefined;
       detailsTree?.invalidate();
       resetTranscriptBinding(view);
       workbenchRequest?.abort();
@@ -2119,7 +2106,6 @@ async function releaseToCli(view: View): Promise<void> {
     if (releases.get(id) !== attempt) return;
     releases.set(id, { status: "released", command });
     remember(session);
-    void fetchCliRows(true);
     const target = selected();
     if (target) finish(target, "handoff-title");
   } catch (error) {
@@ -2313,13 +2299,20 @@ async function openCommandPicker(view: View, help = false): Promise<void> {
 let detailsRequest: AbortController | undefined;
 let runtimeRequest: AbortController | undefined;
 let branchRequest: AbortController | undefined;
+let memoryRequest: AbortController | undefined;
 let dagRequest: AbortController | undefined;
 let activityRequest: AbortController | undefined;
 let detailsTree: ReturnType<typeof createDetailsTree> | undefined;
 let detailsQueue: ReturnType<typeof createDetailsQueue> | undefined;
 let overviewDirty = false;
 let branchData: Wire | undefined;
-let nativeData: { tasks: Wire; dag: Wire; memory: Wire; snapshot?: Wire } | undefined;
+let memoryData: Wire | undefined;
+let nativeData: { tasks: Wire; dag: Wire; memory: Wire; taskIndex: ReturnType<typeof runtimeTaskIndex>; snapshot?: Wire } | undefined;
+type DagScope = "current" | "history";
+type DagTarget = { readonly scope: DagScope; readonly key: string; readonly node: number; readonly taskKey: string };
+const observedDagNodes = { current: new Map<string, readonly DagTarget[]>(), history: new Map<string, readonly DagTarget[]>() };
+let dagReveal: DagTarget | undefined;
+let dagJumpError = false;
 let detailsOpener: HTMLElement | undefined;
 type DetailReveal = "tree" | "todo";
 let detailReveal: DetailReveal | undefined;
@@ -2332,6 +2325,54 @@ const branchSelected = () => !box("runtime-todo").hidden;
 const memoryDisclosure = () => byId("runtime-memory-branch", HTMLDetailsElement);
 const nativePanel = () => !box("runtime-subagent").hidden ? "tasks" : !box("runtime-dag").hidden ? "dag"
   : branchSelected() && memoryDisclosure().open ? "memory" : undefined;
+const historyKinds = ["todo", "dag"] as const;
+type RuntimeHistory = typeof historyKinds[number];
+const historyRequests: Partial<Record<RuntimeHistory, AbortController>> = {};
+const historyDisclosure = (kind: RuntimeHistory) => byId(`runtime-${kind}-history`, HTMLDetailsElement);
+const historyBody = (kind: RuntimeHistory) => historyDisclosure(kind).querySelector<HTMLElement>(".fold-body")!;
+const historyVisible = (kind: RuntimeHistory) => inspector.open && !box(`runtime-${kind}`).hidden && historyDisclosure(kind).open;
+
+function resetRuntimeHistory(kind: RuntimeHistory): void {
+  if (kind === "dag" && dagReveal?.scope === "history") dagReveal = undefined;
+  historyRequests[kind]?.abort();
+  delete historyRequests[kind];
+  const disclosure = historyDisclosure(kind);
+  const summary = disclosure.querySelector("summary");
+  if (historyBody(kind).contains(document.activeElement) && summary?.getClientRects().length) {
+    summary.focus({ preventScroll: true });
+  }
+  disclosure.open = false;
+  historyBody(kind).replaceChildren();
+}
+
+function resetDagAssociations(): void {
+  observedDagNodes.current.clear();
+  observedDagNodes.history.clear();
+  dagReveal = undefined;
+  if (dagJumpError) {
+    notice(box("details-error"));
+    dagJumpError = false;
+  }
+}
+
+function resetRuntimeHistories(): void {
+  for (const kind of historyKinds) resetRuntimeHistory(kind);
+  resetDagAssociations();
+}
+
+function invalidateNativeBinding(): void {
+  runtimeRequest?.abort();
+  dagRequest?.abort();
+  activityRequest?.abort();
+  runtimeRequest = dagRequest = activityRequest = undefined;
+  nativeData = undefined;
+  resetDagAssociations();
+  if (!inspector.open) return;
+  resetRuntimeHistory("dag");
+  const status = { status: "unavailable", reason: "binding_unverified" };
+  replaceRuntimeRuns(box("runtime-dag-current"), renderRuntimePane("dag", status));
+  replaceRuntimeRuns(box("runtime-subagent"), renderRuntimePane("tasks", status));
+}
 
 function syncDetailsRefresh(): void {
   const refresh = btn("details-refresh");
@@ -2385,8 +2426,13 @@ function loadCapabilities(view: View): void {
   });
 }
 
-function selectDetailsView(tab: HTMLButtonElement): void {
+function selectDetailsView(tab: HTMLButtonElement, load = true): void {
   if (tab.getAttribute("aria-selected") === "true") return;
+  dagReveal = undefined;
+  if (dagJumpError) {
+    notice(box("details-error"));
+    dagJumpError = false;
+  }
   for (const button of detailsTabs()) {
     const selected = button === tab;
     button.setAttribute("aria-selected", String(selected));
@@ -2395,9 +2441,10 @@ function selectDetailsView(tab: HTMLButtonElement): void {
     if (target) box(target).hidden = !selected;
     if (target === "runtime-todo" && !selected) resetProjectRules();
   }
+  for (const kind of historyKinds) if (box(`runtime-${kind}`).hidden) resetRuntimeHistory(kind);
   box("details-scroll").scrollTop = 0;
   detailReveal = undefined;
-  if (inspector.open && current?.status === "ready") loadDetails(current);
+  if (load && inspector.open && current?.status === "ready") loadDetails(current);
   syncDetailsRefresh();
 }
 
@@ -2433,7 +2480,8 @@ function openDetails(tab = "overview", opener: HTMLElement = btn("details-button
 function showDetails(view: View): void {
   notice(box("details-error"));
   overviewDirty = false;
-  for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities, #runtime-todo)')) panel.replaceChildren();
+  for (const panel of inspector.querySelectorAll('[role="tabpanel"]:not(#runtime-capabilities, #runtime-todo, #runtime-dag)')) panel.replaceChildren();
+  box("runtime-dag-current").replaceChildren();
   box("runtime-todo").querySelector("[data-runtime-branch]")?.remove();
   box("runtime-memory-journal").replaceChildren();
   box("runtime-memory-branch-content").replaceChildren();
@@ -2496,6 +2544,8 @@ function closeDetails(restoreFocus = true): void {
   runtimeRequest = undefined;
   branchRequest?.abort();
   branchRequest = undefined;
+  memoryRequest?.abort();
+  memoryRequest = undefined;
   dagRequest?.abort();
   dagRequest = undefined;
   activityRequest?.abort();
@@ -2505,7 +2555,9 @@ function closeDetails(restoreFocus = true): void {
   detailsQueue?.deactivate();
   detailsQueue = undefined;
   branchData = undefined;
+  memoryData = undefined;
   nativeData = undefined;
+  resetRuntimeHistories();
   resetProjectRules();
   if (current) current.detailData = undefined;
   detailReveal = undefined;
@@ -2598,19 +2650,210 @@ function loadDetailStats(view: View): void {
 function loadBranchDetails(view: View): void {
   branchRequest?.abort();
   const request = branchRequest = new AbortController();
+  historyRequests.todo?.abort();
+  delete historyRequests.todo;
   const live = () => request === branchRequest && inspector.open && branchSelected() && current === view;
   if (!branchData) renderDetailsBranch({ status: "loading" });
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
+  void api.request(`${sessionPath(view.session.id)}/branch-runtime?scope=todo`, undefined, signal).catch((): Wire => ({
+    status: "unavailable", reason: "read_failed",
+  })).then(data => {
+    if (!live()) return;
+    branchRequest = undefined;
+    const previousLeaf = todoLeaf(branchData);
+    const leaf = todoLeaf(data);
+    if (previousLeaf !== undefined && leaf !== undefined && previousLeaf !== leaf) resetRuntimeHistories();
+    branchData = data;
+    if (leaf !== undefined) detailsTree?.checkLeaf(leaf);
+    renderDetailsBranch(data);
+    revealDetailsTarget();
+    if (historyVisible("todo")) loadRuntimeHistory(view, "todo");
+  }).finally(() => {
+    if (branchRequest === request) branchRequest = undefined;
+  });
+}
+
+function todoLeaf(data?: Wire): string | null | undefined {
+  if (data?.status === "ok" && (typeof data.leafId === "string" || data.leafId === null)) return data.leafId;
+}
+
+function loadBranchMemory(view: View): void {
+  memoryRequest?.abort();
+  const request = memoryRequest = new AbortController();
+  if (!memoryData) renderDetailsBranchMemory({ status: "loading" });
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
   void api.request(`${sessionPath(view.session.id)}/branch-runtime`, undefined, signal).catch((): Wire => ({
     status: "unavailable", reason: "read_failed",
   })).then(data => {
+    if (request !== memoryRequest || !inspector.open || nativePanel() !== "memory" || current !== view) return;
+    memoryData = data;
+    renderDetailsBranchMemory(data);
+  }).finally(() => { if (memoryRequest === request) memoryRequest = undefined; });
+}
+
+function replaceRuntimeRuns(host: HTMLElement, contents: readonly HTMLElement[], restore = true): void {
+  const rows = ".dag-run, .task-run";
+  const keyOf = (node: HTMLElement) => node.dataset.dagKey ?? node.dataset.taskKey;
+  const opened = new Set([...host.querySelectorAll<HTMLDetailsElement>(rows)].filter(row => row.open).flatMap(row => keyOf(row) || []));
+  const active = document.activeElement;
+  const focused = host.contains(active) ? active?.closest<HTMLElement>(rows) : undefined;
+  const focusedKey = focused && keyOf(focused);
+  host.replaceChildren(...contents);
+  let nextFocus: HTMLElement | null = null;
+  for (const run of host.querySelectorAll<HTMLDetailsElement>(rows)) {
+    const key = keyOf(run);
+    if (key && restore && opened.has(key)) run.open = true;
+    if (key && key === focusedKey) nextFocus = run.querySelector("summary");
+  }
+  if (focused && document.activeElement === document.body) {
+    (nextFocus ?? host.closest("details")?.querySelector("summary") ??
+      host.closest<HTMLElement>('[role="tabpanel"]'))?.focus({ preventScroll: true });
+  }
+}
+
+function reportExpiredDagLink(): void {
+  dagReveal = undefined;
+  dagJumpError = true;
+  const status = box("details-error");
+  notice(status, tr("该 DAG 节点关联已无法核验。可打开相应运行查看最新详情。",
+    "This DAG node link is no longer verified. Open the run to see its latest details."));
+  if (document.activeElement === btn("runtime-open-dag")) status.scrollIntoView({ block: "start" });
+}
+
+function openRevealedDag(host: HTMLElement, scope: DagScope): void {
+  const target = dagReveal;
+  if (!target || target.scope !== scope) return;
+  const run = host.querySelector<HTMLDetailsElement>(`.dag-run[data-dag-key="${target.key}"]`);
+  if (!run) {
+    reportExpiredDagLink();
+    return;
+  }
+  run.open = true;
+  if (document.activeElement === btn("runtime-open-dag")) run.scrollIntoView({ block: "start" });
+}
+
+function openLinkedDag(view: View, target: DagTarget): void {
+  if (current !== view || !inspector.open || nativePanel() !== "tasks" || !nativeData?.taskIndex.has(target.taskKey)
+      || !observedDagNodes[target.scope].get(target.key)?.includes(target)) return;
+  const tab = btn("runtime-open-dag");
+  selectDetailsView(tab, false);
+  dagReveal = target;
+  tab.focus({ preventScroll: true });
+  renderNativeDetails(view);
+  if (target.scope === "history") {
+    const history = historyDisclosure("dag");
+    history.open = true;
+    history.scrollIntoView({ block: "start" });
+  }
+}
+
+function taskDagTargets(): ReadonlyMap<string, DagTarget | null> {
+  const result = new Map<string, DagTarget | null>();
+  for (const runs of Object.values(observedDagNodes)) {
+    for (const nodes of runs.values()) for (const target of nodes) {
+      result.set(target.taskKey, result.has(target.taskKey) ? null : target);
+    }
+  }
+  return result;
+}
+
+function scopedDagOptions(view: View, scope: DagScope, parent: AbortSignal): DagRuntimeOptions {
+  return {
+    read: async (key, row) => {
+      const signal = AbortSignal.any([parent, row, AbortSignal.timeout(28_000)]);
+      signal.throwIfAborted();
+      const data = await api.request(`${sessionPath(view.session.id)}/native-runtime/dag/${key}?scope=${scope}`, undefined, signal);
+      signal.throwIfAborted();
+      return data;
+    },
+    links: {
+      task: key => nativeData?.taskIndex.get(key),
+      openTask: key => {
+        if (view !== current || !inspector.open || nativePanel() !== "dag" || !nativeData?.taskIndex.has(key)) return;
+        selectDetailsView(btn("runtime-open-subagents"));
+        if (runtimeRequest) renderNativeDetails(view);
+        const row = box("runtime-subagent").querySelector<HTMLDetailsElement>(`.task-run[data-task-key="${key}"]`);
+        const summary = row?.querySelector("summary");
+        if (row && summary) {
+          row.open = true;
+          focusExecution(summary);
+        }
+      },
+    },
+    settled: (key, nodes, body) => {
+      if (view !== current || !inspector.open || nativePanel() !== "dag" || parent.aborted) return;
+      const routes = nodes.flatMap(node => node.taskKey && nativeData?.taskIndex.has(node.taskKey)
+        ? [{ scope, key, node: node.id, taskKey: node.taskKey }] : []);
+      if (nodes.length) observedDagNodes[scope === "current" ? "history" : "current"].delete(key);
+      if (routes.length) observedDagNodes[scope].set(key, routes);
+      else observedDagNodes[scope].delete(key);
+      const target = dagReveal;
+      if (target?.scope !== scope || target.key !== key) return;
+      if (routes.some(route => route.node === target.node && route.taskKey === target.taskKey)) {
+        dagReveal = undefined;
+        const focus = document.activeElement;
+        revealDagNode(body, target.node, focus === btn("runtime-open-dag") || focus === body.previousElementSibling);
+      } else reportExpiredDagLink();
+    },
+  };
+}
+
+function pruneDagTargets(scope: DagScope, data: Wire): void {
+  const keys = new Set(data.status === "ok" ? list(data.rows).map(row => object(row).key) : []);
+  const runs = observedDagNodes[scope];
+  for (const [key, targets] of runs) {
+    if (!keys.has(key)) { runs.delete(key); continue; }
+    const valid = targets.filter(target => nativeData?.taskIndex.has(target.taskKey));
+    if (valid.length) runs.set(key, valid);
+    else runs.delete(key);
+  }
+}
+
+function runtimeFailure(error: unknown): Wire {
+  const reason = error instanceof RequestError && error.status === 404 && error.code === "not_found" ? "web_unsupported"
+    : error instanceof RequestError && error.status >= 400 && error.status < 500 ? "read_refused" : "read_failed";
+  return { status: "unavailable", reason };
+}
+
+function loadRuntimeHistory(view: View, kind: RuntimeHistory): void {
+  if (view !== current || !historyVisible(kind)) return;
+  const body = historyBody(kind);
+  const leaf = todoLeaf(branchData);
+  if (kind === "todo" && (branchRequest || leaf === undefined)) {
+    body.replaceChildren(...renderTodoHistory(branchRequest ? undefined : { status: "ownership_changed" }));
+    return;
+  }
+  historyRequests[kind]?.abort();
+  const request = historyRequests[kind] = new AbortController();
+  const live = () => historyRequests[kind] === request && historyVisible(kind) && current === view;
+  const path = sessionPath(view.session.id);
+  if (kind === "todo") body.replaceChildren(...renderTodoHistory());
+  else if (!body.childElementCount) body.replaceChildren(...renderRuntimePane("dag", undefined, { history: true }));
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
+  const endpoint = kind === "todo" ? "/todo-history" : "/native-runtime/dag-history";
+  void api.request(`${path}${endpoint}`, undefined, signal).catch(runtimeFailure).then(async data => {
     if (!live()) return;
-    branchData = data;
-    if (data.status === "ok" && (typeof data.leafId === "string" || data.leafId === null)) detailsTree?.checkLeaf(data.leafId);
-    renderDetailsBranch(data);
-    revealDetailsTarget();
-  }).finally(() => {
-    if (branchRequest === request) branchRequest = undefined;
+    if (kind === "todo") {
+      const verified = data.status !== "ok" || (leaf === data.leafId && leaf === todoLeaf(branchData));
+      body.replaceChildren(...renderTodoHistory(verified ? data : { status: "ownership_changed" }));
+      return;
+    }
+    pruneDagTargets("history", data);
+    if (!canShowSnapshot(data)) {
+      const dag = scopedDagOptions(view, "history", request.signal);
+      replaceRuntimeRuns(body, renderRuntimePane("dag", data, { history: true, dag }), dagReveal?.scope !== "history");
+      openRevealedDag(body, "history");
+      return;
+    }
+    if (dagReveal?.scope === "history") {
+      replaceRuntimeRuns(body, renderRuntimePane("dag", data, { history: true }));
+      reportExpiredDagLink();
+      return;
+    }
+    replaceRuntimeRuns(body, renderRuntimePane("dag", data, { history: true, snapshot: "waiting" }));
+    const disk = AbortSignal.any([request.signal, AbortSignal.timeout(8_000)]);
+    const snapshot = await api.request(`${path}/activity`, undefined, disk).catch(runtimeFailure);
+    if (live()) body.replaceChildren(...renderRuntimePane("dag", data, { history: true, snapshot }));
   });
 }
 
@@ -2622,27 +2865,22 @@ function renderNativeDetails(view: View): void {
     return;
   }
   const data = nativeData;
-  const fallback = canShowSnapshot(data[panel]);
-  const snapshot = fallback ? data.snapshot ?? "waiting" : undefined;
-  if (panel === "tasks") {
-    box("runtime-subagent").replaceChildren(...renderRuntimePane("tasks", data.tasks, snapshot));
-  } else {
-    const runs = box("runtime-dag");
-    const selectedRun = runs.querySelector<HTMLDetailsElement>(".dag-run[open]")?.dataset.dagKey;
-    const focusedRun = document.activeElement?.closest<HTMLElement>(".dag-run")?.dataset.dagKey;
+  if (panel === "dag") {
     dagRequest?.abort();
     const request = dagRequest = new AbortController();
-    runs.replaceChildren(...renderRuntimePane("dag", data.dag, snapshot, key => {
-      const signal = AbortSignal.any([request.signal, AbortSignal.timeout(28_000)]);
-      return api.request(`${sessionPath(view.session.id)}/native-runtime/dag/${key}`, undefined, signal);
-    }));
-    for (const detail of runs.querySelectorAll<HTMLDetailsElement>(".dag-run")) {
-      if (detail.dataset.dagKey === selectedRun) detail.open = true;
-      if (focusedRun && detail.dataset.dagKey === focusedRun && document.activeElement === document.body) {
-        detail.querySelector("summary")?.focus({ preventScroll: true });
-      }
-    }
+    const host = box("runtime-dag-current");
+    const dag = scopedDagOptions(view, "current", request.signal);
+    replaceRuntimeRuns(host, renderRuntimePane("dag", data.dag, { dag }), !dagReveal);
+    openRevealedDag(host, "current");
+    return;
   }
+  const fallback = canShowSnapshot(data.tasks);
+  const snapshot = fallback ? data.snapshot ?? "waiting" : undefined;
+  const targets = taskDagTargets();
+  replaceRuntimeRuns(box("runtime-subagent"), renderRuntimePane("tasks", data.tasks, { snapshot, taskJump: key => {
+    const target = targets.get(key);
+    return target ? () => openLinkedDag(view, target) : undefined;
+  } }));
   if (!fallback || data.snapshot || activityRequest) return;
   const request = activityRequest = new AbortController();
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(8_000)]);
@@ -2650,8 +2888,7 @@ function renderNativeDetails(view: View): void {
     .catch(() => ({ status: "unavailable" })).then(snapshot => {
       if (activityRequest !== request || !inspector.open || current !== view || nativeData !== data) return;
       data.snapshot = snapshot;
-      const visible = nativePanel();
-      if ((visible === "tasks" || visible === "dag") && canShowSnapshot(data[visible])) renderNativeDetails(view);
+      if (nativePanel() === "tasks") renderNativeDetails(view);
     }).finally(() => {
       if (activityRequest === request) activityRequest = undefined;
     });
@@ -2668,7 +2905,7 @@ function loadNativeDetails(view: View): void {
     dagRequest?.abort();
     dagRequest = undefined;
   }
-  const host = box(panel === "memory" ? "runtime-memory-journal" : panel === "dag" ? "runtime-dag" : "runtime-subagent");
+  const host = box(panel === "memory" ? "runtime-memory-journal" : panel === "dag" ? "runtime-dag-current" : "runtime-subagent");
   if (!host.childElementCount) {
     const status = el("p", "small muted", tr("正在读取原生运行信息…", "Loading native runtime…"));
     status.setAttribute("role", "status");
@@ -2678,14 +2915,13 @@ function loadNativeDetails(view: View): void {
   const signal = AbortSignal.any([request.signal, AbortSignal.timeout(20_000)]);
   void api.request(`${sessionPath(view.session.id)}/native-runtime`, undefined, signal)
     .catch((error: unknown) => {
-      const reason = error instanceof RequestError && error.status === 404 && error.code === "not_found"
-        ? "web_unsupported"
-        : error instanceof RequestError && error.status >= 400 && error.status < 500 ? "read_refused" : "read_failed";
-      const failure = { status: "unavailable", reason };
+      const failure = runtimeFailure(error);
       return { tasks: failure, dag: failure, memory: failure };
     }).then(data => {
       if (!live()) return;
-      nativeData = { tasks: object(data.tasks), dag: object(data.dag), memory: object(data.memory) };
+      const tasks = object(data.tasks);
+      nativeData = { tasks, dag: object(data.dag), memory: object(data.memory), taskIndex: runtimeTaskIndex(tasks) };
+      pruneDagTargets("current", nativeData.dag);
       renderNativeDetails(view);
     }).finally(() => {
       if (runtimeRequest === request) runtimeRequest = undefined;
@@ -2712,6 +2948,12 @@ function loadDetails(view: View, refresh = false): void {
     branchRequest = undefined;
   }
   const panel = nativePanel();
+  if (panel === "memory") {
+    if (refresh || (!memoryData && !memoryRequest)) loadBranchMemory(view);
+  } else {
+    memoryRequest?.abort();
+    memoryRequest = undefined;
+  }
   if (panel) {
     if (refresh || (!nativeData && !runtimeRequest)) loadNativeDetails(view);
     else if (nativeData && !runtimeRequest) renderNativeDetails(view);
@@ -2723,10 +2965,11 @@ function loadDetails(view: View, refresh = false): void {
     dagRequest?.abort();
     dagRequest = undefined;
   }
-  if (!panel || panel === "memory") {
+  if (panel !== "tasks") {
     activityRequest?.abort();
     activityRequest = undefined;
   }
+  if (refresh && historyVisible("dag")) loadRuntimeHistory(view, "dag");
   if (capabilitiesSelected()) {
     if (refresh || !capabilitiesAttempted) loadCapabilities(view);
   } else if (capabilitiesRequest) clearCapabilities();
@@ -2736,15 +2979,15 @@ function refreshVisibleDetails(view: View): void {
   // A settlement or action may have changed a hidden read; re-read it on next intent.
   if (!overviewSelected()) overviewDirty = true;
   if (!branchSelected()) branchData = undefined;
+  if (nativePanel() !== "memory") memoryData = undefined;
   if (!nativePanel()) nativeData = undefined;
   if (!capabilitiesSelected()) capabilitiesAttempted = false;
   loadDetails(view, true);
 }
 
-function openCliHistory(id?: string): void {
-  follow.stop();
+function openCliHistory(cwd?: string): void {
   toggleNav(false);
-  history.open(id);
+  history.open(cwd);
 }
 
 function listen(): void {
@@ -2813,22 +3056,16 @@ function listen(): void {
       composeOptionsButton.focus({ preventScroll: true });
     } else if (inspector.open) dismissDetails();
   });
-  inp("search").addEventListener("input", () => { renderSessions(); renderCliSessions(); });
+  inp("search").addEventListener("input", renderSessions);
   sel("workspace-select").addEventListener("change", () => filterDirectory(sel("workspace-select").value));
-  btn("recent").addEventListener("click", () => { archived = false; renderSessions(); renderCliSessions(); });
-  btn("archived").addEventListener("click", () => { archived = true; renderSessions(); renderCliSessions(); });
-  // CLI journals appear outside the engine event stream; re-check when the
-  // page becomes visible so the sidebar discovers them without the dialog.
-  // An open run view refreshes too, so metrics stay current while viewed.
+  btn("recent").addEventListener("click", () => { archived = false; renderSessions(); });
+  btn("archived").addEventListener("click", () => { archived = true; renderSessions(); });
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) return;
     void fetchSessions();
     if (current) void loadWorkbenchStatus(current);
     if (current && inspector.open) loadDetails(current, true);
   });
-  window.setInterval(() => {
-    if (!document.hidden && connection === "online") void fetchCliRows(true);
-  }, CLI_REFRESH_MS);
   btn("new-welcome").addEventListener("click", openChooser);
   btn("new-sidebar").addEventListener("click", openChooser);
   form("new-form").addEventListener("submit", event => { event.preventDefault(); void createSession(); });
@@ -2882,6 +3119,12 @@ function listen(): void {
   memoryDisclosure().addEventListener("toggle", () => {
     if (current && inspector.open && branchSelected()) loadDetails(current);
   });
+  for (const kind of historyKinds) {
+    historyDisclosure(kind).addEventListener("toggle", () => {
+      if (current && historyVisible(kind)) loadRuntimeHistory(current, kind);
+      else resetRuntimeHistory(kind);
+    });
+  }
   box("runtime-metrics").addEventListener("click", event => {
     if (!(event.target instanceof Element) || !event.target.closest("#runtime-open-resources")) return;
     selectDetailsView(btn("runtime-open-todo"));

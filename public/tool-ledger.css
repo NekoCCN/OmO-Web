@@ -6,7 +6,7 @@
 }
 
 .message :is(.tool-summary, .tool-group-summary, .tool-details summary) {
-  min-block-size: var(--ledger-control, var(--control));
+  min-block-size: var(--ledger-control, var(--control, 2.25rem));
 }
 
 .tool-summary {
@@ -22,14 +22,14 @@
   position: relative;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 0 var(--s2);
-  padding-inline-start: var(--s6);
+  gap: 0 var(--s2, .5rem);
+  padding-inline-start: var(--s6, 1.5rem);
 }
 
 .tool-kind-icon {
   position: absolute;
   inset-inline-start: 0;
-  inset-block-start: var(--focus);
+  inset-block-start: var(--focus, 2px);
   color: var(--muted);
 }
 
@@ -116,6 +116,7 @@
   white-space: nowrap;
 }
 .tool-card-emblem {
+  display: block;
   position: absolute;
   z-index: -1;
   inset-block-start: var(--s3);
@@ -250,7 +251,7 @@
 }
 
 @media (max-width: 760px), (any-pointer: coarse) {
-  .message :is(.tool-group-summary, .tool-details summary) { min-block-size: var(--touch); }
+  .message :is(.tool-group-summary, .tool-details summary) { min-block-size: var(--touch, 2.75rem); }
 }
 
 .message .tool-details > .fold-body {

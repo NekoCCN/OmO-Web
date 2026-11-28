@@ -24,6 +24,7 @@ async function sidebar(width: number, run: (fixture: {
   detailReads: string[];
   treeReplies: Array<Response | (() => Promise<Response>)>;
   nativeReplies: Response[];
+  dagHistoryReplies: Response[];
   holdNextSnapshot: () => { requested: Promise<void>; release: () => void };
 }) => Promise<void>, initialTodo: string | null = "核对侧栏") {
   const bundle = await Bun.build({ entrypoints: ["src/web/app.ts"], target: "browser" });
@@ -34,6 +35,7 @@ async function sidebar(width: number, run: (fixture: {
   const detailReads: string[] = [];
   const treeReplies: Array<Response | (() => Promise<Response>)> = [];
   const nativeReplies: Response[] = [];
+  const dagHistoryReplies: Response[] = [];
   let send: ReadableStreamDefaultController<string> | undefined;
   let alphaSnapshot: SnapshotFixture = {};
   let todoContent = initialTodo;
@@ -88,16 +90,23 @@ async function sidebar(width: number, run: (fixture: {
         return typeof reply === "function" ? reply() : reply ?? Response.json({ nodes: [], leafId: null });
       },
       [`${path}/:id/branch-runtime`]: request => {
-        detailReads.push(`${request.params.id}/branch-runtime`);
-        return Response.json({ status: "ok", leafId: "leaf-fixture", todo: todoContent === null ? { status: "missing" }
+        const { search } = new URL(request.url);
+        detailReads.push(`${request.params.id}/branch-runtime${search}`);
+        if (search && search !== "?scope=todo") return Response.json({ status: "unexpected_scope" }, { status: 400 });
+        return Response.json({ status: "ok", leafId: "leaf-fixture", todo: todoContent === null ? { status: "none" }
           : { status: "ok", phases: [{ name: "验收", tasks: [{ status: "pending", content: todoContent }] }] },
-          memory: { status: "ok", recalledCount: 3 } });
+          ...(!search && { memory: { status: "ok", recalledCount: 3 } }) });
       },
       [`${path}/:id/native-runtime`]: request => {
         detailReads.push(`${request.params.id}/native-runtime`);
         return nativeReplies.shift() ?? Response.json({
-          tasks: { status: "empty" }, dag: { status: "empty" }, memory: { status: "ok", totalSteps: 8, reflectedSteps: 0 },
+          tasks: { status: "empty" }, dag: { status: "unavailable", reason: "native_window_unverified" },
+          memory: { status: "ok", totalSteps: 8, reflectedSteps: 0 },
         });
+      },
+      [`${path}/:id/native-runtime/dag-history`]: request => {
+        detailReads.push(`${request.params.id}/native-runtime/dag-history`);
+        return dagHistoryReplies.shift() ?? Response.json({ status: "unavailable", reason: "native_window_unverified" });
       },
       [`${path}/:id/activity`]: request => {
         detailReads.push(`${request.params.id}/activity`);
@@ -126,7 +135,7 @@ async function sidebar(width: number, run: (fixture: {
   try { await run({
     browser, events: value => send?.enqueue(`event: omo\ndata: ${JSON.stringify({ sessionId: "alpha", ...value })}\n\n`),
     disconnect: () => send?.close(),
-    reads, actions, detailReads, treeReplies, nativeReplies, setSnapshot: data => { alphaSnapshot = data; },
+    reads, actions, detailReads, treeReplies, nativeReplies, dagHistoryReplies, setSnapshot: data => { alphaSnapshot = data; },
     setTodo: content => { todoContent = content; },
     holdNextSnapshot: () => {
       const started = Promise.withResolvers<void>();
@@ -188,6 +197,8 @@ async function capture(browser: Bun.WebView, name: string) {
 }
 
 const treeSummary = "#runtime-tree summary";
+const todoRead = "alpha/branch-runtime?scope=todo";
+const memoryRead = "alpha/branch-runtime";
 const loadOlder = "#runtime-tree [data-tree-older]";
 const reloadTree = "#runtime-tree [data-tree-reload]";
 const treePage = (id: string, summary: string, leafId = id, nextCursor?: string) => Response.json({
@@ -208,7 +219,7 @@ async function clickTreeControl(browser: Bun.WebView, selector: string) {
 }
 
 for (const width of [320, 1440]) browserTest(`lazy details reads each resource only on intent and adds one older page at a time at ${width}px`, async () => {
-  await sidebar(width, async ({ browser, detailReads, treeReplies }) => {
+  await sidebar(width, async ({ browser, detailReads, treeReplies, setTodo }) => {
     if (width === 320) await browser.click("#details-button");
     await wait(browser, `document.querySelector(".metric-highlights")`);
     expect(detailReads).toEqual([]);
@@ -231,17 +242,21 @@ for (const width of [320, 1440]) browserTest(`lazy details reads each resource o
       return [scroller.scrollWidth <= scroller.clientWidth, top >= bounds.top - 1 && bottom <= bounds.bottom + 1];
     })()`)).toEqual([true, true]);
     await capture(browser, `lazy-tree-pages-${width}`);
+    const treeReads = [...detailReads];
     await browser.click("#runtime-open-todo");
-    await wait(browser, `document.querySelector("[data-runtime-branch] details")`);
-    expect(detailReads.at(-1)).toBe("alpha/branch-runtime");
-    expect(detailReads).not.toContain("alpha/native-runtime");
+    await wait(browser, `document.querySelector("[data-runtime-branch] details[open]")?.innerText.includes("核对侧栏")`);
+    expect(detailReads).toEqual([...treeReads, todoRead]);
+    setTodo("刷新后的待办");
     await browser.click("#details-refresh");
-    await wait(browser, `document.querySelector("[data-runtime-branch] details")?.getClientRects().length`);
+    await wait(browser, `document.querySelector("[data-runtime-branch] details[open]")?.innerText.includes("刷新后的待办")`);
+    expect(detailReads).toEqual([...treeReads, todoRead, todoRead]);
     await clickTreeControl(browser, "#runtime-memory-branch summary");
-    await wait(browser, `document.querySelector("#runtime-memory-journal").textContent.includes("8")`);
+    await wait(browser, `document.querySelector("#runtime-memory-journal dd")?.textContent === "8" &&
+      document.querySelector("#runtime-memory-branch-content dd")?.textContent === "3"`);
+    expect(detailReads).toEqual([...treeReads, todoRead, todoRead, memoryRead, "alpha/native-runtime"]);
     await browser.click("#runtime-open-dag");
-    expect(detailReads.filter(read => read.endsWith("native-runtime"))).toEqual(["alpha/native-runtime"]);
-    expect(detailReads.filter(read => read.endsWith("branch-runtime"))).toEqual(["alpha/branch-runtime", "alpha/branch-runtime"]);
+    await wait(browser, `document.querySelector("#runtime-dag-current").innerText.includes("更早的匹配未知")`);
+    expect(detailReads).toEqual([...treeReads, todoRead, todoRead, memoryRead, "alpha/native-runtime"]);
   });
 });
 
@@ -338,24 +353,39 @@ browserTest("lazy details navigates with the rendered leaf, preserves confirmati
 });
 
 browserTest("lazy details refreshes the visible runtime and falls back only when the live source is unsupported", async () => {
-  await sidebar(1440, async ({ browser, detailReads, nativeReplies }) => {
+  await sidebar(1440, async ({ browser, detailReads, nativeReplies, dagHistoryReplies }) => {
     await wait(browser, `document.querySelector(".metric-highlights")`);
     const unsupported = { status: "unavailable", reason: "unsupported" };
     nativeReplies.push(Response.json({ tasks: unsupported, dag: unsupported, memory: { status: "empty" } }),
       Response.json({ code: "internal" }, { status: 500 }));
+    dagHistoryReplies.push(Response.json(unsupported), Response.json({ code: "internal" }, { status: 500 }));
     await browser.click("#runtime-open-subagents");
     await wait(browser, `document.querySelector("#runtime-subagent").innerText.includes("非实时")`);
-    expect(detailReads).toEqual(["alpha/native-runtime", "alpha/activity"]);
+    const taskReads = ["alpha/native-runtime", "alpha/activity"];
+    expect(detailReads).toEqual(taskReads);
     await browser.click("#runtime-open-dag");
-    await wait(browser, `document.querySelector("#runtime-dag").innerText.includes("非实时")`);
-    expect(detailReads).toEqual(["alpha/native-runtime", "alpha/activity"]);
-    await browser.click("#details-refresh");
-    await wait(browser, `document.querySelector("#runtime-dag").innerText.includes("读取失败或超时")`);
+    await wait(browser, `document.querySelector("#runtime-dag-current").innerText.includes("不支持此读取")`);
+    expect(await browser.evaluate(`document.querySelector("#runtime-dag-history").open`)).toBe(false);
     expect(await browser.evaluate(`document.querySelector("#runtime-dag").innerText`)).not.toContain("非实时");
-    expect(detailReads).toEqual(["alpha/native-runtime", "alpha/activity", "alpha/native-runtime"]);
+    expect(detailReads).toEqual(taskReads);
+    await clickTreeControl(browser, "#runtime-dag-history > summary");
+    await wait(browser, `document.querySelector("#runtime-dag-history[open]").innerText.includes("非实时")`);
+    expect(await browser.evaluate(`document.querySelector("#runtime-dag-current").innerText`)).not.toContain("非实时");
+    const withHistory = [...taskReads, "alpha/native-runtime/dag-history", "alpha/activity"];
+    expect(detailReads).toEqual(withHistory);
+    await clickTreeControl(browser, "#runtime-dag-history > summary");
+    await browser.click("#details-refresh");
+    await wait(browser, `document.querySelector("#runtime-dag-current").innerText.includes("读取失败或超时")`);
+    expect(await browser.evaluate(`document.querySelector("#runtime-dag").innerText`)).not.toContain("非实时");
+    expect(detailReads).toEqual([...withHistory, "alpha/native-runtime"]);
+    await clickTreeControl(browser, "#runtime-dag-history > summary");
+    await wait(browser, `document.querySelector("#runtime-dag-history[open]").innerText.includes("读取失败或超时")`);
+    expect(await browser.evaluate(`document.querySelector("#runtime-dag").innerText`)).not.toContain("非实时");
+    const afterFailure = [...withHistory, "alpha/native-runtime", "alpha/native-runtime/dag-history"];
+    expect(detailReads).toEqual(afterFailure);
     await browser.click("#runtime-open-todo");
-    await wait(browser, `document.querySelector("[data-runtime-branch] details")`);
-    expect(detailReads.at(-1)).toBe("alpha/branch-runtime");
+    await wait(browser, `document.querySelector("[data-runtime-branch] details[open]")?.innerText.includes("核对侧栏")`);
+    expect(detailReads).toEqual([...afterFailure, todoRead]);
   });
 });
 
@@ -756,7 +786,7 @@ browserTest("settled turns update the open dock's Todo and retain disclosure foc
     // The overview load is lazy and leaving its tab cancels an unfinished read.
     await wait(browser, `document.querySelector("#runtime-metrics").textContent.includes("52.1 token/s")`);
     await browser.click("#runtime-open-todo");
-    await wait(browser, `${todo}?.textContent.includes("数量未知")`);
+    await wait(browser, `${todo}?.textContent.includes("没有当前待办")`);
     expect(await browser.evaluate(`${todo}.querySelector("summary") === null`)).toBe(true);
     setTodo("新原生待办");
     events({ type: "agent_settled" });
@@ -766,6 +796,9 @@ browserTest("settled turns update the open dock's Todo and retain disclosure foc
     await browser.press("Tab");
     await browser.press("Tab");
     expect(await browser.evaluate(`document.activeElement === ${todo}.querySelector("summary")`)).toBe(true);
+    expect(await browser.evaluate(`${todo}.querySelector("details").open`)).toBe(true);
+    await browser.press("Enter");
+    expect(await browser.evaluate(`${todo}.querySelector("details").open`)).toBe(false);
     await browser.press("Enter");
     setSnapshot({ generationSpeed: { tokensPerSecond: 71, measuredAt: 3 } });
     events({ type: "generation_speed", generationSpeed: { tokensPerSecond: 71, measuredAt: 3 } });

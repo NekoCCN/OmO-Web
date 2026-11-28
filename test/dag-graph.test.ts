@@ -7,9 +7,11 @@ const cwd = "/fixture/dag-graph";
 const session = { id, cwd, name: "DAG fixture", active: true };
 const base = `/api/sessions/${id}`;
 const dagPath = `${base}/native-runtime/dag/${"a".repeat(64)}`;
+const currentDagRead = `GET ${dagPath}?scope=current`;
 const run = { key: "a".repeat(64), status: "running", nodeCount: 6, createdAt: 1, updatedAt: 2 };
 const branch = {
   status: "ok",
+  runStatus: "running",
   waves: [{ index: 0, nodes: [0] }, { index: 1, nodes: [1, 2, 3, 4] }, { index: 2, nodes: [5] }],
   nodes: [[], [0], [0], [], [], [0, 1, 2]].map((upstream, id) => ({
     id, upstream, attempt: 1, state: id === 5 ? "skipped" : "completed",
@@ -52,10 +54,11 @@ async function withWorkbench(size: number, snapshots: (() => Promise<unknown> | 
       [`${base}/details`]: Response.json({ stats: {} }),
       [`${base}/native-runtime`]: Response.json({
         tasks: { status: "empty" }, memory: { status: "ok", totalSteps: 0, reflectedSteps: 0 },
-        dag: { status: "ok", rows: [run], limitReached: false },
+        dag: { status: "ok", coverage: "native_window", rows: [run], limitReached: false },
       }),
       [dagPath]: async (request: Request) => {
-        requests.push(`${request.method} ${new URL(request.url).pathname}`);
+        const url = new URL(request.url);
+        requests.push(`${request.method} ${url.pathname}${url.search}`);
         return Response.json(await (snapshots[snapshotRead++]?.() ?? { status: "malformed" }));
       },
     },
@@ -142,7 +145,7 @@ for (const size of [320, 400]) {
       expect(graph.ys[1]!).toBeLessThan(graph.ys[5]!);
       expect(graph.states[5]).toContain("已跳过");
       expect(graph.panelWidth).toBe(size);
-      expect(graph.collapsed).toBe(true);
+      expect(graph.collapsed).toBe(size !== 320);
       expect(graph.outsideOverflow).toBe(false);
       expect(graph.localOverflow).toBe(true);
       expect(graph.mapFits).toBe(true);
@@ -153,6 +156,18 @@ for (const size of [320, 400]) {
       }
       expect(await browser.evaluate(`document.activeElement.matches(".dag-run > summary")`)).toBe(true);
       await browser.press("Tab");
+      expect(await browser.evaluate(`document.activeElement.matches(".dag-graph-text > summary")`)).toBe(true);
+      if (size === 320) {
+        await browser.press("Enter");
+        expect(await browser.evaluate(`document.querySelector(".dag-graph-text").open`)).toBe(false);
+      }
+      await browser.press("Enter");
+      await visible(browser, ".dag-wave:last-child li");
+      expect(await browser.evaluate(`document.querySelector(".dag-wave:last-child li").innerText`))
+        .toContain("依赖：节点 1、节点 2、节点 3");
+      await browser.press("Tab");
+      expect(await browser.evaluate(`document.activeElement.matches('[data-node-detail="0"] .runtime-execution > summary')`)).toBe(true);
+      for (let i = 0; i < 6; i++) await browser.press("Tab");
       expect(await browser.evaluate(`document.activeElement.matches(".dag-graph-map")`)).toBe(true);
       expect(await browser.evaluate(`[
         document.activeElement.matches(":focus-visible"), getComputedStyle(document.activeElement).outlineStyle
@@ -165,13 +180,7 @@ for (const size of [320, 400]) {
         map.addEventListener("scroll", () => { clearTimeout(timer); resolve(true); }, { once: true });
       })`);
       expect(await browser.evaluate(`document.querySelector(".dag-graph-map").scrollLeft`)).toBeGreaterThan(0);
-      await browser.press("Tab");
-      expect(await browser.evaluate(`document.activeElement.matches(".dag-graph-text > summary")`)).toBe(true);
-      await browser.press("Enter");
-      await visible(browser, ".dag-wave:last-child li");
-      expect(await browser.evaluate(`document.querySelector(".dag-wave:last-child li").innerText`))
-        .toContain("依赖：节点 1、节点 2、节点 3");
-      expect(requests).toEqual([`GET ${dagPath}`]);
+      expect(requests).toEqual([currentDagRead]);
     });
   });
 }
@@ -186,20 +195,22 @@ browserTest("invalid topology draws no edges and the old fenced response cannot 
     async (browser, requests) => {
       // Hold the first per-run response until the second fenced read has already rendered.
       await firstRead;
-      expect(requests).toEqual([`GET ${dagPath}`]);
+      expect(requests).toEqual([currentDagRead]);
       await browser.click("#details-refresh");
       await visible(browser, ".dag-graph-map");
       release({ ...branch, nodes: branch.nodes.map(node => ({ ...node, state: "failed" })) });
       await browser.evaluate(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
       expect(await browser.evaluate(`document.querySelector(".dag-graph-map").innerText`)).toContain("已跳过");
       await browser.click("#details-refresh");
-      await visible(browser, ".dag-graph-text[open] .dag-wave");
+      await visible(browser, ".dag-graph-view > p:first-child:not(.dag-verified-roster)");
+      expect(await browser.evaluate(`document.querySelector(".dag-graph-view > p:first-child").innerText`)).toContain("无法验证完整拓扑");
+      expect(await browser.evaluate(`document.querySelector(".dag-graph-text[open] .dag-wave") !== null`)).toBe(true);
       expect(await browser.evaluate(`document.querySelector("#runtime-dag .dag-content").innerText`)).not.toContain("节点 1000");
       expect(await browser.evaluate(`document.querySelector(".dag-graph-map, path[data-from][data-to]") === null`)).toBe(true);
       await browser.click("#details-refresh");
       await visible(browser, ".dag-content > .dag-readout");
       expect(await browser.evaluate(`document.querySelector(".dag-content").innerText`)).toContain("会话归属已变化");
       expect(await browser.evaluate(`document.querySelector("#runtime-dag").textContent`)).not.toContain("other owner");
-      expect(requests).toEqual(Array(4).fill(`GET ${dagPath}`));
+      expect(requests).toEqual(Array(4).fill(currentDagRead));
     });
 }, 15_000);

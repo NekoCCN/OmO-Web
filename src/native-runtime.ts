@@ -1,21 +1,17 @@
 import { createHmac, randomBytes } from "node:crypto";
 import { z } from "zod";
 import type { Engine } from "./engine.ts";
-import { boundedRows, count, dagReply, identity, projectDagRow, projectDagSnapshot,
-  RUNTIME_LIST_LIMIT, taskDisplayFields, timestamp } from "./native-runtime-projection.ts";
+import { count, dagReply, dagStatuses, identity, projectDagRow, projectDagSnapshot,
+  projectTasks, RUNTIME_LIST_LIMIT } from "./native-runtime-projection.ts";
+import type { DagScope, RuntimeTaskOwner } from "./native-runtime-projection.ts";
 import { array, entryId, WebError } from "./protocol.ts";
 import type { Action, WireObject } from "./protocol.ts";
-import { projectPagedRuntimeBranch } from "./runtime-branch.ts";
-import type { RuntimeBranchView } from "./runtime-branch.ts";
+import { currentBranchTodo, projectPagedRuntimeBranch, projectTodoRecord } from "./runtime-branch.ts";
+import type { BranchTodoView, RuntimeBranchView, TodoPhaseView } from "./runtime-branch.ts";
 import { previewEntries, readEntryPage, readNativeLeaf, staleTree } from "./session-entry-pages.ts";
 import type { TreeCursors } from "./session-entry-pages.ts";
 
 const TIMEOUT = 6000;
-const taskStatus = z.enum(["pending", "running", "paused", "completed", "error", "cancelled", "interrupted", "lost"]);
-const taskRow = z.object({ status: taskStatus, created_at: timestamp, updated_at: timestamp, ...taskDisplayFields });
-const taskReply = z.object({
-  parent_session_id: identity, tasks: boundedRows(taskRow), truncated_tasks: count.optional(),
-});
 const memoryReply = z.object({
   schemaVersion: z.literal(1),
   journal: z.object({ sessionId: identity, totalSteps: count, reflectedSteps: count }),
@@ -24,7 +20,7 @@ const binding = z.object({
   sessionId: identity, cwd: z.string().min(1), sessionFile: z.string().min(1), archived: z.boolean().optional(),
 });
 
-export type NativeRuntimeBinding = Readonly<z.infer<typeof binding>> & {
+export type NativeRuntimeBinding = Readonly<z.infer<typeof binding>> & RuntimeTaskOwner & {
   readonly route: string;
   readonly dagKey: (runId: string) => string;
 };
@@ -41,7 +37,9 @@ export function bindNativeRuntime(raw: unknown, expected: {
     state.data.cwd !== expected.cwd || state.data.sessionFile !== expected.sessionFile ||
     (expected.durableId !== undefined && state.data.sessionId !== expected.durableId)) return undefined;
   const secret = randomBytes(32);
-  return { ...state.data, route: expected.route, dagKey: runId => createHmac("sha256", secret).update(runId).digest("hex") };
+  return { ...state.data, route: expected.route,
+    dagKey: runId => createHmac("sha256", secret).update(runId).digest("hex"),
+    taskKey: taskId => createHmac("sha256", secret).update("task\0").update(taskId).digest("hex") };
 }
 
 type UnavailableReason = "inactive" | "binding_unverified" | "unsupported" | "native_unavailable" | "engine_unavailable";
@@ -51,11 +49,11 @@ type Failure =
   | { readonly status: "ownership_changed" }
   | { readonly status: "malformed" };
 type Empty = { readonly status: "empty" };
-type TaskRow = Readonly<ReturnType<typeof projectTaskRow>>;
 type DagRow = Readonly<ReturnType<typeof projectDagRow>>;
 export type NativeRuntimeSummary = {
-  readonly tasks: Failure | Empty | { readonly status: "ok"; readonly rows: readonly TaskRow[]; readonly omittedCount: number };
-  readonly dag: Failure | Empty | { readonly status: "ok"; readonly rows: readonly DagRow[]; readonly limitReached: boolean };
+  readonly tasks: Failure | ReturnType<typeof projectTasks>;
+  readonly dag: Failure | { readonly status: "unavailable"; readonly reason: "native_window_unverified" } |
+    { readonly status: "ok"; readonly rows: readonly DagRow[]; readonly limitReached: boolean; readonly coverage: "native_window" };
   readonly memory: Failure | { readonly status: "ok"; readonly totalSteps: number; readonly reflectedSteps: number };
 };
 
@@ -77,30 +75,7 @@ function fault(error: unknown, extension?: string): Failure {
   return unavailable("native_unavailable");
 }
 
-function projectTaskRow(row: z.infer<typeof taskRow>) {
-  return { status: row.status, createdAt: row.created_at, updatedAt: row.updated_at,
-    ...(row.agent_type === undefined ? {} : { agent: row.agent_type }),
-    ...(row.category === undefined ? {} : { category: row.category }),
-    ...(row.execution_mode === undefined ? {} : { executionMode: row.execution_mode }) };
-}
-
-function projectTasks(raw: WireObject, durableId: string): NativeRuntimeSummary["tasks"] {
-  switch (raw.kind) {
-    case "unavailable": return unavailable("native_unavailable");
-    case "not_found": return ownershipChanged;
-    case undefined: break;
-    default: return malformed;
-  }
-  const parsed = taskReply.safeParse(raw);
-  if (!parsed.success) return malformed;
-  const { parent_session_id, tasks, truncated_tasks = 0 } = parsed.data;
-  if (parent_session_id !== durableId) return ownershipChanged;
-  if (truncated_tasks > 0 && tasks.length !== RUNTIME_LIST_LIMIT) return malformed;
-  if (tasks.length === 0) return empty;
-  return { status: "ok", omittedCount: truncated_tasks, rows: tasks.map(projectTaskRow) };
-}
-
-function readDagRows(raw: WireObject, durableId: string) {
+function readDagRows(raw: WireObject, durableId: string, selection: DagScope) {
   if (raw.ok === false) {
     const error = z.object({ code: z.string() }).safeParse(raw.error);
     if (!error.success) return malformed;
@@ -115,6 +90,7 @@ function readDagRows(raw: WireObject, durableId: string) {
   if (!parsed.success) return malformed;
   const { runs } = parsed.data.value;
   if (runs.some(row => row.parentSessionId !== durableId)) return ownershipChanged;
+  if (runs.some(row => !dagStatuses(selection).includes(row.status))) return malformed;
   const ids = runs.flatMap(row => row.runId === undefined ? [] : [row.runId]);
   if (new Set(ids).size !== ids.length) return malformed;
   return { runs };
@@ -175,20 +151,19 @@ async function withinBinding<T>(scope: RuntimeReadScope, read: () => Promise<T>)
 export async function readNativeRuntime(scope: RuntimeReadScope): Promise<NativeRuntimeSummary> {
   const { target } = scope;
   const result = await withinBinding(scope, async () => {
-    const [tasks, list, memory] = await Promise.all([
-      readExtension(scope, { name: "omo.task.list", data: { parent_session_id: target.sessionId } },
-        raw => projectTasks(raw, target.sessionId)),
-      readDagList(scope),
+    const [tasks, dag, memory] = await Promise.all([
+      readTaskSection(scope),
+      readDagSection(scope, "current"),
       readExtension(scope, { name: "omo.memory.status", data: {} }, raw => projectMemory(raw, target.sessionId)),
     ]);
-    const dag: NativeRuntimeSummary["dag"] = "status" in list ? list : list.runs.length === 0 ? empty : {
-      status: "ok", limitReached: list.runs.length === RUNTIME_LIST_LIMIT,
-      rows: list.runs.map(row => projectDagRow(row, target.dagKey)),
-    };
     return { tasks, dag, memory };
   });
   return "status" in result ? all(result) : result;
 }
+
+const readTaskSection = (scope: RuntimeReadScope) => readExtension(
+  scope, { name: "omo.task.list", data: { parent_session_id: scope.target.sessionId } },
+  raw => projectTasks(raw, scope.target));
 
 type ExtensionRead = { readonly name: "omo.task.list" | "omo.dag.list" | "omo.memory.status" | "omo.dag.snapshot";
   readonly data: WireObject };
@@ -204,37 +179,49 @@ async function readExtension<T>(scope: RuntimeReadScope, request: ExtensionRead,
   return project(raw);
 }
 
-const readDagList = (scope: RuntimeReadScope) => readExtension(
-  scope, { name: "omo.dag.list", data: { limit: RUNTIME_LIST_LIMIT } }, raw => readDagRows(raw, scope.target.sessionId));
+const readDagList = (scope: RuntimeReadScope, selection: DagScope) => readExtension(
+  scope, { name: "omo.dag.list", data: { limit: RUNTIME_LIST_LIMIT, statuses: dagStatuses(selection) } },
+  raw => readDagRows(raw, scope.target.sessionId, selection));
+
+async function readDagSection(scope: RuntimeReadScope, selection: DagScope): Promise<NativeRuntimeSummary["dag"]> {
+  const list = await readDagList(scope, selection);
+  if ("status" in list) return list;
+  // Native filters after its all-status window. Even zero filtered rows cannot prove absence.
+  if (list.runs.length === 0) return { status: "unavailable", reason: "native_window_unverified" };
+  return { status: "ok", coverage: "native_window", limitReached: list.runs.length === RUNTIME_LIST_LIMIT,
+    rows: list.runs.map(row => projectDagRow(row, scope.target.dagKey)) };
+}
+
+export async function readNativeDagHistory(scope: RuntimeReadScope | RuntimeInactiveReason) {
+  return typeof scope === "string" ? unavailable(scope) : withinBinding(scope, () => readDagSection(scope, "history"));
+}
 const notFound = { status: "not_found" } as const;
 
-export async function readNativeDag(scope: RuntimeReadScope | RuntimeInactiveReason, key: string) {
+export async function readNativeDag(scope: RuntimeReadScope | RuntimeInactiveReason, key: string, selection: DagScope) {
   if (typeof scope === "string") return unavailable(scope);
   return withinBinding(scope, async () => {
-    const list = await readDagList(scope);
+    const list = await readDagList(scope, selection);
     if ("status" in list) return list;
     const runId = list.runs.find(row => row.runId !== undefined && scope.target.dagKey(row.runId) === key)?.runId;
     if (runId === undefined) return notFound;
     const guard = await sameBinding(scope);
     if (guard || !scope.isCurrent()) return guard ?? ownershipChanged;
-    return readExtension(scope, { name: "omo.dag.snapshot", data: { runId } }, raw => {
-      if (raw.ok === false) {
-        const error = z.object({ code: z.string() }).safeParse(raw.error);
-        if (!error.success) return malformed;
-        switch (error.data.code) {
-          case "run_not_found":
-          case "run_not_owned": return notFound;
-          case "history_unavailable": return unavailable("native_unavailable");
-          default: return malformed;
-        }
-      }
-      return projectDagSnapshot(raw, { runId, owner: scope.target.sessionId });
+    const [snapshot, tasks] = await Promise.all([
+      readExtension(scope, { name: "omo.dag.snapshot", data: { runId } }, raw => ({ raw })),
+      readTaskSection(scope),
+    ]);
+    if (!("raw" in snapshot)) return snapshot;
+    const keys = new Set(tasks.status === "ok" ? tasks.rows.map(row => row.key) : []);
+    return projectDagSnapshot(snapshot.raw, { runId, owner: scope.target.sessionId, scope: selection,
+      taskKey: id => {
+        const key = scope.target.taskKey(id);
+        return keys.has(key) ? key : undefined;
+      },
     });
   });
 }
 
 const BRANCH_PAGE_LIMIT = 4;
-const WORKBENCH_PAGE_LIMIT = 1;
 type Incomplete = { readonly status: "unavailable"; readonly reason: "incomplete" };
 const incomplete: Incomplete = { status: "unavailable", reason: "incomplete" };
 type HistoryFailure = Failure | Incomplete;
@@ -332,14 +319,21 @@ type BranchFailure = { readonly status: "unavailable";
   readonly reason: UnavailableReason | "ownership_changed" | "malformed" | "incomplete" };
 type WorkbenchStatus = Empty | BranchFailure |
   { readonly status: "ok"; readonly currentTodo?: string; readonly pendingTodo: number };
+type CurrentTodo = { readonly status: "ok"; readonly leafId: string | null; readonly todo: BranchTodoView };
+type TodoHistory = { readonly status: "ok"; readonly leafId: string | null; readonly limitReached: boolean;
+  readonly snapshots: readonly { readonly phases: readonly TodoPhaseView[] }[] };
+const TODO_HISTORY_LIMIT = 8;
+const TODO_HISTORY_BYTES = 256 * 1024;
 
-export async function readBranchRuntime(scope: RuntimeReadScope | RuntimeInactiveReason, passive = false):
-  Promise<Extract<RuntimeBranchView, { status: "ok" }> | BranchFailure> {
+function branchFailure(result: HistoryFailure): BranchFailure {
+  return result.status === "unavailable" ? result : { status: "unavailable", reason: result.status };
+}
+
+export async function readBranchRuntime(scope: RuntimeReadScope | RuntimeInactiveReason) {
   if (typeof scope === "string") return { status: "unavailable", reason: scope };
   const result = await withinBinding(scope, async () => {
     const pages: Awaited<ReturnType<typeof readEntryPage>>[] = [];
-    const limit = passive ? WORKBENCH_PAGE_LIMIT : BRANCH_PAGE_LIMIT;
-    for (let i = 0; i < limit; i++) {
+    for (let i = 0; i < BRANCH_PAGE_LIMIT; i++) {
       let page;
       const position = pages.at(-1)?.next;
       if (position) await scope.verifyWorkspace();
@@ -352,17 +346,97 @@ export async function readBranchRuntime(scope: RuntimeReadScope | RuntimeInactiv
       if (!page.next) {
         const view = projectPagedRuntimeBranch(pages.toReversed().flatMap(page => page.entries), page.leafId);
         if (view.status === "invalid") return view.reason === "tree-budget" ? incomplete : malformed;
-        return view.incomplete ? incomplete : view;
+        const todo = view.incomplete ? incomplete : view.todo.status === "ok" ? currentBranchTodo(view.todo.phases) : view.todo;
+        return { status: "ok", leafId: view.leafId, todo, memory: view.memory } as const;
       }
     }
     return incomplete;
   });
-  return result.status === "malformed" || result.status === "ownership_changed"
-    ? { status: "unavailable", reason: result.status } as const : result;
+  return result.status === "ok" ? result : branchFailure(result);
+}
+
+async function walkTodo<T extends { readonly status: "ok" }>(
+  scope: RuntimeReadScope | RuntimeInactiveReason, visit: (entry: WireObject, leafId: string | null) => T | HistoryFailure | undefined,
+  finish: (leafId: string | null, complete: boolean) => T | HistoryFailure,
+): Promise<T | BranchFailure> {
+  if (typeof scope === "string") return { status: "unavailable", reason: scope };
+  const result = await withinBinding(scope, async () => {
+    let position: Awaited<ReturnType<typeof readEntryPage>>["next"];
+    let leafId: string | null | undefined;
+    let parent: string | null = null;
+    const visited = new Set<string>();
+    for (let i = 0; i < BRANCH_PAGE_LIMIT; i++) {
+      if (position) await scope.verifyWorkspace();
+      let page;
+      try {
+        page = await readEntryPage(scope, { position, expectedLeafId: leafId, acceptLargeSingleton: true });
+      } catch (error) {
+        if (position && error instanceof WebError && error.code === "not_found") return ownershipChanged;
+        return entryFailure(error);
+      }
+      if (leafId === undefined) parent = leafId = page.leafId;
+      // Native pages are in journal append order. Follow only the selected
+      // leaf's parent pointers while walking backward; siblings cannot supply Todo.
+      for (const { id, parentId, raw } of page.entries.toReversed()) {
+        visited.add(id);
+        if (id !== parent) continue;
+        if (parentId !== null && visited.has(parentId)) return malformed;
+        parent = parentId;
+        const outcome = visit(raw, leafId);
+        if (outcome) return outcome;
+      }
+      if (parent === null) return finish(leafId, true);
+      position = page.next;
+      if (!position) return malformed;
+    }
+    return finish(leafId ?? null, false);
+  });
+  return result.status === "ok" ? result : branchFailure(result);
+}
+
+export function readCurrentTodo(scope: RuntimeReadScope | RuntimeInactiveReason): Promise<CurrentTodo | BranchFailure> {
+  return walkTodo<CurrentTodo>(scope, (entry, leafId) => {
+    const todo = projectTodoRecord(entry);
+    if (!todo) return undefined;
+    return todo.truncated ? incomplete : { status: "ok", leafId, todo: currentBranchTodo(todo.phases) };
+  }, (leafId, complete) => complete ? { status: "ok", leafId, todo: { status: "none" } } : incomplete);
+}
+
+export function readTodoHistory(scope: RuntimeReadScope | RuntimeInactiveReason): Promise<TodoHistory | BranchFailure> {
+  const snapshots: TodoHistory["snapshots"][number][] = [];
+  const seen = new Set<string>();
+  let newest = true;
+  let skipped = false;
+  let bytes = 0;
+  return walkTodo<TodoHistory>(scope, (entry, leafId) => {
+    const record = projectTodoRecord(entry);
+    if (!record) return undefined;
+    const isNewest = newest;
+    newest = false;
+    if (record.truncated) {
+      skipped = true;
+      return undefined;
+    }
+    if (!record.phases.some(phase => phase.tasks.length !== 0)) return undefined;
+    const snapshot = { phases: record.phases };
+    const key = JSON.stringify(snapshot);
+    if (seen.has(key)) return undefined;
+    seen.add(key);
+    if (isNewest && currentBranchTodo(record.phases).status === "ok") return undefined;
+    if (snapshots.length === TODO_HISTORY_LIMIT) return { status: "ok", leafId, snapshots, limitReached: true };
+    const size = Buffer.byteLength(key) + 1;
+    if (bytes + size > TODO_HISTORY_BYTES) {
+      skipped = true;
+      return undefined;
+    }
+    bytes += size;
+    snapshots.push(snapshot);
+    return undefined;
+  }, (leafId, complete) => ({ status: "ok", leafId, snapshots, limitReached: skipped || !complete }));
 }
 
 export async function readWorkbenchStatus(scope: RuntimeReadScope | RuntimeInactiveReason): Promise<WorkbenchStatus> {
-  const view = await readBranchRuntime(scope, true);
+  const view = await readCurrentTodo(scope);
   if (view.status === "unavailable") return view;
   if (view.todo.status === "none") return empty;
   const tasks = view.todo.phases.flatMap(phase => phase.tasks);

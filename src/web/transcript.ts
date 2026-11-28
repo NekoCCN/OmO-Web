@@ -2,6 +2,7 @@ import { button, codeBlock, el, fold, isImageType, list, num, object, str } from
 import type { Wire } from "./dom.ts";
 import { tr, uiLocale } from "./locale.ts";
 import { markdownRichLimit, prose } from "./markdown.ts";
+import { parseSkillInput, skillInputInstructions, skillInputNames } from "../skill-input.ts";
 import { groupToolCalls, ToolDisplay, visibleToolTarget } from "./tool-display.ts";
 import type { ToolTrace } from "./tool-display.ts";
 import type { HistoryContent, HistoryControl, HistoryRender } from "./transcript-history.ts";
@@ -9,6 +10,43 @@ export type { ToolTrace } from "./tool-display.ts";
 
 function parts(content: unknown): readonly unknown[] {
   return typeof content === "string" ? [{ type: "text", text: content }] : list(content);
+}
+
+const skillInstructions = Symbol("skill instructions");
+
+function messageParts(message: Wire): readonly Wire[] {
+  const source = parts(message.content).map(object);
+  if (message.role !== "user") return source;
+  const history = object(message.historyContent);
+  if (str(history.cursor)) {
+    const names = str(history.skillNames);
+    // An ordinary cursor preview is not a complete envelope.
+    return names ? [...source, { type: skillInstructions, names }] : source;
+  }
+  const disclosures: Wire[] = [];
+  const visible = source.map(part => {
+    const skill = part.type === "text" ? parseSkillInput(str(part.text)) : undefined;
+    if (!skill) return part;
+    disclosures.push({ type: skillInstructions, names: skillInputNames(skill), text: skillInputInstructions(skill) });
+    return { type: "text", text: skill.request };
+  });
+  return [...visible, ...disclosures];
+}
+
+function renderSkill(part: Wire, previous?: HTMLElement): HTMLDetailsElement {
+  const node = previous instanceof HTMLDetailsElement ? previous : fold("", el("p", "plain"));
+  node.classList.add("skill-instructions");
+  const names = str(part.names);
+  const summary = node.querySelector("summary");
+  const label = tr(`Skill 指令 · ${names}`, `Skill instructions · ${names}`);
+  if (summary && summary.textContent !== label) summary.textContent = label;
+  const body = node.querySelector<HTMLElement>(":scope > .fold-body > p");
+  if (body) {
+    const text = str(part.text);
+    if (body.textContent !== text) body.textContent = text;
+    body.hidden = !text;
+  }
+  return node;
 }
 
 function renderPart(part: Wire, kind: "markdown" | "plain" | "tool", previous?: HTMLElement): HTMLElement | undefined {
@@ -112,8 +150,7 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
     before?.time?.remove();
     if (time) header.append(time);
   }
-  const rendered = parts(message.content).map((entry, index): PartView => {
-    const part = object(entry);
+  const rendered = messageParts(message).map((part, index): PartView => {
     if (part.type === "toolCall") return { part, node: renderCall(part, index) };
     const old = before?.parts[index];
     if (old) {
@@ -121,7 +158,8 @@ function renderMessage(message: Wire, live: boolean, renderCall: (part: Wire, in
       if (old.part === part || (keys.length === Object.keys(old.part).length && keys.every(key => Object.hasOwn(old.part, key) && part[key] === old.part[key]))) return old;
     }
     const oldNode = old?.part.type === part.type ? old?.node : undefined;
-    const current = renderPart(part, role === "assistant" ? "markdown" : "plain", oldNode);
+    const current = part.type === skillInstructions ? renderSkill(part, oldNode)
+      : renderPart(part, role === "assistant" ? "markdown" : "plain", oldNode);
     if (current instanceof HTMLDetailsElement && oldNode instanceof HTMLDetailsElement) current.open = oldNode.open;
     return { part, node: current };
   });
@@ -273,7 +311,7 @@ export class Transcript {
     const { scrollTop, scrollHeight, clientHeight } = this.scroller;
     const active = document.activeElement;
     const rowFocus = active instanceof HTMLElement && this.root.contains(active)
-      && (active.closest(".tool-details, .tool-group, .tool-attachment, .transcript-content, .prose") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
+      && (active.closest(".tool-details, .tool-group, .tool-attachment, .transcript-content, .skill-instructions, .prose") || (this.trace && active.matches(".message[tabindex='-1']"))) ? active : undefined;
     const toolFocus = rowFocus?.matches(".tool-group-summary")
       ? rowFocus.parentElement?.querySelector<HTMLElement>(".tool-summary")
       : rowFocus?.querySelector<HTMLElement>(".tool-summary");
@@ -398,9 +436,13 @@ export class Transcript {
         if (messageView) {
           const content = history?.content(message);
           const textParts = messageView.parts.filter(({ part }) => part.type === "text");
+          const skillPart = messageView.parts.find(({ part }) => part.type === skillInstructions);
+          const skillHost = skillPart?.node?.querySelector<HTMLElement>(":scope > .fold-body");
+          const pagedSkill = skillHost && str(object(message.historyContent).skillNames);
           // Text cursors read from the start of the original, not from the end of the preview.
-          if (textParts.length === 1 && textParts[0]?.node) textParts[0].node.hidden = Boolean(content?.chunks.length);
-          this.renderHistoryContent(messageView.body, content, message.role === "assistant" && textParts.length === 1);
+          if (textParts.length === 1 && textParts[0]?.node) textParts[0].node.hidden = !pagedSkill && Boolean(content?.chunks.length);
+          this.renderHistoryContent(messageView.body, pagedSkill ? undefined : content, message.role === "assistant" && textParts.length === 1);
+          if (skillHost) this.renderHistoryContent(skillHost, pagedSkill ? content : undefined);
         }
         if (groupedElsewhere && node.classList.contains("message--tool-only") && !this.cache.get(row.key)?.view.body.childElementCount) {
           node.remove();

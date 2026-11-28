@@ -142,8 +142,11 @@ try {
   await click(use);
   await wait(`${approve}:enabled`);
   await click(approve);
+  await wait("#cli-history-dialog[open]");
+  assert.equal(await value("#cli-history-directory"), external);
+  await click("#cli-history-dialog [data-close]");
   await wait("#workspace-select");
-  assert.equal(await value("#workspace-select"), external);
+  assert.equal(await value("#workspace-select"), "", "The directory handoff does not change the sidebar filter");
   assert.deepEqual(await roots(), [approved, external]);
   assert(!await exists(`${panel}[open]`));
   const previousWrites = await page.evaluate(() => window.directoryRequests);

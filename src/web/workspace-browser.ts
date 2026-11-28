@@ -18,7 +18,7 @@ export function workspacePaths(value: unknown): string[] {
 export function workspaceBrowser(
   api: Api,
   scope: () => { readonly roots: readonly string[]; readonly selected: string },
-  onSelect: (path: string, roots: readonly string[]) => void,
+  onSelect: (path: string, roots: readonly string[], fromSidebar: boolean) => void,
   restoreFocus: () => void,
 ) {
   const launch = byId("workspace-browser-button", HTMLButtonElement);
@@ -45,6 +45,7 @@ export function workspaceBrowser(
   let approval: Approval | undefined;
   let expiry = 0;
   let parent = "";
+  let restore: (() => void) | undefined;
 
   function message(text = "", error = false): void {
     feedback.classList.toggle("error", error);
@@ -178,8 +179,10 @@ export function workspaceBrowser(
     const path = str(data.path);
     const allowed = workspacePaths(data.workspaces);
     if (!path || !allowed.includes(path)) throw new Error("Invalid workspace selection receipt");
+    const fromSidebar = restore === undefined;
+    restore = undefined;
     modal.close();
-    onSelect(path, allowed);
+    onSelect(path, allowed, fromSidebar);
   }
 
   function prepare(path: string): void {
@@ -245,8 +248,9 @@ export function workspaceBrowser(
     rootField.hidden = !paths.length;
   }
 
-  launch.addEventListener("click", () => {
-    if (!platform || document.querySelector("dialog:modal")) return;
+  function open(onDismiss?: () => void): boolean {
+    if (!platform || document.querySelector("dialog:modal")) return false;
+    restore = onDismiss;
     abort();
     setApproval();
     message();
@@ -260,7 +264,10 @@ export function workspaceBrowser(
     render();
     modal.showModal();
     if (start) browse(start, false);
-  });
+    return true;
+  }
+
+  launch.addEventListener("click", () => open());
   form.addEventListener("submit", event => {
     event.preventDefault();
     prepare(input.value);
@@ -288,10 +295,13 @@ export function workspaceBrowser(
     setApproval();
     message();
     resetListing();
-    if (!document.querySelector("dialog:modal")) restoreFocus();
+    const onDismiss = restore ?? restoreFocus;
+    restore = undefined;
+    if (!document.querySelector("dialog:modal")) onDismiss?.();
   });
 
   return {
+    open,
     update(value: unknown, tokenChanged: boolean): void {
       const candidate = object(value).platform;
       const next = candidate === "win32" || candidate === "posix" ? candidate : undefined;

@@ -32,7 +32,8 @@ async function fixture(supported = true) {
   let resumed = false;
   const support = supported ? { supported: true } : unsupported;
   const gates: { history?: () => Promise<void>; release?: () => Promise<void>; held: boolean; busy: boolean;
-    unadopted: boolean; oversized?: boolean } = { held: false, busy: false, unadopted: false };
+    oversized?: boolean } = { held: false, busy: false };
+  const catalogRequests: Array<string | null> = [];
   let activityRequests = 0;
   const sessions = () => ({ sessions: published ? [{ ...row, active }, other] : [other] });
   const snapshot = (session: typeof row) => Response.json({ session, state: { isStreaming: false, pendingDialogs: [], pendingQuestions: [] },
@@ -40,7 +41,7 @@ async function fixture(supported = true) {
     handoff: supported ? { eligible: true } : { eligible: false, reason: unsupported.reason } });
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request, listener) {
     listener.timeout(request, 0);
-    const path = new URL(request.url).pathname;
+    const { pathname: path, searchParams } = new URL(request.url);
     if (request.method === "POST") {
       if (request.headers.get("X-OmO-Token") !== "synthetic-token") return Response.json({ code: "token_refused", error: "令牌错误" }, { status: 403 });
       const body: unknown = await request.json();
@@ -81,10 +82,14 @@ async function fixture(supported = true) {
     }, { status: 409 });
     if (path === `/api/sessions/${otherId}`) return snapshot(other);
     if (path.startsWith("/api/sessions/") && path.endsWith("/options")) return Response.json({ models: [], levels: [], commands: [] });
-    if (path === "/api/cli-history") return Response.json({ available: true, sessions: [{ ...record, adopted: !gates.unadopted }] });
+    if (path === "/api/cli-history") {
+      const directory = searchParams.get("cwd");
+      catalogRequests.push(directory);
+      return Response.json({ available: true, sessions: directory === cwd ? [{ ...record, adopted: published }] : [] });
+    }
     if (path === `/api/cli-history/${historyId}`) {
       if (gates.oversized) return Response.json({ code: "history_too_large", error: "预览受限" }, { status: 400 });
-      return Response.json({ session: { ...record, adopted: !gates.unadopted }, messages: [historyMessage] });
+      return Response.json({ session: { ...record, adopted: published }, messages: [historyMessage] });
     }
     if (path === `/api/cli-history/${historyId}/activity`) {
       activityRequests++;
@@ -95,7 +100,7 @@ async function fixture(supported = true) {
     const asset = assets.get(path);
     return asset ? new Response(Bun.file(fromRoot(`public/${asset}`))) : new Response(null, { status: 404 });
   } });
-  return { url: server.url.href, gates, posted, activityRequests: () => activityRequests, close: () => server.stop(true) };
+  return { url: server.url.href, gates, posted, catalogRequests, activityRequests: () => activityRequests, close: () => server.stop(true) };
 }
 
 function page(view: Bun.WebView, width: number) {
@@ -118,9 +123,18 @@ function page(view: Bun.WebView, width: number) {
   })`);
   const click = async (selector: string) => { await visible(selector); await view.click(selector); };
   const nav = async () => { if (width < 761) await click("#open-navigation"); };
+  const chooseDirectory = async () => {
+    await nav();
+    await click("#cli-history-button");
+    await view.evaluate(`(() => {
+      const directory = document.querySelector("#cli-history-directory");
+      directory.value = ${JSON.stringify(cwd)};
+      directory.dispatchEvent(new Event("change", { bubbles: true }));
+    })()`);
+  };
   return {
-    visible, click,
-    async history() { await nav(); await click("#cli-history-button"); await visible("#cli-history-list button", "已在 Web 打开"); await click("#cli-history-list button"); await visible("#cli-history-messages article", historyMessage.content); },
+    visible, click, chooseDirectory,
+    async history() { await chooseDirectory(); await click("#cli-history-list button"); await visible("#cli-history-messages article", historyMessage.content); },
     async select(id: string) { await nav(); await click(`#session-list button[data-session="${id}"]`); },
     async check(name: string) {
       expect(await view.evaluate("innerWidth")).toBe(width);
@@ -171,11 +185,13 @@ for (const width of [1440, 390]) {
       await p.visible("#session-title", other.name);
       await p.select(bookmarkId);
       await p.visible("#messages article", historyMessage.content);
-      await p.history();
-      await p.click("#cli-history-resume:not(:disabled)");
-      await p.visible("#composer-shell #prompt:focus");
+      await p.chooseDirectory();
+      await p.visible(`#cli-history-web-list button[data-session="${bookmarkId}"]`);
+      expect(await view.evaluate('document.querySelector("#cli-history-list").textContent')).not.toContain(row.name);
+      await p.click(`#cli-history-web-list button[data-session="${bookmarkId}"]`);
+      await p.visible("#composer-shell #prompt");
       expect(await view.evaluate('document.querySelector("#session-list button[aria-current=true]").dataset.session')).toBe(bookmarkId);
-      expect(await view.evaluate("document.activeElement.id")).toBe("prompt");
+      expect(await view.evaluate("document.activeElement.id")).toBe("conversation");
       await view.evaluate(`(() => {
         const prompt = document.querySelector("#prompt");
         prompt.value = "未发送的合成草稿";
@@ -240,7 +256,7 @@ for (const width of [1440, 390]) {
       await p.visible('#attachments img[alt="draft.png"]');
       await p.check("restored");
       expect(f.posted.map(({ path, body }) => [path, body])).toEqual([
-        ...Array.from({ length: 3 }, () => [`/api/cli-history/${historyId}/resume`, {}]),
+        ...Array.from({ length: 2 }, () => [`/api/cli-history/${historyId}/resume`, {}]),
         ...Array.from({ length: 2 }, () => [`/api/sessions/${bookmarkId}/handoff`, {}]),
         ...Array.from({ length: 2 }, () => [`/api/sessions/${bookmarkId}/actions`, { action: "resume" }]),
       ]);
@@ -270,16 +286,15 @@ test.skipIf(!chromium)("an older host leaves history readable and handoff unavai
 test.skipIf(!chromium)("oversized history preview keeps explicit resume and preserves holder refusal", async () => {
   if (!chromium) throw new Error("Set OMO_HANDOFF_CHROMIUM to an isolated Chromium executable.");
   const f = await fixture();
-  f.gates.unadopted = true;
   f.gates.oversized = true;
   f.gates.held = true;
   try {
     using view = new Bun.WebView({ backend: { type: "chrome", url: false, path: chromium }, width: 1440 });
     const p = page(view, 1440);
     await view.navigate(f.url);
-    await p.visible("#cli-session-list button", record.name);
-    await p.click("#cli-session-list button");
-    await p.visible("#cli-history-record-error", "无法预览完整对话");
+    await p.chooseDirectory();
+    await p.click("#cli-history-list button");
+    await p.visible("#cli-history-record-error", "无法预览");
     await p.visible("#cli-history-branch:disabled");
     await p.visible("#cli-history-refresh-activity:disabled");
     expect(await view.evaluate('document.querySelector("#cli-history-empty").hidden')).toBe(true);
@@ -294,20 +309,23 @@ test.skipIf(!chromium)("oversized history preview keeps explicit resume and pres
   } finally { f.close(); }
 }, 15000);
 
-test.skipIf(!chromium)("fresh page discovers unadopted CLI sessions in the sidebar", async () => {
+test.skipIf(!chromium)("CLI history waits for directory intent and does not put discoveries in the sidebar", async () => {
   if (!chromium) throw new Error("Set OMO_HANDOFF_CHROMIUM to an isolated Chromium executable.");
   const f = await fixture();
-  f.gates.unadopted = true;
   try {
     using view = new Bun.WebView({ backend: { type: "chrome", url: false, path: chromium }, width: 1440 });
     const p = page(view, 1440);
     await view.navigate(f.url);
-    // No dialog is opened: the ordinary sidebar itself lists the CLI journal.
-    await p.visible("#cli-sessions:not([hidden])");
-    await p.visible("#cli-session-list button", record.name);
-    // Previewing from the sidebar reads the record without seizing the holder.
-    await p.click("#cli-session-list button");
+    await p.visible('#connection[data-state="online"]');
+    expect(f.catalogRequests).toEqual([]);
+    await p.chooseDirectory();
+    await p.visible("#cli-history-list button", record.name);
+    expect(f.catalogRequests).toEqual([cwd]);
+    expect(await view.evaluate('document.querySelector("#session-list").textContent')).not.toContain(record.name);
+    await p.click("#cli-history-list button");
     await p.visible("#cli-history-messages article", historyMessage.content);
+    expect(f.activityRequests()).toBe(0);
+    await p.click("#cli-history-refresh-activity:not(:disabled)");
     await p.visible("#cli-history-activity section h3");
     expect(await view.evaluate(`Array.from(document.querySelectorAll("#runtime-shortcuts [role=tab]"), tab => {
       const id = tab.getAttribute("aria-controls");

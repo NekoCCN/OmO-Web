@@ -312,7 +312,7 @@ legend { padding-inline: var(--s1); font-size: var(--small); color: var(--muted)
 .message:has(> header) { padding: var(--s2) var(--s3); background: var(--turn-surface); border-radius: var(--r2); }
 .message--user:has(> header) { background: var(--user-surface); }
 .message--tool { gap: 0; }
-.message details { border: var(--stroke) solid var(--line); border-radius: var(--r1); background: var(--tool-surface); }
+.message details:where(:not(.skill-instructions)) { border: var(--stroke) solid var(--line); border-radius: var(--r1); background: var(--tool-surface); }
 .tool-summary {
   display: grid;
   grid-template-columns: var(--s2) minmax(0, 1fr) auto;

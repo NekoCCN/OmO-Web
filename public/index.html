@@ -6,6 +6,49 @@
   <meta name="color-scheme" content="light dark">
   <title data-en="OmO Web · Session workbench">OmO Web · 会话工作台</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <!-- Keep this fallback in sync with its style-src hash in src/web-access.ts. -->
+  <style>
+    @layer tool-layout-fallback {
+      :where(.message--tool, .tool-group) {
+        min-inline-size: 0;
+        overflow-wrap: anywhere;
+      }
+      .message-body:has(> :is(.message--tool, .tool-group)) { min-inline-size: 0; }
+      :where(.message--tool, .tool-group) [hidden] { display: none !important; }
+      :where(.tool-summary, .tool-group-summary, .tool-details summary) {
+        align-content: center;
+        min-block-size: var(--touch, 2.75rem);
+        cursor: pointer;
+      }
+      .tool-subject, .tool-state {
+        display: inline-flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0 var(--s1, .25rem);
+        max-inline-size: 100%;
+      }
+      :where(.tool-subject, .tool-state) > span { min-inline-size: 0; }
+      :where(.message--tool, .tool-group) :is(p, ul, ol, dl, dd, pre) { margin: 0; }
+      .tool-details > .fold-body, .tool-card-content { padding: var(--s2, .5rem); }
+      .tool-card-facts { display: flex; flex-wrap: wrap; gap: var(--s2, .5rem) var(--s6, 1.5rem); }
+      .tool-details :where(.fold-body, .tool-scene, .tool-result, .tool-terminal-input, .tool-output) {
+        min-inline-size: 0;
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .tool-card-emblem, .tool-group .tool-card-preview, .tool-card-inline,
+      .tool-details[open] + .tool-card-preview > .tool-card-content { display: none; }
+      .tool-details pre, .tool-output {
+        max-block-size: var(--code-height, 22rem);
+        overflow: auto;
+      }
+      .tool-output pre { max-block-size: none; overflow: visible; }
+      .tool-output img {
+        max-inline-size: 100%;
+        max-block-size: var(--code-height, 22rem);
+        object-fit: contain;
+      }
+    }
+  </style>
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/workbench.css">
   <link rel="stylesheet" href="/tool-ledger.css">
@@ -31,7 +74,7 @@
           </button>
           <label class="field" id="workspace-field" hidden><span class="sr-only" data-en="Filter by directory">目录筛选</span><select id="workspace-select"></select></label>
           <button type="button" class="button" id="workspace-browser-button" aria-label="目录" data-en-aria-label="Directories" title="浏览目录" data-en-title="Browse directories" aria-haspopup="dialog" aria-controls="workspace-browser-dialog" hidden>
-            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#browse"/></svg><span aria-hidden="true" data-en="Browse">目录</span>
+            <svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#browse"/></svg><span aria-hidden="true" data-en="Browse">目录</span>
           </button>
         </div>
         <label class="field"><span class="sr-only" data-en="Search sessions or directories">搜索会话或目录</span><input id="search" type="search" placeholder="搜索会话或目录" data-en-placeholder="Session or directory" autocomplete="off"></label>
@@ -39,21 +82,20 @@
           <button type="button" class="button button--quiet" id="recent" aria-pressed="true" data-en="Recent">最近</button>
           <button type="button" class="button button--quiet" id="archived" aria-pressed="false" data-en="Archived">已归档</button>
         </div>
-        <div class="cli-launchers" role="group" aria-label="CLI 会话" data-en-aria-label="CLI sessions">
-          <button type="button" class="button button--quiet" id="cli-live-button" aria-haspopup="dialog" aria-label="CLI 实时" data-en-aria-label="Live CLI">
-            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#live"/></svg><span data-en="Live">CLI 实时</span>
+        <div class="cli-launchers" role="group" aria-label="会话入口" data-en-aria-label="Session actions">
+          <button type="button" class="button" id="cli-history-button" aria-haspopup="dialog" aria-controls="cli-history-dialog">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#history"/></svg><span data-en="Open session">打开会话</span>
           </button>
-          <button type="button" class="button button--quiet" id="cli-history-button" aria-haspopup="dialog" aria-label="CLI 历史" data-en-aria-label="CLI history">
-            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#history"/></svg><span data-en="History">CLI 历史</span>
+          <button type="button" class="button button--quiet" id="cli-live-button" aria-haspopup="dialog" aria-label="CLI 实时" data-en-aria-label="Live CLI">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#live"/></svg><span data-en="Live">实时</span>
           </button>
           <button type="button" class="button button--quiet" id="cli-follow-button" aria-controls="cli-follow-view" aria-pressed="false" aria-label="跟随 CLI" data-en-aria-label="Follow CLI">
-            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#follow"/></svg><span data-en="Follow">跟随 CLI</span>
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#follow"/></svg><span data-en="Follow">跟随</span>
           </button>
         </div>
       </div>
       <div class="session-rail">
-        <nav class="sessions" aria-label="会话列表" data-en-aria-label="Session list"><ul id="session-list"></ul><p id="list-empty" class="muted small" data-en="Loading sessions…">正在读取会话…</p></nav>
-        <nav class="sessions" id="cli-sessions" aria-label="CLI 会话" data-en-aria-label="CLI sessions" hidden><p class="muted small" id="cli-sessions-label" data-en="Local CLI sessions">本机 CLI 会话</p><ul id="cli-session-list"></ul><p id="cli-list-empty" class="muted small" hidden></p></nav>
+        <nav class="sessions" aria-label="已打开的会话" data-en-aria-label="Opened sessions"><div id="session-list"></div><p id="list-empty" class="muted small" data-en="Loading sessions…">正在读取会话…</p></nav>
       </div>
       <div class="sidebar-footer stack stack--tight">
         <p id="connection" class="connection small" role="status"><span class="status-dot"></span><span id="connection-label" data-en="Connecting">正在连接</span></p>
@@ -246,7 +288,7 @@
           <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-todo"/></svg><span data-en="Todo">待办</span>
         </button>
         <button type="button" class="button button--quiet" id="runtime-open-capabilities" role="tab" aria-selected="false" aria-controls="runtime-capabilities" tabindex="-1">
-          <svg class="icon" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-tools"/></svg><span data-en="Tools">能力</span>
+          <svg class="icon" width="16" height="16" viewBox="0 0 15 15" fill="currentColor" aria-hidden="true" focusable="false"><use href="/icons.svg#hud-tools"/></svg><span data-en="Tools">能力</span>
         </button>
       </div>
       <div id="details-scroll" class="details-scroll">
@@ -254,6 +296,10 @@
         <div id="details-body">
           <div id="runtime-metrics" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-overview" tabindex="0"></div>
           <div id="runtime-todo" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-todo" tabindex="0" hidden>
+            <details id="runtime-todo-history" class="metric-breakdown">
+              <summary data-en="History · Read-only">历史 · 只读</summary>
+              <div class="fold-body stack stack--tight"></div>
+            </details>
             <section id="runtime-resources" class="runtime-panel stack runtime-resources" aria-labelledby="runtime-resources-title">
               <h3 id="runtime-resources-title" tabindex="-1" data-en="Resources">资料</h3>
               <section id="runtime-memory" class="subpanel stack stack--tight" aria-label="记忆" data-en-aria-label="Memory">
@@ -276,7 +322,13 @@
         </div>
         <div id="details-native-activity">
           <div id="runtime-subagent" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-subagents" tabindex="0" hidden></div>
-          <div id="runtime-dag" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-dag" tabindex="0" hidden></div>
+          <div id="runtime-dag" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-dag" tabindex="0" hidden>
+            <div id="runtime-dag-current" class="runtime-panel stack"></div>
+            <details id="runtime-dag-history" class="metric-breakdown">
+              <summary data-en="History · Read-only">历史 · 只读</summary>
+              <div class="fold-body stack stack--tight"></div>
+            </details>
+          </div>
         </div>
         <div id="runtime-capabilities" class="runtime-panel stack" role="tabpanel" aria-labelledby="runtime-open-capabilities" tabindex="0" hidden>
           <p id="capabilities-status" class="sr-only" role="status"></p>
@@ -387,25 +439,40 @@
   <dialog id="cli-history-dialog" aria-labelledby="cli-history-title">
     <div class="stack">
       <div class="row row--between">
-        <h2 id="cli-history-title" data-en="CLI history">CLI 历史</h2>
-        <button type="button" class="button button--quiet" data-close data-en="Close">关闭</button>
+        <h2 id="cli-history-title" data-en="Open a session">打开会话</h2>
+        <button type="button" class="button button--quiet" id="cli-history-title-close" data-close data-en="Close">关闭</button>
       </div>
-      <p class="small muted" data-en="Browsing history does not open a session. Select “Continue in Web” to try opening that session.">浏览记录不会打开会话。选择「在 Web 继续」后才会尝试打开同一会话。</p>
-      <section id="cli-history-index" class="stack" aria-label="CLI 历史列表" data-en-aria-label="CLI history list">
-        <label class="field"><span data-en="Filter CLI history">筛选 CLI 历史</span><input id="cli-history-search" type="search" placeholder="名称或工作目录" data-en-placeholder="Name or working directory" autocomplete="off" autofocus></label>
-        <ul id="cli-history-list" class="command-list"></ul>
-        <p id="cli-history-list-status" class="small muted" role="status" hidden></p>
-        <p id="cli-history-list-error" class="notice error small" role="alert" hidden></p>
-        <div class="row"><button type="button" class="button" id="cli-history-refresh" data-en="Refresh list">刷新列表</button></div>
+      <section id="cli-history-index" class="stack" aria-label="目录会话" data-en-aria-label="Directory sessions">
+        <div class="workspace-path-form">
+          <label class="field"><span data-en="Working directory">工作目录</span><select id="cli-history-directory" aria-describedby="cli-history-directory-path" autofocus></select></label>
+          <button type="button" class="button" id="cli-history-browse" aria-haspopup="dialog" aria-controls="workspace-browser-dialog" data-en="Browse directories" hidden>浏览目录</button>
+          <p id="cli-history-directory-path" class="path small muted workspace-full-path" dir="ltr" hidden></p>
+        </div>
+        <p id="cli-history-directory-hint" class="small muted" data-en="Choose a directory to list its sessions. This won’t open a session.">先选目录查看会话，不会直接打开。</p>
+        <div id="cli-history-results" class="stack" hidden>
+          <label class="field"><span data-en="Filter by session name">按会话名称筛选</span><input id="cli-history-search" type="search" placeholder="会话名称" data-en-placeholder="Session name" autocomplete="off"></label>
+          <section id="cli-history-bookmarks" class="stack stack--tight" aria-labelledby="cli-history-bookmarks-title" hidden>
+            <h3 id="cli-history-bookmarks-title" data-en="Opened in Web">已在 Web 打开</h3>
+            <ul id="cli-history-web-list" class="command-list"></ul>
+          </section>
+          <section class="stack stack--tight" aria-labelledby="cli-history-list-title">
+            <h3 id="cli-history-list-title" data-en="CLI history">CLI 历史</h3>
+            <ul id="cli-history-list" class="command-list" hidden></ul>
+            <p id="cli-history-list-status" class="small muted" role="status" hidden></p>
+            <p id="cli-history-list-error" class="notice error small" role="alert" hidden></p>
+            <div class="row"><button type="button" class="button" id="cli-history-refresh" data-en="Refresh list">刷新列表</button></div>
+          </section>
+        </div>
       </section>
       <section id="cli-history-record" class="stack" aria-labelledby="cli-history-record-title" hidden>
         <div class="row row--between">
           <button type="button" class="button" id="cli-history-back" data-en="Back to list">返回列表</button>
-          <button type="button" class="button" id="cli-history-refresh-activity" data-en="Refresh native snapshot">刷新原生快照</button>
+          <button type="button" class="button" id="cli-history-refresh-activity" data-en="Read native snapshot">读取原生快照</button>
         </div>
         <div class="stack stack--tight">
           <h3 id="cli-history-record-title" tabindex="-1"></h3>
-          <p id="cli-history-record-meta" class="small muted break"></p>
+          <p id="cli-history-record-meta" class="small muted path workspace-full-path" dir="ltr"></p>
+          <p id="cli-history-record-updated" class="small muted numerical" hidden></p>
           <div class="row">
             <button type="button" class="button button--primary" id="cli-history-resume" aria-describedby="cli-history-resume-status" data-en="Continue in Web" disabled>在 Web 继续</button>
             <button type="button" class="button" id="cli-history-branch" aria-haspopup="dialog" data-en="Branch / Copy" disabled>分支 / 复制</button>

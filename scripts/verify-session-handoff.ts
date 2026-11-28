@@ -337,26 +337,23 @@ try {
         array(snapshot.messages).some(message => textOf(message).includes(`Reply ${marker}`));
     });
   }
-  const tree = record((await request(`${webBornApi}/details`)).tree);
-  const nodes = array(tree.tree).map(record);
-  let leaf: string | undefined;
-  for (const node of nodes) {
-    nodes.push(...array(node.children).map(record));
-    const entry = record(node.entry);
-    if (typeof entry.id === "string" && record(entry.message).role === "assistant" &&
-        textOf(entry.message) === `Reply ${webCreated}`) leaf = entry.id;
-  }
-  assert(leaf && tree.leafId !== leaf, "The test must branch away from a newer active descendant");
-  assert.equal(record((await request(`${webBornApi}/actions`, { action: "navigate", targetId: leaf })).result).cancelled, false);
+  const [webBornPath, ...extras] = (await journalFiles()).filter(path => !paths.includes(path));
+  assert(webBornPath && extras.length === 0, "There is only one Web-origin journal in the shared native store");
+  const webBornJournal = await readFile(webBornPath, "utf8");
+  const leaf = webBornJournal.trimEnd().split("\n").map(line => record(JSON.parse(line))).find(entry =>
+    record(entry.message).role === "assistant" && textOf(entry.message) === `Reply ${webCreated}`)?.id;
+  const tree = await request(`${webBornApi}/tree`);
+  assert(typeof leaf === "string" && typeof tree.leafId === "string" &&
+    tree.leafId !== leaf && array(tree.nodes).map(record).some(node => node.id === leaf),
+    "The bounded tree page must allow branching away from a newer active descendant");
+  assert.equal(record((await request(`${webBornApi}/actions`, { action: "navigate", targetId: leaf, expectedLeafId: tree.leafId })).result).cancelled, false);
   // Native session_tree hooks may append descriptive metadata below the chosen
   // node. The proof is the visible/model ancestry, not that metadata entry ID.
   const afterNavigation = array((await request(webBornApi)).messages).map(textOf);
   assert(afterNavigation.some(text => text.includes(webCreated)));
   assert(!afterNavigation.some(text => text.includes(oldBranch)));
-  const [webBornPath, ...extras] = (await journalFiles()).filter(path => !paths.includes(path));
-  assert(webBornPath && extras.length === 0, "There is only one Web-origin journal in the shared native store");
   assert.deepEqual((await readdir(webStore)).filter(name => name.endsWith(".jsonl")), []);
-  const webBornHeader = record(JSON.parse((await readFile(webBornPath, "utf8")).split("\n", 1)[0]));
+  const webBornHeader = record(JSON.parse(webBornJournal.split("\n", 1)[0]));
   assert(typeof webBornHeader.id === "string");
   const cannotAttach = terminal(cwd, [...entry, "--session", webBornPath]);
   terminals.add(cannotAttach);

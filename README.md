@@ -60,7 +60,7 @@ The left column finds projects and sessions, the center follows the conversation
 
 ### Projects and sessions
 
-The sidebar lists Web and CLI sessions across directories; click one to continue without switching projects first. Filtering narrows the list without leaving the current conversation. New sessions pick their own working directory; the Directories view browses authorized locations, or type an absolute path to add a directory for this run. Put favorites in the launch configuration so they survive restarts. Switch the UI language (English / 简体中文) at the bottom of the left column.
+The sidebar groups sessions already opened in Web by their working directory. Filtering narrows the list without leaving the current conversation. To find another session, choose **Open session** (or run `/resume` or `/sessions`), select an authorized directory, then pick a session. Selecting a directory only lists its sessions; it does not open one. New sessions pick their own working directory. Use **Browse directories** to browse authorized locations or enter an absolute path to authorize a directory for this run. Put favorites in the launch configuration so they survive restarts. Switch the UI language (English / 简体中文) at the bottom of the left column.
 
 Sessions can be searched, renamed, marked done, archived, and restored. In a Web conversation, choose **Load older messages** to fetch an earlier page. Long text loads in chunks only when requested. To try another direction, fork from a selected user message or clone with the current context kept. Web sessions, CLI history, and an attached CLI all offer this entry.
 
@@ -85,7 +85,7 @@ Approvals default to Ask. Confirm, choose, type, or answer structured questions 
 
 When Web and CLI use the same OmO profile, you can continue from the same session log:
 
-1. **Terminal to Web**: preview the local CLI session in the left column, then Continue in Web. If the original terminal still holds the session, quit it there first.
+1. **Terminal to Web**: choose **Open session**, select the session’s working directory, choose its CLI record, then select **Continue in Web**. A preview is optional. If the original terminal still holds the session, quit it there first.
 2. **Web to terminal**: finish the turn and pending items, choose Session management → Go to CLI, and run the printed command in your terminal.
 
 Handoff waits until the session is idle and any pending questions are answered. CLI history shows the last saved branch; the live view follows recent text.

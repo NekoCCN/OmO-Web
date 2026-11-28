@@ -44,8 +44,9 @@ async function withWorkbench(width: number, run: (browser: Bun.WebView, writes: 
       "/tool-ledger.css": asset("tool-ledger.css"), "/dag-graph.css": asset("dag-graph.css"),
       "/icons.svg": asset("icons.svg"), "/app.js": () => new Response(bundle),
       "/api/bootstrap": () => Response.json({ sessions, workspaces: roots, fileBrowser: { platform: "posix" }, engine: { online: true } }),
-      "/api/cli-history": () => Response.json({ available: true,
-        sessions: roots.map((cwd, i) => ({ id: `cli-${i}`, name: `CLI ${i}`, cwd, updatedAt: fixtureDate + i * 1000 })) }),
+      "/api/cli-history": request => Response.json({ available: true, sessions: roots.flatMap((cwd, i) =>
+        new URL(request.url).searchParams.get("cwd") === cwd
+          ? [{ id: String(i).repeat(64), name: `CLI ${i}`, cwd, updatedAt: fixtureDate + i * 1000, adopted: false }] : []) }),
       "/api/events": () => new Response(new ReadableStream({ start(controller) { controller.enqueue(": fixture\n\n"); } })
         .pipeThrough(new TextEncoderStream()), { headers: { "Content-Type": "text/event-stream" } }),
       "/api/workspaces/browse": async request => {
@@ -97,8 +98,8 @@ async function openSession(browser: Bun.WebView, id: string): Promise<void> {
 
 browserTest("Directory filtering and browsing leave the active conversation and other drafts alone", async () => {
   await withWorkbench(1440, async (browser, writes) => {
-    await waitFor(browser, `document.querySelectorAll("#cli-session-list button").length === 2`);
-    const sidebar = () => browser.evaluate(`Array.from(document.querySelectorAll("#session-list .path"), row => [row.innerText, row.title])`);
+    const sidebar = () => browser.evaluate(`Array.from(document.querySelectorAll("#session-list [data-cwd]"), group =>
+      [group.querySelector("h2").textContent, group.dataset.cwd])`);
     expect(await sidebar()).toEqual([["alpha/desktop", roots[0]], ["beta/desktop", roots[1]]]);
     await openSession(browser, "alpha");
     await change(browser, "prompt", "Unsent from alpha", "input");
@@ -120,7 +121,9 @@ browserTest("Directory filtering and browsing leave the active conversation and 
     await change(browser, "workspace-browser-root", roots[0]);
     await waitFor(browser, `document.querySelector("#workspace-browser-current").textContent === ${JSON.stringify(roots[0])}`);
     await browser.click("#workspace-browser-use");
-    await waitFor(browser, `!document.querySelector("#workspace-browser-dialog").open`);
+    await waitFor(browser, `document.querySelector("#cli-history-list").textContent.includes("CLI 0")`);
+    expect(await browser.evaluate(`document.querySelector("#cli-history-directory").value`)).toBe(roots[0]);
+    await browser.click("#cli-history-dialog [data-close]");
     expect(await browser.evaluate(`[document.querySelector("#session-path").textContent, document.querySelector("#workspace-select").value]`))
       .toEqual([roots[1], roots[1]]);
     await browser.click("#new-sidebar");

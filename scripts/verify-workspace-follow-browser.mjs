@@ -101,10 +101,9 @@ try {
   }, value);
   const row = id => `#session-list button[data-session="${id}"]`;
   const exists = selector => page.evaluate(selector => Boolean(document.querySelector(selector)?.getClientRects().length), selector);
-  const choose = async (cwd, id, cliName) => {
+  const choose = async (cwd, id) => {
     await page.locator("#workspace-select").selectOption(cwd);
     await wait(row(id));
-    await wait("#cli-session-list button", cliName);
   };
   const selectValue = selector => page.evaluate(selector => document.querySelector(selector).value, selector);
   const follow = "#cli-follow-view";
@@ -125,16 +124,16 @@ try {
   await wait(row(bId));
   assert(!await exists(row(staleId)), "All workspaces still excludes sessions from an old unapproved root");
   assert.equal(await page.evaluate(() => window.workspaceProbe.reads), 0, "Follow is opt-in");
-  await choose(a, aId, "CLI 历史 A");
+  await choose(a, aId);
   assert(!await exists(row(bId)), "B stays out of A's Web list");
-  assert(!await page.evaluate(() => document.querySelector("#cli-session-list").textContent.includes("CLI 历史 B")));
   await click(row(aId));
   await wait("#prompt:enabled");
   await page.locator("#prompt").fill("草稿只属于 A");
-  await choose(b, bId, "CLI 历史 B");
+  await choose(b, bId);
   assert(!await exists(row(aId)), "A stays out of B's Web list");
-  assert(!await page.evaluate(() => document.querySelector("#cli-session-list").textContent.includes("CLI 历史 A")));
   await click("#cli-history-button");
+  assert.equal(await selectValue("#cli-history-directory"), "");
+  await page.locator("#cli-history-directory").selectOption(b);
   await wait("#cli-history-list button", "CLI 历史 B");
   assert(!await page.evaluate(() => document.querySelector("#cli-history-list").textContent.includes("CLI 历史 A")));
   await page.locator("#cli-history-dialog [data-close]").click();
@@ -145,14 +144,16 @@ try {
   await wait("#session-title", "在 B 新建");
   const created = await (await fetch(new URL("/api/sessions", app.url))).json();
   assert.equal(created.sessions.find(item => item.name === "在 B 新建")?.cwd, b);
-  await choose(a, aId, "CLI 历史 A");
+  await choose(a, aId);
+  await click(row(aId));
   await wait("#session-title", "Web 会话 A");
   await wait("#prompt:enabled");
   assert.equal(await selectValue("#prompt"), "草稿只属于 A");
   await page.goto(app.url.origin);
   await wait("#workspace-select");
-  assert.equal(await selectValue("#workspace-select"), a, "Workspace selection survives reload");
-  assert(!await exists(row(bId)));
+  assert.equal(await selectValue("#workspace-select"), "", "Both bookmark groups are visible after reload");
+  await wait(row(bId));
+  await choose(a, aId);
   assert(!await page.evaluate(cwd => Array.from(document.querySelector("#workspace-select").options).some(option => option.value === cwd), hidden));
   await capture("desktop-workspace-a");
   await theme("dark");
@@ -167,21 +168,22 @@ try {
   native.state.durable = "fixture-b-current";
   native.state.messages = [{ role: "assistant", content: "CLI_BETA_MESSAGE" }];
   await wait("#cli-follow-messages", "CLI_BETA_MESSAGE");
-  assert.equal(await selectValue("#workspace-select"), b, "Verified CLI workspace and displayed conversation move together");
+  assert.equal(await selectValue("#workspace-select"), a, "Verified CLI workspace does not rewrite the manual sidebar filter");
+  assert.equal(await page.evaluate(() => document.querySelector("#session-path").textContent), b);
   assert(!await page.evaluate(() => document.querySelector("#cli-follow-messages").textContent.includes("CLI_ALPHA_MESSAGE")));
   await capture("desktop-follow-b");
   await theme("dark");
   await capture("desktop-follow-b-dark");
   await omowright.emulate(page, { width: 320, height: 600, deviceScaleFactor: 1, mobile: true, hasTouch: true });
   const narrow = await page.evaluate(() => {
-    const path = document.querySelector("#session-path");
+    const path = document.querySelector("#session-path-short");
     return { overflow: document.documentElement.scrollWidth - innerWidth, height: path.getBoundingClientRect().height,
-      twoLines: parseFloat(getComputedStyle(path).lineHeight) * 2, value: path.textContent,
-      prefix: getComputedStyle(path, "::before").content };
+      twoLines: parseFloat(getComputedStyle(path).lineHeight) * 2, value: document.querySelector("#session-path").textContent,
+      label: path.textContent };
   });
   assert.equal(narrow.overflow, 0);
   assert.equal(narrow.value, b);
-  assert.match(narrow.prefix, /^"workspace-b · /, "Mobile heading shows the distinguishing workspace name before the truncation point");
+  assert.equal(narrow.label, "workspace-b", "Mobile heading shows the distinguishing workspace name");
   assert(narrow.height <= narrow.twoLines + 1, "A long cwd does not consume the fixed follow header");
   await capture("mobile-follow-b-dark");
   await theme("light");
@@ -189,9 +191,9 @@ try {
   await omowright.emulate(page, { width: 1050, height: 510, deviceScaleFactor: 1, mobile: false, hasTouch: false });
   assert.deepEqual(await page.evaluate(() => {
     const picker = document.querySelector("#workspace-select");
-    return [picker.selectedOptions[0].text, picker.title];
-  }), ["workspace-b", b], "Short desktop shows a compact label while retaining the full path");
-  await wait(row(bId));
+    return [picker.value, picker.title];
+  }), [a, a], "Short desktop preserves the manual scope and its full path");
+  await wait(row(aId));
   native.state.cwd = hidden;
   native.state.messages = [{ role: "assistant", content: "UNAUTHORIZED_CONTENT" }];
   await wait("#cli-follow-status");
@@ -206,16 +208,16 @@ try {
     observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
     check();
   }));
-  assert.equal(await selectValue("#workspace-select"), b, "Unapproved CLI cwd does not become selected");
+  assert.equal(await selectValue("#workspace-select"), a, "Unapproved CLI cwd does not become selected");
   assert(!await page.evaluate(() => document.body.textContent.includes("UNAUTHORIZED_CONTENT")));
   native.state.cwd = b;
   native.state.messages = [{ role: "assistant", content: "CLI_BETA_MESSAGE" }];
   await wait("#cli-follow-messages", "CLI_BETA_MESSAGE");
   await page.evaluate(() => { window.workspaceProbe.hold = true; });
   await held();
-  await choose(a, aId, "CLI 历史 A");
+  await click(row(aId));
   await release();
-  assert(!await exists(follow), "Manual workspace selection stops follow even when the response ignores cancellation");
+  assert(!await exists(follow), "Opening a Web session stops follow even when the response ignores cancellation");
   assert.equal(await selectValue("#workspace-select"), a);
   await click(row(aId));
   await wait("#prompt:enabled");
@@ -233,7 +235,7 @@ try {
   assert.deepEqual(probe, { posts: [], errors: 0 }, "Scope and follow are read only and cannot accidentally resume");
   assert(native.trace.length > 0 && native.trace.every(frame => frame.observe === true &&
     ["get_protocol_info", "list_sessions", "get_state", "get_messages"].includes(frame.type)), "Observe never attaches or writes");
-  console.log("WORKSPACE_FOLLOW_BROWSER_OK exact-scope persisted default draft isolated read-only switch late-response ambiguity mobile-320 short-desktop");
+  console.log("WORKSPACE_FOLLOW_BROWSER_OK exact scope, independent filter, isolated draft, read-only switch, late response, ambiguity, mobile-320 and short desktop");
 } finally {
   try { await browser?.close(); } finally {
     try { await app?.stop(); } finally {

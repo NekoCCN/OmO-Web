@@ -33,15 +33,12 @@ function toolState(call?: Wire, trace?: ToolTrace, result?: Wire): keyof typeof 
   return !result && trace?.stage === "running" ? "running" : "unknown";
 }
 
-function glyph(path: SVGPathElement): SVGSVGElement {
+function glyph(path: SVGPathElement, size = "16"): SVGSVGElement {
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("aria-hidden", "true");
-  svg.setAttribute("fill", "none");
-  svg.setAttribute("stroke", "currentColor");
-  svg.setAttribute("stroke-width", "2");
-  svg.setAttribute("stroke-linecap", "round");
-  svg.setAttribute("stroke-linejoin", "round");
+  for (const [name, value] of Object.entries({
+    viewBox: "0 0 24 24", width: size, height: size, "aria-hidden": "true",
+    fill: "none", stroke: "currentColor", "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round",
+  })) svg.setAttribute(name, value);
   svg.append(path);
   return svg;
 }
@@ -89,7 +86,7 @@ export class ToolDisplay {
     subject.append(kind, this.label, this.operation, this.target, this.preview, this.compactFacts);
     const state = el("span", "tool-state");
     state.append(glyph(this.icon), this.status);
-    summary.append(chevron, subject, state);
+    summary.append(chevron, subject, " ", state);
 
     this.identity.append(this.name);
     this.rawArgs.append(el("summary", "", tr("原始参数", "Raw arguments")));
@@ -126,7 +123,7 @@ export class ToolDisplay {
     if (repeatedRecap) card.dataset.repeatRecap = "";
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
     path.setAttribute("d", recap.kind === "todo" ? "m3 12 6 6L21 6" : toolGlyphs[recap.kind]);
-    const emblem = glyph(path);
+    const emblem = glyph(path, "0");
     emblem.classList.add("tool-card-emblem");
     card.append(emblem, renderToolCard(projection));
     this.node.append(card);

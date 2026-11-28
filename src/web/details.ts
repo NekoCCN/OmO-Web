@@ -324,7 +324,7 @@ const runtimeInvalidReason: Readonly<Record<string, string>> = {
   "duplicate-id": tr("会话树有重复标识", "The session tree contains duplicate IDs."),
   "broken-ancestry": tr("分支链断裂或指向其他分支", "The branch chain is broken or points to another branch."),
   "tree-budget": tr("会话树超出读取上限，可能不完整", "The session tree exceeds the read limit and may be incomplete."),
-  "incomplete": tr("历史超出分支读取上限", "The branch history exceeds the read limit."),
+  "incomplete": tr("分支记录超出读取上限", "The branch records exceed the read limit."),
   "ownership_changed": tr("会话或活动分支已变化", "The session or active branch changed."),
   "binding_unverified": tr("无法确认会话归属", "The session binding could not be verified."),
   "unsupported": tr("当前宿主不支持有界分支读取", "The current host does not support bounded branch reads."),
@@ -333,7 +333,7 @@ const runtimeInvalidReason: Readonly<Record<string, string>> = {
 
 function runtimeBranchPanel(runtime: Wire): HTMLElement {
   const section = el("section", "subpanel stack stack--tight");
-  section.append(el("h3", "", tr("待办 · 当前活动分支", "Todo · Active branch")));
+  section.append(el("h3", "", tr("当前待办", "Current Todo")));
   if (runtime.status === "loading") {
     const status = el("p", "small muted", tr("正在读取当前分支…", "Loading the active branch…"));
     status.setAttribute("role", "status");
@@ -357,35 +357,69 @@ function runtimeBranchPanel(runtime: Wire): HTMLElement {
   section.append(el("p", "small muted", leaf ? tr(`活动分支：${leaf}`, `Active branch: ${leaf}`) : tr("当前没有活动分支。", "No branch is active.")));
   const todo = object(runtime.todo);
   if (str(todo.status) === "ok") {
-    const phases = list(todo.phases).map(object);
-    const incomplete = runtime.incomplete === true;
-    if (!phases.length) {
-      section.append(el("p", "small muted", tr("当前活动分支待办为空（原生明确返回空列表）。", "The native host returned an empty Todo list for the active branch.")));
-    } else {
-      const items = el("ul", "inline-list");
-      for (const phase of phases) {
-        const entry = el("li", "stack stack--tight");
-        entry.append(el("p", "plain", str(phase.name) || tr("待办", "Todo")));
-        const lines = el("ul", "inline-list");
-        for (const task of list(phase.tasks).map(object)) {
-          const line = el("li");
-          line.append(el("p", "small break", `${todoStatusText[str(task.status)] ?? str(task.status)} · ${str(task.content)}`));
-          lines.append(line);
-        }
-        if (lines.childElementCount) entry.append(lines);
-        items.append(entry);
-      }
-      const groups = items.childElementCount;
-      section.append(fold(tr(`待办（${number.format(groups)} 组）${incomplete ? " · 内容已截断" : ""}`,
-        `Todo (${number.format(groups)} ${groups === 1 ? "group" : "groups"})${incomplete ? " · Truncated" : ""}`),
-        el("p", "small muted", tr("只读：来自所选活动分支的最新原生记录；其他分支与原始自定义内容不在此显示。",
-          "Read-only. Shows the latest native record for the selected branch. Other branches and raw custom entries are not shown.")), items));
+    const items = todoPhases(todo);
+    const groups = items.childElementCount;
+    if (groups) {
+      const checklist = fold(tr(`待办（${number.format(groups)} 组）`, `Todo (${number.format(groups)} ${groups === 1 ? "group" : "groups"})`),
+        items);
+      checklist.open = true;
+      section.append(checklist);
     }
-    if (incomplete && phases.length) section.append(el("p", "small muted", tr("待办内容超出显示上限，仅显示前面的记录。", "The Todo list exceeds the display limit. Only the first entries are shown.")));
+  } else if (todo.status === "none") {
+    section.append(el("p", "small muted", tr("所选分支没有当前待办。", "No current Todo on the selected branch.")));
   } else {
-    section.append(el("p", "small muted", tr("当前分支未报告待办，数量未知。", "No Todo record was reported for the active branch. The task count is unknown.")));
+    const reason = runtimeInvalidReason[str(todo.reason)] ?? "";
+    section.append(el("p", "small muted", [tr("当前待办不可用，数量未知。可刷新重试。",
+      "Current Todo is unavailable. The task count is unknown. Refresh to try again."), reason].filter(Boolean).join(" ")));
   }
   return section;
+}
+
+function todoPhases(data: Wire): HTMLElement {
+  const items = el("ul", "inline-list");
+  for (const phase of list(data.phases).map(object)) {
+    const entry = el("li", "stack stack--tight");
+    entry.append(el("p", "plain break", str(phase.name) || tr("待办", "Todo")));
+    const tasks = el("ul", "inline-list");
+    for (const task of list(phase.tasks).map(object)) {
+      const line = el("li");
+      line.append(el("p", "small break", `${todoStatusText[str(task.status)] ?? str(task.status)} · ${str(task.content)}`));
+      tasks.append(line);
+    }
+    if (tasks.childElementCount) entry.append(tasks);
+    items.append(entry);
+  }
+  return items;
+}
+
+export function renderTodoHistory(data?: Wire): HTMLElement[] {
+  const status = el("p", "small muted");
+  status.setAttribute("role", "status");
+  if (!data) {
+    status.textContent = tr("正在读取已记录的待办列表…", "Loading recorded Todo lists…");
+    return [status];
+  }
+  if (data.status !== "ok" || !Array.isArray(data.snapshots) || typeof data.limitReached !== "boolean") {
+    status.textContent = data.status === "ownership_changed"
+      ? tr("无法核验历史所属分支。可刷新重试。", "The branch for this history could not be verified. Refresh to try again.")
+      : tr("无法读取已记录的待办列表。可刷新重试。", "Recorded Todo lists are unavailable. Refresh to try again.");
+    return [status];
+  }
+  const snapshots = list(data.snapshots).map(object);
+  status.textContent = snapshots.length
+    ? tr("所选分支已记录的列表，按新到旧排列。", "Recorded lists for the selected branch, newest first.")
+    : data.limitReached
+      ? tr("在读取范围内未找到已记录的列表，更早的记录未知。", "No recorded lists in the read window. Older records are unknown.")
+      : tr("所选分支没有已记录的历史列表。", "No recorded lists for the selected branch.");
+  const items = el("ol", "inline-list");
+  for (const [index, snapshot] of snapshots.entries()) {
+    const item = el("li", "stack stack--tight");
+    item.append(el("h4", "", tr(`记录 ${number.format(index + 1)}`, `Recorded list ${number.format(index + 1)}`)), todoPhases(snapshot));
+    items.append(item);
+  }
+  return [status, ...(snapshots.length ? [items] : []), ...(snapshots.length && data.limitReached ? [
+    el("p", "small muted", tr("已达历史读取上限，更早的记录可能未显示。", "The read limit was reached. Older records may not appear.")),
+  ] : [])];
 }
 
 function branchMemory(runtime: Wire): Node[] {
@@ -460,8 +494,11 @@ export function renderDetailsBranch(runtime: Wire): void {
   branch.dataset.runtimeBranch = "";
   if (oldBranch) oldBranch.replaceWith(branch);
   else todo.prepend(branch);
-  byId("runtime-memory-branch-content", HTMLElement).replaceChildren(...branchMemory(runtime));
   if (focusTodo) (nextTodo?.querySelector("summary") ?? todo).focus({ preventScroll: true });
+}
+
+export function renderDetailsBranchMemory(runtime: Wire): void {
+  byId("runtime-memory-branch-content", HTMLElement).replaceChildren(...branchMemory(runtime));
 }
 
 export function showNativeActivity(host: HTMLElement, data: Wire): void {

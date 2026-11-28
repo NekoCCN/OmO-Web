@@ -25,7 +25,6 @@ export type RuntimeBranchView =
   | { readonly status: "ok"; readonly leafId: string | null; readonly todo: BranchTodoView; readonly memory: BranchMemoryView; readonly incomplete?: true };
 
 const TODO_STATE_TYPE = "senpi.todo-state";
-const TODO_TOOL_NAMES: readonly string[] = ["todo", "todowrite"];
 const NUDGED_TYPE = "omo-kibitzer:nudged";
 const GATE_TYPE = "omo-kibitzer:gate";
 const UNAVAILABLE_TYPE = "omo-kibitzer:unavailable";
@@ -157,8 +156,10 @@ function readCustomTodo(entry: Fields): TodoPayload | undefined {
 function readToolTodo(entry: Fields): TodoPayload | undefined {
   if (entry.type !== "message") return undefined;
   const message = record(entry.message);
-  if (message.role !== "toolResult" || !TODO_TOOL_NAMES.includes(message.toolName as string)) return undefined;
-  return readTodoPayload(message.details);
+  if (message.role !== "toolResult" || message.isError === true ||
+      (message.toolName !== "todo" && message.toolName !== "todowrite")) return undefined;
+  const details = record(message.details);
+  return details.op === "view" ? undefined : readTodoPayload(details);
 }
 
 function isNudgedRecord(data: Fields): boolean {
@@ -292,6 +293,17 @@ function capTodo(phases: TodoPhaseView[]): { phases: TodoPhaseView[]; truncated:
   return { phases: kept, truncated: false };
 }
 
+export function projectTodoRecord(entry: Fields): TodoPayload | undefined {
+  const todo = readCustomTodo(entry) ?? readToolTodo(entry);
+  if (todo === undefined || todo.truncated) return todo;
+  return capTodo(todo.phases);
+}
+
+export function currentBranchTodo(phases: readonly TodoPhaseView[]): BranchTodoView {
+  return phases.some(phase => phase.tasks.some(task => task.status === "pending" || task.status === "in_progress"))
+    ? { status: "ok", phases } : { status: "none" };
+}
+
 export function projectRuntimeBranch(tree: unknown): RuntimeBranchView {
   const root = record(tree);
   if (!Array.isArray(root.tree)) return { status: "invalid", reason: "missing-tree" };
@@ -332,7 +344,7 @@ export function projectRuntimeBranch(tree: unknown): RuntimeBranchView {
     const todo = readCustomTodo(entry) ?? readToolTodo(entry);
     if (todo) {
       phases = todo.phases;
-      if (todo.truncated) incomplete = true;
+      incomplete = todo.truncated;
     }
     if (entry.type !== "custom" || typeof entry.customType !== "string") continue;
     const data = record(entry.data);

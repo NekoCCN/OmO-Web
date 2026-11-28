@@ -5,9 +5,10 @@ import { MessagesFrameError } from "./bounded-messages.ts";
 import { composeMessage, projectCommands, refuseRuntimeCommandRelay, resolveCommand } from "./commands.ts";
 import { modelProfile, registeredModel } from "./model-options.ts";
 import type { ModelTarget } from "./model-options.ts";
-import { bindNativeRuntime, navigateSessionTree, readBranchRuntime, readNativeDag, readNativeRuntime, readSessionTree,
-  readWorkbenchStatus, unavailableNativeRuntime } from "./native-runtime.ts";
+import { bindNativeRuntime, navigateSessionTree, readBranchRuntime, readCurrentTodo, readNativeDag, readNativeDagHistory,
+  readNativeRuntime, readSessionTree, readTodoHistory, readWorkbenchStatus, unavailableNativeRuntime } from "./native-runtime.ts";
 import type { NativeRuntimeBinding, RuntimeInactiveReason, RuntimeReadScope } from "./native-runtime.ts";
+import type { DagScope } from "./native-runtime-projection.ts";
 import { readNativeSurfaces } from "./native-surfaces.ts";
 import { WebError, array, browserEvent, model, pick, record, sessionKey, state } from "./protocol.ts";
 import type { Action, SessionKey, WireObject } from "./protocol.ts";
@@ -843,6 +844,14 @@ export class Sessions {
     return readBranchRuntime(this.#historyRead(id));
   }
 
+  currentTodo(id: SessionKey) {
+    return readCurrentTodo(this.#historyRead(id));
+  }
+
+  todoHistory(id: SessionKey) {
+    return readTodoHistory(this.#historyRead(id));
+  }
+
   async #navigate(id: SessionKey, action: Extract<Action, { action: "navigate" }>) {
     const scope = this.#runtimeRead(id);
     let write: { pending: boolean } | undefined;
@@ -859,8 +868,12 @@ export class Sessions {
     }
   }
 
-  nativeDag(id: SessionKey, key: string) {
-    return readNativeDag(this.#runtimeRead(id), key);
+  nativeDag(id: SessionKey, key: string, scope: DagScope) {
+    return readNativeDag(this.#runtimeRead(id), key, scope);
+  }
+
+  nativeDagHistory(id: SessionKey) {
+    return readNativeDagHistory(this.#runtimeRead(id));
   }
 
   /** Web alias for this native session and authorized directory identity.

@@ -6,7 +6,27 @@
   --hud-sweep-line: color-mix(in srgb, var(--accent), transparent 94%);
 }
 
-#cli-history-list .session-link { justify-content: stretch; }
+:is(#cli-history-list, #cli-history-web-list) { gap: var(--s1); padding: 0; }
+:is(#cli-history-list, #cli-history-web-list, #session-list) .session-link {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  justify-content: stretch;
+  gap: var(--s1) var(--s2);
+}
+:is(#cli-history-list, #cli-history-web-list) .session-link span { white-space: normal; overflow-wrap: anywhere; }
+#cli-history-directory { inline-size: 100%; min-inline-size: 0; text-overflow: ellipsis; }
+#cli-history-directory-path { padding-inline: var(--s1); }
+:is(#cli-history-activity, #cli-history-messages):empty { display: none; }
+.sessions .session-group + .session-group { margin-block-start: var(--s3); }
+.session-group { display: grid; min-inline-size: 0; gap: var(--s1); }
+.session-group-heading {
+  padding-inline: var(--s3);
+  color: var(--ink);
+  font-size: var(--small);
+  text-wrap: wrap;
+}
+.sessions .session-group-path { padding: 0 var(--s3); font-size: var(--caption); }
+#session-list .session-link { color: var(--ink); }
 .workspace-tools { display: grid; grid-template-columns: minmax(0, 1fr); gap: inherit; }
 .workspace-tools:has(#workspace-browser-button:not([hidden])) { grid-template-columns: minmax(0, 1fr) auto; }
 .workspace-tools:has(#workspace-field:not([hidden])) > #new-sidebar { grid-column: 1 / -1; }
@@ -52,9 +72,10 @@ button.workspace-entry { color: var(--accent); }
   color: var(--warning);
 }
 .workspace-approval > .workspace-full-path { color: var(--ink); }
-.cli-launchers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s1); }
+.cli-launchers { display: grid; grid-template-columns: max-content repeat(2, minmax(0, 1fr)); gap: var(--s1); }
 .cli-launchers .button { gap: var(--s1); padding-inline: var(--s1); font-size: var(--caption); line-height: 1.25; text-wrap: balance; }
 .cli-launchers .icon { inline-size: var(--s3); block-size: var(--s3); }
+#cli-history-button { color: var(--accent); }
 #cli-follow-button[aria-pressed="true"] { background: var(--accent-tint); color: var(--accent); }
 .workspace-actions #cli-follow-stop { inline-size: auto; padding-inline: var(--s2); white-space: nowrap; }
 #cli-follow-view { padding-block-start: 0; }
@@ -402,7 +423,9 @@ button.workspace-entry { color: var(--accent); }
 #runtime-memory-branch-content .details-list dd { text-align: end; }
 #runtime-instructions { --runtime-fold-radius: var(--r2); padding: 0; background: var(--surface); }
 #runtime-instructions-text { white-space: pre-wrap; }
-#details-dialog:modal .runtime-resources summary { min-block-size: var(--touch); }
+#details-dialog:modal :is(.runtime-resources summary, #runtime-todo-history > summary, #runtime-dag-history > summary) {
+  min-block-size: var(--touch);
+}
 
 #rail-toggle {
   flex: none;
@@ -565,9 +588,6 @@ button.workspace-entry { color: var(--accent); }
 
 @media (width > 760px) {
   .sidebar-head { padding-block: var(--s4) var(--s2); gap: var(--s2); }
-  #session-list .session-link { grid-template-columns: minmax(0, 1fr) auto; gap: 0 var(--s2); }
-  #session-list .session-link > :first-child { grid-column: 1 / -1; }
-  #session-list .session-link > small { grid-area: 2 / 2; }
   :is(#messages, #cli-follow-messages) > .message > header { flex-direction: column; gap: 0; }
   :is(#messages, #cli-follow-messages) > .message--user > header { padding-block-start: var(--s1); }
   .request-controls--choice { display: flex; flex-wrap: wrap; align-items: end; }
@@ -585,6 +605,18 @@ button.workspace-entry { color: var(--accent); }
   #workspace-browser-button { min-inline-size: var(--control); }
   #workspace-browser-button > span { display: none; }
   #workspace-select { padding-inline: var(--s2); }
+}
+
+@media (max-width: 760px) {
+  #cli-history-index > .workspace-path-form { grid-template-columns: minmax(0, 1fr); }
+  #cli-history-directory-path { grid-row: 2; }
+  #cli-history-browse { justify-self: start; }
+  :is(#cli-history-list, #cli-history-web-list) .session-link { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (width <= 760px) and (height <= 36rem) {
+  .sidebar.is-open { grid-template-rows: repeat(3, max-content); align-content: start; overflow: auto; overscroll-behavior: contain; }
+  .sidebar.is-open .session-rail { overflow: visible; }
 }
 
 @container workbench (inline-size < 40rem) {

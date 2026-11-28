@@ -8,7 +8,10 @@ import type { BranchSource } from "./session-branches.ts";
 import { WorkspaceAccess } from "./workspace-access.ts";
 
 /**
- * Scan and read budgets. list() stats every candidate, ranks newest first,
+ * Scan and read budgets. An exact catalog checks only its native bucket and
+ * ranks matching recorded cwd headers. Each exact summary samples at most
+ * two maxHeaderBytes windows, regardless of journal size. Legacy list() stats
+ * every candidate, ranks newest first,
  * then fully parses only what fits: at most maxListFiles files and
  * maxListBytes aggregate content bytes, returning at most maxSessions
  * summaries. Journals above maxFileBytes skip the full parse: list()
@@ -49,9 +52,10 @@ export type CliSessionDetail = {
   readonly internal: { readonly nativeSessionId: string };
 };
 
-type FileRef = { readonly root: string; readonly dir: string; readonly path: string; readonly workspaceKey?: string };
+type HistoryDirectory = { readonly root: string; readonly workspaceKey?: string };
+type FileRef = HistoryDirectory & { readonly path: string };
 export type ScopedBranchSource = BranchSource & { readonly workspaceKey?: string };
-type ScopedSummary = CliSessionSummary & { readonly nativeSessionId: string; readonly workspaceKey?: string };
+export type ScopedSummary = CliSessionSummary & { readonly nativeSessionId: string; readonly workspaceKey?: string };
 
 type LoadedContent = {
   readonly sessionId: string;
@@ -123,16 +127,21 @@ export class CliHistory {
 
   /** Server-only list carrying the durable native id per row for alias coalescing.
    * Never serialize nativeSessionId to the browser; the public list stays opaque. */
-  async listWithIds(): Promise<{ readonly available: boolean;
+  async listWithIds(scope?: HistoryDirectory): Promise<{ readonly available: boolean;
     readonly sessions: readonly ScopedSummary[] }> {
-    const scanned = await this.#scan();
+    const scanned = await this.#scan(scope);
     if (!scanned.available) return { available: false, sessions: [] };
-    const candidates: { file: FileRef; mtimeMs: number; size: number }[] = [];
+    const candidates: { file: FileRef; mtimeMs: number; size: number; sessionId?: string }[] = [];
     for (const file of scanned.files) {
       try {
         const target = await lstat(file.path);
         if (!target.isFile()) continue;
-        candidates.push({ file, mtimeMs: target.mtimeMs, size: target.size });
+        // Native's flattened bucket name is not injective. In a scoped list,
+        // ignore journals for a colliding cwd before ranking or sampling.
+        const header = scope === undefined ? undefined : await this.#headerOf(file.path);
+        if (scope !== undefined && header?.cwd !== scope.root) continue;
+        candidates.push({ file, mtimeMs: target.mtimeMs, size: target.size,
+          ...(header === undefined ? {} : { sessionId: header.sessionId }) });
       } catch {
         continue;
       }
@@ -141,28 +150,34 @@ export class CliHistory {
     const sessions: ScopedSummary[] = [];
     let bytes = 0;
     let parsed = 0;
+    const sampleLimit = 2 * CLI_HISTORY_LIMITS.maxHeaderBytes;
+    const fullLimit = scope === undefined ? CLI_HISTORY_LIMITS.maxFileBytes : sampleLimit;
     for (const candidate of candidates) {
       if (sessions.length >= CLI_HISTORY_LIMITS.maxSessions ||
         parsed >= CLI_HISTORY_LIMITS.maxListFiles || bytes >= CLI_HISTORY_LIMITS.maxListBytes) break;
+      const budget = candidate.size <= fullLimit ? candidate.size : sampleLimit;
+      // Reserve scoped bytes and attempts even if the candidate is invalidated
+      // during the read. A growing small journal cannot exceed its reservation.
+      if (scope !== undefined && budget > CLI_HISTORY_LIMITS.maxListBytes - bytes) continue;
       try {
         if (!await this.#rootMatches(candidate.file)) continue;
-        if (candidate.size <= CLI_HISTORY_LIMITS.maxFileBytes) {
-          const loaded = await this.#loadContent(candidate.file.path);
+        if (scope !== undefined) {
           parsed += 1;
-          bytes += loaded.bytes;
-          if (loaded.cwd !== candidate.file.root || !await this.#rootMatches(candidate.file)) continue;
-          sessions.push({ id: loaded.sessionId, name: nameOf(loaded.entries, loaded.cwd),
-            cwd: loaded.cwd, updatedAt: loaded.updatedAt, nativeSessionId: loaded.sessionId,
-            ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
-        } else {
-          const oversized = await this.#summarizeOversized(candidate.file.path);
-          parsed += 1;
-          bytes += oversized.sampledBytes;
-          if (oversized.cwd !== candidate.file.root || !await this.#rootMatches(candidate.file)) continue;
-          sessions.push({ id: oversized.sessionId, name: oversized.name,
-            cwd: oversized.cwd, updatedAt: oversized.updatedAt, nativeSessionId: oversized.sessionId,
-            ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
+          bytes += budget;
         }
+        const summary = candidate.size <= fullLimit
+          ? await this.#loadContent(candidate.file.path, scope === undefined ? undefined : budget)
+          : await this.#summarizeOversized(candidate.file.path, fullLimit);
+        if (scope === undefined) {
+          parsed += 1;
+          bytes += summary.bytes;
+        }
+        if (summary.cwd !== candidate.file.root || (candidate.sessionId !== undefined && summary.sessionId !== candidate.sessionId) ||
+          !await this.#rootMatches(candidate.file)) continue;
+        const { sessionId, cwd, updatedAt } = summary;
+        const name = "entries" in summary ? nameOf(summary.entries, cwd) : summary.name;
+        sessions.push({ id: sessionId, name, cwd, updatedAt, nativeSessionId: sessionId,
+          ...(candidate.file.workspaceKey === undefined ? {} : { workspaceKey: candidate.file.workspaceKey }) });
       } catch {
         continue;
       }
@@ -173,7 +188,7 @@ export class CliHistory {
 
   async read(id: string, cwd?: string, workspaceKey?: string): Promise<CliSessionDetail> {
     checkId(id);
-    const scanned = await this.#scan();
+    const scanned = await this.#scan(cwd === undefined ? undefined : { root: cwd, workspaceKey });
     if (!scanned.available) throw unavailable();
     for (const file of scanned.files) {
       if ((cwd !== undefined && cwd !== file.root) ||
@@ -200,7 +215,7 @@ export class CliHistory {
     if (policy instanceof WorkspaceAccess ? workspaceKey === undefined ||
       (expectedKey !== undefined && workspaceKey !== expectedKey) :
       !policy.includes(cwd) || await realpath(cwd).catch(() => undefined) !== cwd) throw notFound();
-    const scanned = await this.#scan();
+    const scanned = await this.#scan({ root: cwd, workspaceKey });
     if (!scanned.available) throw unavailable();
     let sourcePath: string | undefined;
     for (const file of scanned.files) {
@@ -238,7 +253,7 @@ export class CliHistory {
       (file.workspaceKey !== undefined && await this.#workspaces.exact(file.root) === file.workspaceKey);
   }
 
-  async #scan(): Promise<{ available: boolean; files: FileRef[] }> {
+  async #scan(scope?: HistoryDirectory): Promise<{ available: boolean; files: FileRef[] }> {
     if (this.#agentDir === undefined) return { available: false, files: [] };
     const base = join(this.#agentDir, "sessions");
     try {
@@ -247,9 +262,12 @@ export class CliHistory {
       return { available: false, files: [] };
     }
     const files: FileRef[] = [];
-    for (const root of await this.#rootsList()) {
+    const roots = await (scope === undefined || !(this.#workspaces instanceof WorkspaceAccess) ? this.#rootsList() : [scope.root]);
+    for (const root of roots) {
+      if (scope !== undefined && root !== scope.root) continue;
       const workspaceKey = this.#workspaces instanceof WorkspaceAccess ? await this.#workspaces.exact(root) : undefined;
-      if (this.#workspaces instanceof WorkspaceAccess && workspaceKey === undefined) continue;
+      if ((this.#workspaces instanceof WorkspaceAccess && workspaceKey === undefined) ||
+        (scope?.workspaceKey !== undefined && workspaceKey !== scope.workspaceKey)) continue;
       const dir = join(base, sessionDirName(root));
       try {
         if (!(await lstat(dir)).isDirectory()) continue;
@@ -257,7 +275,7 @@ export class CliHistory {
         const names = dirents.filter(entry => entry.isFile() && entry.name.endsWith(".jsonl")).map(entry => entry.name);
         names.sort();
         for (const name of names.slice(0, CLI_HISTORY_LIMITS.maxFilesPerDir)) {
-          files.push({ root, dir, path: join(dir, name), ...(workspaceKey === undefined ? {} : { workspaceKey }) });
+          files.push({ root, path: join(dir, name), ...(workspaceKey === undefined ? {} : { workspaceKey }) });
         }
       } catch {
         continue;
@@ -266,16 +284,20 @@ export class CliHistory {
     return { available: true, files };
   }
 
-  async #headerOf(path: string, branch = false): Promise<{ sessionId: string; cwd: string; version: unknown } | undefined> {
+  async #headerOf(path: string): Promise<{ sessionId: string; cwd: string } | undefined> {
     let handle: FileHandle | undefined;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const target = await handle.stat();
-      if (!target.isFile() || (branch && (target.nlink !== 1 || (process.getuid && target.uid !== process.getuid()) ||
-        (process.platform === "linux" && await realpath(`/proc/self/fd/${handle.fd}`) !== path)))) return undefined;
-      const { header } = parse(await readPrefix(handle, CLI_HISTORY_LIMITS.maxHeaderBytes));
+      if (!target.isFile()) return undefined;
+      // A well-formed native header is the first line. Avoid reading a
+      // whole prefix while classifying each candidate in an exact catalog.
+      const opening = await readAt(handle, 0, Math.min(target.size, 4096));
+      const end = opening.indexOf("\n");
+      const first = end < 0 ? undefined : parse(opening.slice(0, end)).header;
+      const header = first ?? parse(await readPrefix(handle, CLI_HISTORY_LIMITS.maxHeaderBytes)).header;
       if (!header || typeof header.cwd !== "string") return undefined;
-      return { sessionId: header.id as string, cwd: header.cwd, version: header.version };
+      return { sessionId: header.id as string, cwd: header.cwd };
     } catch {
       return undefined;
     } finally {
@@ -283,13 +305,16 @@ export class CliHistory {
     }
   }
 
-  async #loadContent(path: string): Promise<LoadedContent> {
+  async #loadContent(path: string, summaryBudget?: number): Promise<LoadedContent> {
     let handle: FileHandle | undefined;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const target = await handle.stat();
       if (!target.isFile()) throw invalid();
-      const { text, bytes } = await readText(handle, target.size, CLI_HISTORY_LIMITS.maxFileBytes);
+      if (summaryBudget !== undefined && target.size > summaryBudget) throw tooLarge();
+      const { text, bytes } = summaryBudget === undefined
+        ? await readText(handle, target.size, CLI_HISTORY_LIMITS.maxFileBytes)
+        : { text: await readAt(handle, 0, target.size), bytes: target.size };
       const { header, entries } = parse(text);
       if (!header || typeof header.cwd !== "string") throw invalid();
       return { sessionId: header.id as string, cwd: header.cwd, updatedAt: Math.floor(target.mtimeMs), bytes, entries };
@@ -302,21 +327,21 @@ export class CliHistory {
     }
   }
 
-  /** Bounded summary for a journal above maxFileBytes: header plus newest sampled
+  /** Bounded summary for a journal above the current list's full-parse limit: header plus newest sampled
    * rename from the first and last maxHeaderBytes windows, complete records
    * only. Never reads the body between the windows and never projects messages.
    * A journal that shrank to the full-parse cap after listing is skipped here
    * and picked up on the next refresh. Sampling misses renames strictly between
    * the windows, falling back to the workspace cwd. The caller charges
-   * sampledBytes against list budgets and revalidates cwd and workspace. */
-  async #summarizeOversized(path: string): Promise<{ readonly sessionId: string;
-    readonly cwd: string; readonly name: string; readonly updatedAt: number; readonly sampledBytes: number }> {
+   * bytes against list budgets and revalidates cwd and workspace. */
+  async #summarizeOversized(path: string, fullLimit: number): Promise<{ readonly sessionId: string;
+    readonly cwd: string; readonly name: string; readonly updatedAt: number; readonly bytes: number }> {
     const window = CLI_HISTORY_LIMITS.maxHeaderBytes;
     let handle: FileHandle | undefined;
     try {
       handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       const target = await handle.stat();
-      if (!target.isFile() || target.size <= CLI_HISTORY_LIMITS.maxFileBytes) throw invalid();
+      if (!target.isFile() || target.size <= fullLimit) throw invalid();
       const headText = await readAt(handle, 0, window);
       const cut = headText.lastIndexOf("\n");
       if (cut < 0) throw invalid();
@@ -340,7 +365,7 @@ export class CliHistory {
       }
       return { sessionId: header.id as string, cwd: header.cwd,
         name: nameOf([...entries, ...tailEntries], header.cwd),
-        updatedAt: Math.floor(target.mtimeMs), sampledBytes: window + tailLen };
+        updatedAt: Math.floor(target.mtimeMs), bytes: window + tailLen };
     } catch (error) {
       if (error instanceof WebError) throw error;
       if ((error as NodeJS.ErrnoException)?.code === "ELOOP") throw invalid();

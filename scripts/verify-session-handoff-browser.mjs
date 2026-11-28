@@ -123,6 +123,9 @@ export async function openBrowserProof() {
       assert.equal(new URL(origin).hostname, "127.0.0.1");
       await page.goto(origin);
       await click("#cli-history-button");
+      await ready("#cli-history-directory:not(:disabled)");
+      const cwd = await page.evaluate(() => document.querySelector("#cli-history-directory").options[1].value);
+      await page.locator("#cli-history-directory").selectOption(cwd);
       await click("#cli-history-list button");
       await ready("#cli-history-messages article", marker);
       await ready("#cli-history-resume:not(:disabled)");

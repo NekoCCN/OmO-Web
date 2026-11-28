@@ -11,6 +11,9 @@ const unavailable = (reason: string) => ({ status: "unavailable", reason });
 const all = (section: object) => ({ tasks: section, dag: section, memory: section });
 const time = Date.parse("2026-11-25T12:34:56.000Z");
 const keys = z.object({ session: z.object({ id: z.string() }) });
+const activeStatuses = ["pending", "running", "paused"];
+const closedStatuses = ["completed", "failed", "cancelled"];
+const unknownWindow = unavailable("native_window_unverified");
 
 async function usingApp(mode: string, run: (fixture: {
   readonly app: Awaited<ReturnType<typeof startApp>>;
@@ -52,7 +55,8 @@ test("native runtime GET projects nonempty data with fixed RPCs and no native st
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect(await response.json()).toEqual({
       tasks: { status: "ok", rows: [{ status: "error", createdAt: time, updatedAt: time }], omittedCount: 0 },
-      dag: { status: "ok", rows: [{ status: "running", createdAt: time, updatedAt: time, nodeCount: 3 }], limitReached: false },
+      dag: { status: "ok", rows: [{ status: "running", createdAt: time, updatedAt: time, nodeCount: 3 }],
+        limitReached: false, coverage: "native_window" },
       memory: { status: "ok", totalSteps: 8, reflectedSteps: 5 },
     });
     const calls = (await readFile(log, "utf8")).trim().split("\n").map(line =>
@@ -60,7 +64,7 @@ test("native runtime GET projects nonempty data with fixed RPCs and no native st
         .parse(JSON.parse(line)));
     expect(calls.filter(call => call.type === "extension_request")).toEqual([
       { type: "extension_request", sessionId: "rpc-private-route", name: "omo.task.list", data: { parent_session_id: "native-private-durable" } },
-      { type: "extension_request", sessionId: "rpc-private-route", name: "omo.dag.list", data: { limit: 256 } },
+      { type: "extension_request", sessionId: "rpc-private-route", name: "omo.dag.list", data: { limit: 256, statuses: activeStatuses } },
       { type: "extension_request", sessionId: "rpc-private-route", name: "omo.memory.status", data: {} },
     ]);
   });
@@ -114,7 +118,7 @@ test("native runtime keeps empty lists distinct from unavailable and refuses unk
     expect(await Bun.file(log).exists()).toBe(false);
     const url = await create(app, cwd);
     expect(await (await fetch(url)).json()).toEqual({
-      tasks: { status: "empty" }, dag: { status: "empty" }, memory: { status: "ok", totalSteps: 8, reflectedSteps: 5 },
+      tasks: { status: "empty" }, dag: unknownWindow, memory: { status: "ok", totalSteps: 8, reflectedSteps: 5 },
     });
     const { token } = z.object({ token: z.string() }).parse(await (await fetch(new URL("/api/bootstrap", app.url))).json());
     const request = (path: URL, body: unknown) => fetch(path, {
@@ -132,11 +136,11 @@ test("native runtime keeps empty lists distinct from unavailable and refuses unk
 
 test.each([
   ["current", { status: "ok", currentTodo: "Review changes", pendingTodo: 1 }],
-  ["todo-zero", { status: "ok", pendingTodo: 0 }],
+  ["todo-zero", { status: "empty" }],
   ["empty", { status: "empty" }],
   ["todo-invalid", unavailable("malformed")],
   ["todo-budget", unavailable("incomplete")],
-  ["tree-current", unavailable("incomplete")],
+  ["tree-current", { status: "ok", currentTodo: "Paged Todo", pendingTodo: 0 }],
   ["todo-release", unavailable("ownership_changed")],
 ] as const)("workbench status distinguishes %s Todo without exposing the tree", async (mode, expected) => {
   await usingApp(mode, async ({ app, cwd, log }) => {
@@ -150,8 +154,9 @@ test.each([
     expect(await response.json()).toEqual(expected);
     const requests = (await readFile(log, "utf8")).slice(before).trim().split("\n")
       .map(line => z.object({ type: z.string() }).parse(JSON.parse(line)).type);
-    expect(requests).toEqual(mode === "todo-release"
-      ? ["get_state", "get_entries"] : ["get_state", "get_entries", "get_state"]);
+    expect(requests).toEqual(mode === "todo-release" ? ["get_state", "get_entries"] :
+      mode === "tree-current" ? ["get_state", "get_entries", "get_entries", "get_state"] :
+        ["get_state", "get_entries", "get_state"]);
   });
 });
 
@@ -355,43 +360,150 @@ async function listedDag(url: URL) {
   return { body, detail: new URL(`${url.pathname}/dag/${row.key}`, url) };
 }
 
+const taskKey = z.string().regex(/^[a-f0-9]{64}$/u);
+const taskKeys = z.object({ tasks: z.object({
+  rows: z.array(z.object({ key: taskKey })),
+}) });
+
+test("DAG scopes request independent Native windows and recheck membership", async () => {
+  await usingApp("select-split", async ({ app, cwd, log }) => {
+    const url = await create(app, cwd);
+    const history = new URL(`${url.pathname}/dag-history`, url);
+    const { detail } = await listedDag(url);
+    const calls = async () => (await readFile(log, "utf8")).trim().split("\n").flatMap(line => {
+      const row = z.object({ name: z.string().optional(), data: z.unknown().optional() }).parse(JSON.parse(line));
+      return row.name === "omo.dag.list" ? [row.data] : [];
+    });
+    expect(await calls()).toEqual([{ limit: 256, statuses: activeStatuses }]);
+    const closed = z.object({ status: z.literal("ok"), coverage: z.literal("native_window"),
+      rows: z.array(z.object({ key: z.string(), status: z.literal("completed") })).length(255),
+      limitReached: z.literal(false) }).parse(await (await fetch(history)).json());
+    expect(await calls()).toEqual([{ limit: 256, statuses: activeStatuses }, { limit: 256, statuses: closedStatuses }]);
+    const terminal = new URL(`${url.pathname}/dag/${closed.rows[0]?.key}`, url);
+    expect(await (await fetch(terminal)).json()).toEqual({ status: "not_found" });
+    expect(await (await fetch(new URL("?scope=history", detail))).json()).toEqual({ status: "not_found" });
+    expect(await readFile(log, "utf8")).not.toContain("omo.dag.snapshot");
+    expect(await (await fetch(new URL("?scope=history", terminal))).json()).toMatchObject({
+      status: "ok", runStatus: "completed",
+    });
+  });
+});
+
+test("a saturated Native window cannot establish that there is no active DAG", async () => {
+  await usingApp("select-saturated", async ({ app, cwd, log }) => {
+    const url = await create(app, cwd);
+    expect(await (await fetch(url)).json()).toMatchObject({ dag: unknownWindow });
+    expect(await readFile(log, "utf8")).not.toContain(`"statuses":${JSON.stringify(closedStatuses)}`);
+    const history = await (await fetch(new URL(`${url.pathname}/dag-history`, url))).json();
+    expect(history).toMatchObject({ status: "ok", coverage: "native_window", limitReached: true });
+    expect(history.rows).toHaveLength(256);
+  });
+});
+
+test.each([["select-wrong-scope", { status: "malformed" }], ["empty", unknownWindow]])(
+  "DAG history distinguishes %s from a verified empty set", async (mode, expected) => {
+    await usingApp(mode, async ({ app, cwd }) => {
+      const url = await create(app, cwd);
+      const history = new URL(`${url.pathname}/dag-history`, url);
+      expect(await (await fetch(history)).json()).toEqual(expected);
+    });
+  });
+
+test("current Todo stops at the newest visible list; history is bounded, deduped and branch-local", async () => {
+  await usingApp("tree-todo-snapshots", async ({ app, cwd, log }) => {
+    const base = await create(app, cwd);
+    const current = new URL("branch-runtime?scope=todo", base);
+    const history = new URL("todo-history", base);
+    const calls = async () => (await readFile(log, "utf8")).match(/"type":"get_entries"/g)?.length ?? 0;
+    expect(await (await fetch(current)).json()).toEqual({
+      status: "ok", leafId: "entry-200", todo: { status: "ok", phases: [{ name: "Checks", tasks: [
+        { content: "Current item", status: "in_progress" }, { content: "Done item", status: "completed" },
+      ] }] },
+    });
+    expect(await calls()).toBe(1);
+    expect(await (await fetch(history)).json()).toEqual({ status: "ok", leafId: "entry-200", limitReached: true, snapshots: [
+      { phases: [{ name: "Checks", tasks: [{ content: "Closed item", status: "completed" }] }] },
+    ] });
+    expect(await calls()).toBe(5);
+    expect((await postAction(base, { action: "navigate", targetId: "entry-198", expectedLeafId: "entry-200" })).status).toBe(200);
+    expect(await (await fetch(current)).json()).toEqual({ status: "ok", leafId: "entry-198", todo: { status: "none" } });
+    expect(await (await fetch(history)).json()).toMatchObject({ leafId: "entry-198", snapshots: [
+      { phases: [{ name: "Checks", tasks: [{ content: "Closed item", status: "completed" }] }] },
+    ] });
+    expect((await postAction(base, { action: "navigate", targetId: "entry-199", expectedLeafId: "entry-198" })).status).toBe(200);
+    expect(await (await fetch(current)).json()).toEqual({ status: "ok", leafId: "entry-199", todo: { status: "none" } });
+  });
+});
+
 test("native runtime DAG choice returns bounded local topology using only fixed read RPCs", async () => {
   await usingApp("select-current", async ({ app, cwd, log }) => {
     const url = await create(app, cwd);
     const before = (await readFile(log, "utf8")).length;
     const { body, detail } = await listedDag(url);
+    const { tasks: { rows: [first, second, unobserved] } } = taskKeys.parse(body);
+    expect(first?.key).not.toBe(second?.key);
     expect(body).toEqual({
-      tasks: { status: "ok", rows: [{ status: "error", createdAt: time, updatedAt: time,
-        agent: "explore", executionMode: "in-process" }], omittedCount: 0 },
+      tasks: { status: "ok", rows: [
+        { key: first?.key, status: "error", createdAt: time, updatedAt: time, agent: "explore", executionMode: "in-process",
+          title: "Review changes", description: "Inspect changes", configuredModel: "fixture/requested",
+          effectiveModel: { provider: "fixture", modelId: "observed", reasoning: "high" } },
+        { key: second?.key, status: "error", createdAt: time, updatedAt: time, agent: "explore", executionMode: "in-process",
+          title: "Review changes", configuredModel: "fixture/fallback" },
+        { key: unobserved?.key, status: "error", createdAt: time, updatedAt: time, agent: "explore",
+          executionMode: "in-process", title: "Prepare checks", configuredModel: "fixture/assigned" },
+      ], omittedCount: 0 },
       dag: { status: "ok", rows: [{ status: "running", createdAt: time, updatedAt: time,
-        nodeCount: 3, counts: { running: 1, completed: 2 }, key: detail.pathname.split("/").at(-1) }],
-      limitReached: false },
+        name: "Verify build", nodeCount: 3, counts: { running: 1, completed: 2 }, key: detail.pathname.split("/").at(-1) }],
+      limitReached: false, coverage: "native_window" },
       memory: { status: "ok", totalSteps: 8, reflectedSteps: 5 },
     });
     detail.search = "?runId=foreign&name=omo.dag.cancel";
     const response = await fetch(detail);
     expect(response.headers.get("cache-control")).toBe("no-store");
-    expect(await response.json()).toEqual({ status: "ok", runStatus: "running",
+    const receipt = await response.text();
+    expect(JSON.parse(receipt)).toEqual({ status: "ok", runStatus: "running", name: "Verify build",
+      createdAt: time, startedAt: time,
       waves: [{ index: 0, nodes: [0, 1] }, { index: 1, nodes: [2] }],
       nodes: [
-        { id: 0, state: "completed", attempt: 1, upstream: [], agent: "explore" },
-        { id: 1, state: "completed", attempt: 2, upstream: [] },
+        { id: 0, state: "completed", attempt: 1, upstream: [], agent: "explore", label: "Inspect build",
+          startedAt: time, completedAt: time, configuredModel: "fixture/node-override", taskKey: first?.key },
+        { id: 1, state: "completed", attempt: 2, upstream: [], taskKey: second?.key },
         { id: 2, state: "running", attempt: 1, upstream: [0, 1], category: "quick" },
       ],
     });
+    expect(`${JSON.stringify(body)}${receipt}`).not.toMatch(/PRIVATE-DO-NOT-RETURN|\/home\/private|private-(?:build|test|report)-id|st_1234567[0189]|dag_22222222/u);
     const requests = (await readFile(log, "utf8")).slice(before).trim().split("\n").map(line =>
       z.object({ type: z.string(), name: z.string().optional(), data: z.unknown().optional() }).parse(JSON.parse(line)));
     expect(requests).toEqual([
       { type: "get_state" },
       { type: "extension_request", name: "omo.task.list", data: { parent_session_id: "native-private-durable" } },
-      { type: "extension_request", name: "omo.dag.list", data: { limit: 256 } },
+      { type: "extension_request", name: "omo.dag.list", data: { limit: 256, statuses: activeStatuses } },
       { type: "extension_request", name: "omo.memory.status", data: {} },
       { type: "get_state" }, { type: "get_state" },
-      { type: "extension_request", name: "omo.dag.list", data: { limit: 256 } },
+      { type: "extension_request", name: "omo.dag.list", data: { limit: 256, statuses: activeStatuses } },
       { type: "get_state" },
       { type: "extension_request", name: "omo.dag.snapshot", data: { runId: "dag_22222222-2222-4222-8222-222222222222" } },
+      { type: "extension_request", name: "omo.task.list", data: { parent_session_id: "native-private-durable" } },
       { type: "get_state" },
     ]);
+  });
+});
+
+test.each([
+  ["select-task-unavailable", unavailable("native_unavailable")],
+  ["select-task-foreign", owned],
+  ["select-task-duplicate", { status: "malformed" }],
+  ["select-task-truncated", { status: "ok", omittedCount: 4 }],
+] as const)("DAG keeps its topology when task identity is incomplete or unproven (%s)", async (mode, expected) => {
+  await usingApp(mode, async ({ app, cwd }) => {
+    const { body, detail } = await listedDag(await create(app, cwd));
+    expect(body).toMatchObject({ tasks: expected });
+    const graph = z.object({ status: z.literal("ok"),
+      nodes: z.array(z.object({ id: z.number(), taskKey: taskKey.optional() })),
+    }).parse(await (await fetch(detail)).json());
+    expect(graph.nodes).toEqual(mode === "select-task-truncated" ?
+      [{ id: 0, taskKey: taskKeys.parse(body).tasks.rows[0]?.key }, { id: 1 }, { id: 2 }] :
+      [{ id: 0 }, { id: 1 }, { id: 2 }]);
   });
 });
 
@@ -399,6 +511,7 @@ test.each([
   ["select-foreign", owned], ["select-release", owned],
   ["select-malformed", { status: "malformed" }], ["select-overbudget", { status: "malformed" }],
   ["select-bytes", { status: "malformed" }], ["select-delisted", { status: "not_found" }],
+  ["select-crossed", { status: "not_found" }],
 ] as const)("native DAG detail fails closed for %s", async (mode, expected) => {
   await usingApp(mode, async ({ app, cwd, log }) => {
     const { detail } = await listedDag(await create(app, cwd));
@@ -410,7 +523,8 @@ test.each([
 test("DAG selectors cannot cross a binding or name a raw run; replaced workspaces cannot be read", async () => {
   await usingApp("select-current", async ({ app, cwd, log }) => {
     const url = await create(app, cwd);
-    const { detail } = await listedDag(url);
+    const { body, detail } = await listedDag(url);
+    const firstKeys = taskKeys.parse(body).tasks.rows.map(row => row.key);
     const tampered = new URL(detail);
     tampered.pathname = `${detail.pathname.slice(0, -1)}${detail.pathname.endsWith("0") ? "1" : "0"}`;
     expect(await (await fetch(tampered)).json()).toEqual({ status: "not_found" });
@@ -420,6 +534,14 @@ test("DAG selectors cannot cross a binding or name a raw run; replaced workspace
       const foreign = new URL(`${otherUrl.pathname}/dag/${detail.pathname.split("/").at(-1)}`, otherUrl);
       expect(await (await fetch(foreign)).json()).toEqual({ status: "not_found" });
       expect(await readFile(other.log, "utf8")).not.toContain("omo.dag.snapshot");
+      const { body: otherBody, detail: otherDetail } = await listedDag(otherUrl);
+      const otherKeys = taskKeys.parse(otherBody).tasks.rows.map(row => row.key);
+      expect(otherKeys.every(key => !firstKeys.includes(key))).toBe(true);
+      expect(await (await fetch(otherDetail)).json()).toMatchObject({
+        nodes: [{ taskKey: otherKeys[0] }, { taskKey: otherKeys[1] }, { id: 2 }],
+      });
+      const wrongDomain = new URL(`${otherUrl.pathname}/dag/${otherKeys[0]}`, otherUrl);
+      expect(await (await fetch(wrongDomain)).json()).toEqual({ status: "not_found" });
     });
     const before = await readFile(log, "utf8");
     expect(before).not.toContain("omo.dag.snapshot");
@@ -478,7 +600,7 @@ realRuntime("reads two real Web bindings and seeded DAG/task records through iso
       const receipt = await response.text();
       expect(response.status).toBe(200);
       expect(JSON.parse(receipt)).toEqual({
-        tasks: { status: "empty" }, dag: { status: "empty" },
+        tasks: { status: "empty" }, dag: unknownWindow,
         memory: { status: "ok", totalSteps: 0, reflectedSteps: 0 },
       });
       const snapshotUrl = new URL(url);
@@ -501,15 +623,18 @@ realRuntime("reads two real Web bindings and seeded DAG/task records through iso
     const privateText = "PRIVATE-SEED /tmp/not-for-display";
     const nodes = [
       { id: "private-seed-build", label: "Verify build", state: "completed", attempt: 1, dependsOn: [],
-        route: { kind: "category", category: "quick" }, prompt: privateText },
-      { id: "private-seed-test", label: privateText, state: "completed", attempt: 1, dependsOn: ["private-seed-build"],
-        route: { kind: "agent", agent: "explore", model: privateText }, prompt: privateText },
+        route: { kind: "category", category: "quick" }, taskId, prompt: privateText },
+      { id: "private-seed-test", label: "Review test output", state: "completed", attempt: 1, dependsOn: ["private-seed-build"],
+        route: { kind: "agent", agent: "explore", model: "fixture/review" }, prompt: privateText },
     ];
     const taskRecord = JSON.stringify({
       task_id: taskId, status: "completed", residency_state: "persisted_only", task_summary: "Run tests",
       parent_session_id: owner, root_session_id: owner, depth: 1, execution_mode: "in-process",
       model: "fixture/fixture", category: "quick", notify_on_terminal: false, created_at: now, updated_at: now,
-      notification: { run_epoch: 0, notified_epoch: 0 }, final_response: privateText, description: privateText,
+      effective_model: { provider: "observed-provider", model_id: "observed-model",
+        display: "observed-provider/observed-model", reasoning: "high", source: "explicit" },
+      notification: { run_epoch: 0, notified_epoch: 0 }, final_response: privateText,
+      error_message: privateText, description: "Run the isolated suite",
     });
     const dagRecord = JSON.stringify({
       schemaVersion: 1, checkpointSeq: 0, runId, runKey: "private-seed", name: "Verify build",
@@ -520,21 +645,36 @@ realRuntime("reads two real Web bindings and seeded DAG/task records through iso
       criticalPath: ["private-seed-build", "private-seed-test"], bottlenecks: [],
     });
     await Promise.all([writeFile(taskPath, taskRecord), writeFile(dagPath, dagRecord)]);
-    const { body, detail } = await listedDag(a);
+    const body = await (await fetch(a)).json();
+    expect(body).toMatchObject({ tasks: { status: "ok" } });
+    const linkedKey = taskKey.parse(taskKeys.parse(body).tasks.rows[0]?.key);
     expect(body).toMatchObject({
-      tasks: { status: "ok", rows: [{ category: "quick", executionMode: "in-process" }] },
-      dag: { status: "ok", rows: [{ nodeCount: 2, counts: { completed: 2 } }] },
+      tasks: { status: "ok", rows: [{ key: linkedKey, category: "quick", executionMode: "in-process",
+        title: "Run tests", description: "Run the isolated suite", configuredModel: "fixture/fixture",
+        effectiveModel: { provider: "observed-provider", modelId: "observed-model", reasoning: "high" } }] },
+      dag: unknownWindow,
     });
     expect(JSON.stringify(body)).not.toContain(privateText);
-    expect(await (await fetch(detail)).json()).toEqual({ status: "ok", runStatus: "completed",
+    const history = await (await fetch(new URL(`${a.pathname}/dag-history`, a))).json();
+    expect(history).toMatchObject({ status: "ok", coverage: "native_window",
+      rows: [{ name: "Verify build", nodeCount: 2, counts: { completed: 2 } }] });
+    const key = z.object({ rows: z.tuple([z.object({ key: z.string() })]) }).parse(history).rows[0].key;
+    const detail = new URL(`${a.pathname}/dag/${key}?scope=history`, a);
+    const graph = await (await fetch(detail)).text();
+    expect(graph).not.toContain(privateText);
+    for (const id of [taskId, runId, "private-seed-build", "private-seed-test"]) {
+      expect(`${JSON.stringify(body)}${JSON.stringify(history)}${graph}`).not.toContain(id);
+    }
+    expect(JSON.parse(graph)).toEqual({ status: "ok", runStatus: "completed", name: "Verify build", createdAt: Date.parse(now),
       waves: [{ index: 0, nodes: [0] }, { index: 1, nodes: [1] }],
-      nodes: [{ id: 0, state: "completed", attempt: 1, category: "quick", upstream: [] },
-        { id: 1, state: "completed", attempt: 1, agent: "explore", upstream: [0] }],
+      nodes: [{ id: 0, state: "completed", attempt: 1, category: "quick", label: "Verify build", taskKey: linkedKey, upstream: [] },
+        { id: 1, state: "completed", attempt: 1, agent: "explore", label: "Review test output",
+          configuredModel: "fixture/review", upstream: [0] }],
     });
     expect(await (await fetch(b)).json()).toEqual({
-      tasks: { status: "empty" }, dag: { status: "empty" }, memory: { status: "ok", totalSteps: 0, reflectedSteps: 0 },
+      tasks: { status: "empty" }, dag: unknownWindow, memory: { status: "ok", totalSteps: 0, reflectedSteps: 0 },
     });
-    const cross = new URL(`${b.pathname}/dag/${detail.pathname.split("/").at(-1)}`, b);
+    const cross = new URL(`${b.pathname}/dag/${key}?scope=history`, b);
     expect(await (await fetch(cross)).json()).toEqual({ status: "not_found" });
     expect(await Promise.all([readFile(taskPath, "utf8"), readFile(dagPath, "utf8")])).toEqual([taskRecord, dagRecord]);
     console.log("Native runtime HTTP verified: Senpi 2026.11.23, two private stdio bindings, seeded read-only topology");

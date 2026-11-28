@@ -1,16 +1,62 @@
-import { el, object, str } from "./dom.ts";
+import { el, num, object, str } from "./dom.ts";
 import type { Wire } from "./dom.ts";
-import { knownActivityState } from "./native-activity.ts";
-import { tr } from "./locale.ts";
+import { knownActivityState, timeText } from "./native-activity.ts";
+import { tr, uiLocale } from "./locale.ts";
 
 // Match the server projection's node limit; at most N * (N - 1) / 2 edges
 // survive the strictly earlier-wave and unique-upstream checks.
 export const MAX_DAG_NODES = 64;
 const svgNS = "http://www.w3.org/2000/svg";
 let nextMarker = 0;
-type DagNode = { id: number; state: string; upstream: number[] };
+const opaqueRuntimeKey = /^[0-9a-f]{64}$/u;
+export const runtimeKey = (value: unknown): string => typeof value === "string" && opaqueRuntimeKey.test(value) ? value : "";
+export const executionTime = (value: unknown): number | undefined => {
+  const time = num(value);
+  return time !== undefined && Number.isSafeInteger(time) && Math.abs(time) <= 8.64e15 ? time : undefined;
+};
+export type ExecutionTimes = {
+  readonly createdAt?: number;
+  readonly startedAt?: number;
+  readonly completedAt?: number;
+  readonly lastActivityAt?: number;
+};
+export function executionTimes(data: Wire): ExecutionTimes {
+  return { createdAt: executionTime(data.createdAt), startedAt: executionTime(data.startedAt),
+    completedAt: executionTime(data.completedAt), lastActivityAt: executionTime(data.lastActivityAt) };
+}
+const clockNumber = new Intl.NumberFormat(uiLocale);
+export function executionTimeFacts({ createdAt, startedAt, completedAt, lastActivityAt }: ExecutionTimes): (readonly [string, string])[] {
+  const times: (readonly [string, string])[] = [];
+  for (const [label, value] of [[tr("创建", "Created"), createdAt], [tr("开始", "Started"), startedAt],
+    [tr("完成", "Completed"), completedAt], [tr("最近活动", "Last activity"), lastActivityAt]] as const) {
+    if (value !== undefined) times.push([label, timeText(value)]);
+  }
+  if (startedAt !== undefined && completedAt !== undefined && completedAt >= startedAt) {
+    const seconds = Math.floor((completedAt - startedAt) / 1000);
+    const minutes = clockNumber.format(Math.floor(seconds / 60));
+    const remainder = clockNumber.format(seconds % 60);
+    times.push([tr("耗时", "Elapsed"), seconds < 60 ? tr(`${remainder} 秒`, `${remainder}s`)
+      : tr(`${minutes} 分 ${remainder} 秒`, `${minutes}m ${remainder}s`)]);
+  }
+  return times;
+}
+export type DagNode = {
+  readonly id: number;
+  readonly state: string;
+  readonly upstream: readonly number[];
+  readonly attempt: number | undefined;
+  readonly agent: string;
+  readonly category: string;
+  readonly label: string;
+  readonly configuredModel: string;
+  readonly taskKey: string;
+  readonly times: ExecutionTimes;
+};
+export type DagWaves = readonly (readonly DagNode[])[];
+export const dagNodeLabel = (node: Pick<DagNode, "id" | "label">) =>
+  node.label || tr(`节点 ${node.id + 1}`, `Node ${node.id + 1}`);
 
-function projectedWaves(data: Wire) {
+export function readDagWaves(data: Wire): DagWaves | undefined {
   if (!Array.isArray(data.nodes) || !data.nodes.length || data.nodes.length > MAX_DAG_NODES ||
       !Array.isArray(data.waves) || !data.waves.length || data.waves.length > data.nodes.length) return;
   const nodeCount = data.nodes.length;
@@ -18,10 +64,14 @@ function projectedWaves(data: Wire) {
   const localIndex = (id: unknown): id is number =>
     typeof id === "number" && Number.isInteger(id) && id >= 0 && id < nodeCount;
   for (const raw of data.nodes) {
-    const { id, state, upstream } = object(raw);
+    const row = object(raw);
+    const { id, state, upstream, attempt, agent, category, label, configuredModel, taskKey } = row;
     if (!localIndex(id) || nodes.has(id) || !Array.isArray(upstream) || upstream.length >= nodeCount ||
         !upstream.every(localIndex) || new Set(upstream).size !== upstream.length) return;
-    nodes.set(id, { id, state: str(state), upstream });
+    // The server projects display text and replaces Native IDs with local indexes or opaque keys.
+    nodes.set(id, { id, state: str(state), upstream, agent: str(agent), category: str(category),
+      label: str(label), configuredModel: str(configuredModel), taskKey: runtimeKey(taskKey), times: executionTimes(row),
+      attempt: typeof attempt === "number" && Number.isSafeInteger(attempt) && attempt >= 0 ? attempt : undefined });
   }
   const positions = new Map<number, number>();
   const waves: DagNode[][] = [];
@@ -45,9 +95,7 @@ function projectedWaves(data: Wire) {
   return waves;
 }
 
-export function renderDagGraph(data: Wire): HTMLElement | undefined {
-  const waves = projectedWaves(data);
-  if (!waves) return;
+export function renderDagGraph(waves: DagWaves, openNode: (id: number) => void): HTMLElement {
   const cardWidth = 88;
   const cardHeight = 46;
   const gap = 16;
@@ -63,7 +111,8 @@ export function renderDagGraph(data: Wire): HTMLElement | undefined {
   const map = el("div", "dag-graph-map");
   map.tabIndex = 0;
   map.setAttribute("role", "region");
-  map.setAttribute("aria-label", tr("有向依赖图；可滚动，完整依赖见下方文字列表", "Scrollable directed dependency graph. See the text list below for all dependencies."));
+  map.setAttribute("aria-label", tr("可滚动的有向依赖图，完整依赖见节点详情。",
+    "Scrollable directed dependency graph. See node details for all dependencies."));
   const canvas = el("div", "dag-graph-canvas");
   const scale = (value: number) => `${value / 16}rem`;
 
@@ -75,7 +124,8 @@ export function renderDagGraph(data: Wire): HTMLElement | undefined {
     for (const [column, node] of row.entries()) {
       const x = inset + Math.max(0, (originWidth - rowWidth(row.length)) / 2) + column * (cardWidth + gap);
       boxes.set(node.id, { x: x + cardWidth / 2, y: y + headingHeight, wave });
-      const card = el("div", "dag-graph-node");
+      const card = el("button", "dag-graph-node");
+      card.type = "button";
       card.dataset.node = String(node.id);
       const label = knownActivityState(node.state);
       if (label) card.dataset.state = node.state;
@@ -83,7 +133,9 @@ export function renderDagGraph(data: Wire): HTMLElement | undefined {
       card.style.top = scale(y + headingHeight);
       card.style.width = scale(cardWidth);
       card.style.height = scale(cardHeight);
-      card.append(el("strong", "", tr(`节点 ${node.id + 1}`, `Node ${node.id + 1}`)),
+      card.title = dagNodeLabel(node);
+      card.addEventListener("click", () => openNode(node.id));
+      card.append(el("strong", "", dagNodeLabel(node)),
         el("span", "", node.state === "blocked" ? tr("被依赖阻塞", "Blocked") : label ?? tr("状态未知", "Unknown")));
       canvas.append(card);
     }

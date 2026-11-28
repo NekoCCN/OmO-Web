@@ -13,8 +13,9 @@ let reads = 0;
 let lists = 0;
 let openings = 0;
 const paging = mode?.startsWith("tree-");
-let leafId: string | null = mode === "tree-null-leaf" ? null : "entry-42";
-const pagingEntries = Array.from({ length: mode === "tree-budget" ? 201 : 45 }, (_, i) => ({
+let leafId: string | null = mode === "tree-null-leaf" ? null :
+  mode === "tree-todo-snapshots" ? "entry-200" : "entry-42";
+const pagingEntries = Array.from({ length: mode === "tree-budget" || mode === "tree-todo-snapshots" ? 201 : 45 }, (_, i) => ({
   id: `entry-${i}`, parentId: i === 0 ? null : `entry-${i - 1}`, type: "message",
   message: { role: "assistant", content: [{ type: "text", text: secret }] },
 }));
@@ -27,6 +28,13 @@ const activeMemory = { id: "entry-4", parentId: "entry-3", type: "custom", custo
 const labelRecord = { id: "entry-44", parentId: "entry-43", type: "label",
   targetId: "entry-3", label: secret };
 const runId = "dag_22222222-2222-4222-8222-222222222222";
+const taskId = "st_12345678";
+const siblingId = "st_12345679";
+const missingId = "st_12345670";
+const dagTasks = mode?.startsWith("select-");
+const historyRunId = (i: number) => `dag_33333333-3333-4333-8333-${String(i).padStart(12, "0")}`;
+const todoDetails = (tasks: readonly { content: string; status: string }[]) =>
+  ({ schema: "v2", phases: [{ name: "Checks", tasks }], ask: { text: secret } });
 
 function todoEntries() {
   const tasks = mode === "todo-zero" ? [{ content: "Done", status: "completed" }]
@@ -54,7 +62,7 @@ for await (const line of createInterface({ input: process.stdin })) {
       reply({});
       break;
     case "open_session":
-      if (paging && ++openings > 1) {
+      if ((paging || dagTasks) && ++openings > 1) {
         route = `rpc-private-route-${openings}`;
         durable = `native-private-durable-${openings}`;
       }
@@ -100,6 +108,18 @@ for await (const line of createInterface({ input: process.stdin })) {
         console.log(JSON.stringify({ type: "session_replaced", sessionId: route }));
       }
       const entries = paging ? pagingEntries.map((entry, i) => {
+        if (mode === "tree-todo-snapshots" && i >= 194) {
+          const task = { content: "Closed item", status: "completed" };
+          const tasks = i === 194 ? Array(501).fill({ content: secret.repeat(27), status: "pending" })
+            : i === 196 || i === 198 ? [{ content: secret, status: "pending" }]
+            : i === 199 ? [] : i === 200 ? [{ content: "Current item", status: "in_progress" },
+              { content: "Done item", status: "completed" }] : [task];
+          const data = todoDetails(tasks);
+          return i === 197 || i === 198 ? { ...entry, parentId: i === 197 ? "entry-195" : entry.parentId,
+            message: { role: "toolResult", toolName: "todo", details: { ...data, op: i === 197 ? "done" : "view" } } }
+            : { id: entry.id, parentId: i === 196 ? "entry-194" : entry.parentId,
+              type: "custom", customType: "senpi.todo-state", data };
+        }
         if (i === 2) return siblingMemory;
         if (i === 3) return activeTodo;
         if (i === 4 && mode === "tree-cycle") return { ...entry, parentId: "entry-6" };
@@ -112,7 +132,10 @@ for await (const line of createInterface({ input: process.stdin })) {
       }) : todoEntries();
       const end = cmd.before === undefined ? entries.length : entries.findIndex(entry => entry.id === cmd.before);
       if (end < 0) { reply({}, "not_found"); break; }
-      const start = mode === "tree-giant" && cmd.before === undefined ? end - 1 : Math.max(0, end - cmd.tail);
+      let start = mode === "tree-giant" && cmd.before === undefined ? end - 1 : Math.max(0, end - cmd.tail);
+      if (mode === "tree-todo-snapshots") {
+        while (start < end - 1 && Buffer.byteLength(JSON.stringify(entries.slice(start, end))) > 262144) start++;
+      }
       const page = entries.slice(start, end);
       if (mode === "tree-repeat" && cmd.before !== undefined) {
         reply({ entries: [entries[end]], leafId, hasMore: true, next_before: cmd.before });
@@ -144,38 +167,63 @@ for await (const line of createInterface({ input: process.stdin })) {
       }
       if (cmd.name === "omo.task.list" && data.parent_session_id === durable && Object.keys(data).length === 1) {
         if (mode === "route-change") console.log(JSON.stringify({ type: "session_released", sessionId: route }));
-        const row = { task_id: secret, status: "error", created_at: time, updated_at: time,
-          description: secret, task_summary: secret, error_message: secret, final_response: secret,
-          ...(mode?.startsWith("select-") ? { name: "Review changes", agent_type: "explore",
+        const row = { task_id: dagTasks ? taskId : secret, status: "error", created_at: time, updated_at: time,
+          error_message: secret, final_response: secret,
+          ...(dagTasks ? { name: secret, agent_type: "explore", task_summary: "Review changes",
+            description: "\u001b[32mInspect\tchanges\u001b[0m\u202e", model: "fixture/requested",
+            effective_model: { provider: "fixture", model_id: "observed", reasoning: "high", error: secret },
             category: `${secret} /home/private`, execution_mode: "in-process" } : {}) };
-        reply(mode === "configured-unavailable" ? { kind: "unavailable", reason: secret }
-          : { parent_session_id: mode === "foreign-task" ? secret : durable,
+        const sibling = { ...row, task_id: siblingId, description: "测".repeat(108) + secret,
+          model: "fixture/fallback", effective_model: { provider: "fixture", model_id: "/home/private" } };
+        const unobserved = { ...row, task_id: "st_12345671", task_summary: "Prepare checks", description: secret,
+          description_truncated: true, model: "fixture/assigned", effective_model: undefined,
+          resolved_model: { provider: "fixture", model_id: "not-observed" } };
+        const tasks = mode === "select-task-duplicate" ? [row, { ...sibling, task_id: taskId }]
+          : mode === "select-task-truncated" ? [row, ...Array.from({ length: 255 }, (_, i) =>
+            ({ ...sibling, task_id: `st_${i.toString(16).padStart(8, "0")}` }))] : [row, sibling, unobserved];
+        reply(mode === "configured-unavailable" || mode === "select-task-unavailable" ? { kind: "unavailable", reason: secret }
+          : { parent_session_id: mode === "foreign-task" || mode === "select-task-foreign" ? secret : durable,
             tasks: mode === "invalid" ? [{ ...row, status: secret }]
-              : mode === "oversize" ? Array(257).fill(row) : mode === "empty" ? [] : [row] });
-      } else if (cmd.name === "omo.dag.list" && data.limit === 256 && Object.keys(data).length === 1) {
+              : mode === "oversize" ? Array(257).fill(row) : mode === "empty" ? [] : dagTasks ? tasks : [row],
+            ...(mode === "select-task-truncated" ? { truncated_tasks: 4 } : {}) });
+      } else if (cmd.name === "omo.dag.list" && data.limit === 256) {
+        const active = JSON.stringify(data.statuses) === '["pending","running","paused"]';
+        const history = JSON.stringify(data.statuses) === '["completed","failed","cancelled"]';
+        if (!active && !history) { reply({}, "wrong_scope"); break; }
         if (mode === "dag-unavailable") { reply({ ok: false, error: { code: "history_unavailable", message: secret } }); break; }
         lists++;
         const selectable = mode?.startsWith("select-");
-        reply({ ok: true, value: { limit: 256, runs: mode === "empty" || (mode === "select-delisted" && lists > 1) ? [] : [{
-          runId: selectable ? runId : secret, name: selectable ? "Verify build" : secret,
+        const row = {
+          runId: selectable ? runId : secret, ...(selectable ? { name: "Verify build" } : {}),
           parentSessionId: mode === "foreign-dag" ? secret : durable,
           status: "running", createdAt: time, updatedAt: time,
           counts: { total: mode === "invalid-dag" ? -1 : 3, ...(selectable ? { running: 1, completed: 2 } : {}) },
           nodes: [{ prompt: secret }], lastSeq: 42,
-        }] } });
-      } else if (cmd.name === "omo.dag.snapshot" && data.runId === runId && Object.keys(data).length === 1) {
+        };
+        const runs = mode === "empty" || (active && mode === "select-saturated") ||
+          (mode === "select-delisted" && lists > 1) ? [] :
+          history && (mode === "select-split" || mode === "select-saturated") ?
+            Array.from({ length: mode === "select-split" ? 255 : 256 }, (_, i) =>
+            ({ ...row, status: "completed", runId: historyRunId(i) })) :
+          !history || mode === "select-wrong-scope" ? [row] : [];
+        reply({ ok: true, value: { limit: 256, runs } });
+      } else if (cmd.name === "omo.dag.snapshot" && (data.runId === runId || data.runId === historyRunId(0)) &&
+          Object.keys(data).length === 1) {
         if (mode === "select-release") console.log(JSON.stringify({ type: "session_released", sessionId: route }));
         const a = "private-build-id", b = "private-test-id", c = "private-report-id";
         const nodes = [
-          { id: a, state: "completed", attempt: 1, dependsOn: [], label: "Verify build",
-            route: { kind: "agent", agent: "explore", model: `${secret} /home/private` } },
-          { id: b, state: "completed", attempt: 2, dependsOn: [], label: `Run tests ${secret}`,
-            route: { kind: "category", category: `quick ${secret}` } },
+          { id: a, state: "completed", attempt: 1, dependsOn: [], label: "Inspect\u202e build", taskId,
+            startedAt: time, completedAt: time, lastActivityAt: secret,
+            route: { kind: "agent", agent: "explore", model: "fixture/node-override" } },
+          { id: b, state: "completed", attempt: 2, dependsOn: [], label: `<b>${secret}</b>`, taskId: siblingId,
+            route: { kind: "agent", agent: `explore ${secret}`, model: `fixture/${"x".repeat(128)}` } },
           { id: c, state: "running", attempt: 1, dependsOn: [b], label: "/home/private",
-            route: { kind: "category", category: "quick" } },
+            taskId: missingId, route: { kind: "category", category: "quick" } },
         ].map(node => ({ ...node, prompt: secret, output: secret, error: secret }));
-        reply({ ok: true, value: { schemaVersion: 1, runId,
-          parentSessionId: mode === "select-foreign" ? secret : durable, status: "running", counts: { total: 3 },
+        reply({ ok: true, value: { schemaVersion: 1, runId: data.runId, name: "Verify build",
+          createdAt: time, startedAt: time, completedAt: secret,
+          parentSessionId: mode === "select-foreign" ? secret : durable,
+          status: data.runId === runId && mode !== "select-crossed" ? "running" : "completed", counts: { total: 3 },
           nodes: mode === "select-overbudget" ? Array(65).fill(nodes[0]) : nodes,
           edges: [{ from: mode === "select-malformed" ? c : a, to: c }],
           waves: [{ index: 0, nodeIds: [a, b] }, { index: 1, nodeIds: [c] }],

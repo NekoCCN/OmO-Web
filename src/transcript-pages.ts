@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebError, pick, record, transcriptMessage } from "./protocol.ts";
 import type { WireObject } from "./protocol.ts";
+import { parseSkillInput, skillInputInstructions, skillInputNames } from "./skill-input.ts";
 
 const KiB = 1024;
 export const TRANSCRIPT_PAGE_BYTES = 256 * KiB;
@@ -115,6 +116,22 @@ function preview(row: WireObject): WireObject {
   return small;
 }
 
+function pagedSkill(row: WireObject, cursor: string): { readonly row: WireObject; readonly instructions: string } | undefined {
+  if (row.role !== "user") return;
+  const blocks = Array.isArray(row.content) ? row.content : undefined;
+  const texts = blocks?.filter((part: WireObject) => part.type === "text");
+  const text = typeof row.content === "string" ? row.content : texts?.length === 1 ? texts[0]?.text : undefined;
+  const skill = typeof text === "string" ? parseSkillInput(text) : undefined;
+  if (!skill) return;
+  const projected = {
+    ...row,
+    content: blocks ? blocks.map((part: WireObject) => part.type === "text" ? { type: "text", text: skill.request } : part) : skill.request,
+    historyContent: { cursor, skillNames: skillInputNames(skill) },
+  };
+  // Keep the entire request and every already-admitted non-text block, or use the existing fallback.
+  if (jsonBytes(projected) <= INLINE_BYTES) return { row: projected, instructions: skillInputInstructions(skill) };
+}
+
 /** A per-capture ring: write projected rows in Native order, evict whole oldest rows on wrap.
  * Offsets, lengths and counters are the only retained history index; no Native raw row goes to disk. */
 export class TranscriptCapture {
@@ -154,20 +171,22 @@ export class TranscriptCapture {
     const size = jsonBytes(row);
     if (compatibility && size > COMPAT_ROW_BYTES) { this.markOmitted(); return; }
     if (size > INLINE_BYTES) {
+      const cursor = this.#token(CONTENT, this.#next, 0);
+      const skill = pagedSkill(row, cursor);
       const role = row.role;
-      const text = role === "user" || role === "assistant" || role === "custom"
+      const text = skill?.instructions ?? (role === "user" || role === "assistant" || role === "custom"
         ? typeof row.content === "string" ? row.content
           : Array.isArray(row.content) && row.content.length === 1 ? record(row.content[0]).text : undefined
-        : undefined;
-      const small = preview(row);
-      if (typeof text === "string" && text.length > PREVIEW_UNITS) {
+        : undefined);
+      const small = skill?.row ?? preview(row);
+      if (typeof text === "string" && (skill || text.length > PREVIEW_UNITS)) {
         for (let start = 0; start < text.length;) {
           const end = textEnd(text, start, TEXT_UNITS);
           // JSON string records preserve lone surrogates as well as valid Unicode pairs.
           chunks.push(Buffer.from(JSON.stringify(text.slice(start, end))));
           start = end;
         }
-        small.historyContent = { cursor: this.#token(CONTENT, this.#next, 0) };
+        if (!skill) small.historyContent = { cursor };
         // Other large fields aren't expanded by this text cursor.
         if (Object.keys(small).some(key => key !== "content" && key !== "historyContent" && small[key] !== row[key])) {
           this.markOmitted();

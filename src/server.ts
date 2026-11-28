@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z, ZodError } from "zod";
 import { CliHistory } from "./cli-history.ts";
-import type { CliSessionSummary } from "./cli-history.ts";
+import type { ScopedSummary } from "./cli-history.ts";
 import { Engine } from "./engine.ts";
 import type { EngineStatus } from "./engine.ts";
 import { modelTarget } from "./model-options.ts";
@@ -37,6 +37,8 @@ const MAX_REQUEST_BYTES = 12 * 1024 * 1024;
 const MAX_JSON_BYTES = 512 * 1024;
 const MAX_SSE_FRAME_BYTES = 96 * 1024;
 const MAX_STREAM_CLIENTS = 16;
+const MAX_HISTORY_DIRECTORIES = 32;
+const MAX_HISTORY_SELECTIONS_PER_DIRECTORY = 400;
 const SSE_PREFIX = "event: omo\ndata: ";
 const SSE_SUFFIX = "\n\n";
 const LIVE_TRANSCRIPT_EVENTS = new Set([
@@ -138,14 +140,20 @@ export async function startApp(settings: AppSettings) {
   const profile = settings.cliAgentDir?.trim() || undefined;
   const history = new CliHistory(profile, workspaces);
   const native = new NativeActivity(profile);
-  let historySessions = new Map<string, CliSessionSummary & { readonly nativeSessionId: string; readonly workspaceKey?: string }>();
-  const historyKey = (session: CliSessionSummary & { readonly workspaceKey?: string }) =>
+  let legacyHistorySessions = new Map<string, ScopedSummary>();
+  const scopedHistorySessions = new Map<string, Map<string, ScopedSummary>>();
+  const historyKey = (session: ScopedSummary) =>
     createHmac("sha256", tokenBytes).update(JSON.stringify([session.cwd, session.id, session.workspaceKey])).digest("hex");
-  async function activityFor(durableId: string, cwd: string): Promise<Response> {
-    if (await workspaces.exact(cwd) === undefined) {
+  async function activityFor(durableId: string, cwd: string, expectedKey?: string): Promise<Response> {
+    const key = await workspaces.exact(cwd);
+    if (key === undefined || (expectedKey !== undefined && key !== expectedKey)) {
       throw new WebError(403, "workspace_refused", "此工作目录已不可用。");
     }
-    return activityResponse(await native.read(durableId, cwd));
+    const data = await native.read(durableId, cwd);
+    if (expectedKey !== undefined && await workspaces.exact(cwd) !== expectedKey) {
+      throw new WebError(403, "workspace_refused", "此工作目录已不可用。");
+    }
+    return activityResponse(data);
   }
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const disconnect = (client: ReadableStreamDefaultController<Uint8Array>) => {
@@ -216,7 +224,16 @@ export async function startApp(settings: AppSettings) {
       ...(cliProfileDir === undefined ? {} : { profileDir: cliProfileDir }) });
   try { await sessions.load(); } catch (error) { await sendFile?.stop(); throw error; }
   async function selectedHistory(id: string | undefined) {
-    const selected = id === undefined ? undefined : historySessions.get(id);
+    let selected = id === undefined ? undefined : legacyHistorySessions.get(id);
+    if (id !== undefined) {
+      for (const catalog of scopedHistorySessions.values()) {
+        const row = catalog.get(id);
+        if (row !== undefined) {
+          selected = row;
+          break;
+        }
+      }
+    }
     if (!selected || selected.workspaceKey === undefined || await workspaces.exact(selected.cwd) !== selected.workspaceKey) {
       throw new WebError(404, "history_not_found", "找不到这条 CLI 历史，请刷新列表。");
     }
@@ -260,17 +277,57 @@ export async function startApp(settings: AppSettings) {
           return listing;
         }
         if (pathname === "/api/cli-history") {
-          const { available, sessions: rows } = await history.listWithIds();
-          historySessions = new Map(rows.map(row => [historyKey(row), row]));
-          return json({
-            available,
-            sessions: [...historySessions].map(([id, { name, cwd, updatedAt, nativeSessionId, workspaceKey }]) => ({
-              id, name, cwd, updatedAt,
-              // Coalesce logical aliases by native id and cwd: an adopted row
-              // enters the existing Web alias (holder admission still applies).
-              adopted: sessions.findAlias(nativeSessionId, cwd, workspaceKey) !== undefined,
-            })),
-          });
+          const requested = searchParams.has("cwd") ? workspacePath.shape.path.parse(searchParams.get("cwd")) : undefined;
+          if (requested !== undefined && searchParams.size !== 1) {
+            throw new WebError(400, "invalid_request", "请求参数不正确。");
+          }
+          const scope = requested === undefined ? undefined : { root: requested, workspaceKey: await workspaces.exact(requested) };
+          if (scope !== undefined && scope.workspaceKey === undefined) {
+            throw new WebError(403, "workspace_refused", "此工作目录未获授权或已不可用。");
+          }
+          const { available, sessions: rows } = await history.listWithIds(scope);
+          if (scope !== undefined && await workspaces.exact(scope.root) !== scope.workspaceKey) {
+            throw new WebError(403, "workspace_refused", "此工作目录未获授权或已不可用。");
+          }
+          const returned = new Map<string, ScopedSummary>();
+          const result: { id: string; name: string; cwd: string; updatedAt: number; adopted: boolean }[] = [];
+          let bytes = Buffer.byteLength(JSON.stringify({ available, sessions: [] }));
+          const entries = rows.map(row => [historyKey(row), row] as const);
+          // Preserve the legacy last-row value for duplicated recorded IDs.
+          for (const [id, row] of scope === undefined ? new Map(entries) : entries) {
+            if (returned.has(id)) continue;
+            const { cwd, updatedAt, nativeSessionId, workspaceKey } = row;
+            const name = scope === undefined ? row.name : row.name.slice(0, 256);
+            const summary = { id, name, cwd, updatedAt, adopted: sessions.findAlias(nativeSessionId, cwd, workspaceKey) !== undefined };
+            if (scope !== undefined) {
+              bytes += Buffer.byteLength(JSON.stringify(summary)) + Number(result.length > 0);
+              if (bytes > MAX_JSON_BYTES) break;
+            }
+            result.push(summary);
+            returned.set(id, row.name === name ? row : { ...row, name });
+          }
+          if (scope === undefined) {
+            legacyHistorySessions = returned;
+          } else if (returned.size) {
+            // Keep recently returned references independently per directory.
+            // A hot bucket cannot churn a different directory's selections.
+            const catalog = scopedHistorySessions.get(scope.root) ?? new Map<string, ScopedSummary>();
+            for (const [id, row] of returned) {
+              catalog.delete(id);
+              catalog.set(id, row);
+            }
+            for (const id of catalog.keys()) {
+              if (catalog.size <= MAX_HISTORY_SELECTIONS_PER_DIRECTORY) break;
+              catalog.delete(id);
+            }
+            scopedHistorySessions.delete(scope.root);
+            scopedHistorySessions.set(scope.root, catalog);
+            for (const cwd of scopedHistorySessions.keys()) {
+              if (scopedHistorySessions.size <= MAX_HISTORY_DIRECTORIES) break;
+              scopedHistorySessions.delete(cwd);
+            }
+          }
+          return json({ available, sessions: result });
         }
         const historyRoute = /^\/api\/cli-history\/([a-f0-9]{64})(\/activity)?$/.exec(pathname);
         if (historyRoute) {
@@ -278,7 +335,7 @@ export async function startApp(settings: AppSettings) {
           const selected = await selectedHistory(id);
           const { session, messages, internal } = await history.read(selected.id, selected.cwd, selected.workspaceKey);
           if (session.cwd !== selected.cwd) throw new WebError(404, "history_not_found", "找不到这条 CLI 历史，请刷新列表。");
-          if (activity) return await activityFor(internal.nativeSessionId, session.cwd);
+          if (activity) return await activityFor(internal.nativeSessionId, session.cwd, selected.workspaceKey);
           const { name, cwd, updatedAt } = session;
           const preview = jsonWithin({ session: { id, name, cwd, updatedAt,
             adopted: sessions.findAlias(internal.nativeSessionId, session.cwd, selected.workspaceKey) !== undefined }, messages },
@@ -368,14 +425,20 @@ export async function startApp(settings: AppSettings) {
         }
       }
       const dag = /^\/api\/sessions\/([a-z0-9-]+)\/native-runtime\/dag\/([a-f0-9]{64})$/u.exec(pathname);
-      if (request.method === "GET" && dag?.[2]) return json(await sessions.nativeDag(sessionKey.parse(dag[1]), dag[2]));
+      if (request.method === "GET" && dag?.[2]) {
+        const [scope = "current", ...extra] = searchParams.getAll("scope");
+        if (extra.length || (scope !== "current" && scope !== "history")) {
+          throw new WebError(400, "invalid_request", "请求参数不正确。");
+        }
+        return json(await sessions.nativeDag(sessionKey.parse(dag[1]), dag[2], scope));
+      }
       const attachment = /^\/api\/sessions\/([a-z0-9-]+)\/attachments\/([a-f0-9-]+)$/u.exec(pathname);
       if (request.method === "GET" && attachment?.[2] && sendFile) {
         const id = sessionKey.parse(attachment[1]);
         await sessions.authorizeAttachment(id);
         return await sendFile.store.download(id, attachment[2], request.headers);
       }
-      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|queue|tree|branch-runtime|instructions|capabilities|activity|native-runtime|workbench-status|actions|branch-options|branches|handoff|last-assistant|transcript(?:\/content)?))?$/i.exec(pathname);
+      const route = /^\/api\/sessions\/([a-z0-9-]+)(?:\/(options|model-preview|details|queue|tree|branch-runtime|instructions|capabilities|activity|native-runtime(?:\/dag-history)?|todo-history|workbench-status|actions|branch-options|branches|handoff|last-assistant|transcript(?:\/content)?))?$/i.exec(pathname);
       if (route) {
         const id = sessionKey.parse(route[1]);
         if (request.method === "POST" && route[2] === "actions") {
@@ -415,14 +478,21 @@ export async function startApp(settings: AppSettings) {
             if (searchParams.size !== 1) throw new WebError(400, "invalid_request", "请求参数不正确。");
             return json(await sessions.tree(id, treeCursor.parse(searchParams.get("cursor"))));
           }
-          if ((route[2] === "details" || route[2] === "queue" || route[2] === "branch-runtime" || route[2] === "workbench-status") &&
+          if ((route[2] === "details" || route[2] === "queue" || route[2] === "workbench-status" ||
+              route[2] === "native-runtime/dag-history" || route[2] === "todo-history") &&
               searchParams.size > 0) throw new WebError(400, "invalid_request", "请求参数不正确。");
           if (route[2] === "details") return json(await sessions.details(id));
           if (route[2] === "queue") return json(await sessions.queue(id));
-          if (route[2] === "branch-runtime") return json(await sessions.branchRuntime(id));
+          if (route[2] === "branch-runtime") {
+            if (searchParams.size === 0) return json(await sessions.branchRuntime(id));
+            if (searchParams.size === 1 && searchParams.get("scope") === "todo") return json(await sessions.currentTodo(id));
+            throw new WebError(400, "invalid_request", "请求参数不正确。");
+          }
+          if (route[2] === "todo-history") return json(await sessions.todoHistory(id));
           if (route[2] === "instructions") return json(await sessions.instructions(id));
           if (route[2] === "capabilities") return json(await sessions.capabilities(id));
           if (route[2] === "native-runtime") return json(await sessions.nativeRuntime(id));
+          if (route[2] === "native-runtime/dag-history") return json(await sessions.nativeDagHistory(id));
           if (route[2] === "workbench-status") return json(await sessions.workbenchStatus(id));
           if (route[2] === "last-assistant") {
             const copy = jsonWithin(await sessions.lastAssistant(id), TRANSCRIPT_PAGE_BYTES);
