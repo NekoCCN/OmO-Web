@@ -142,6 +142,16 @@ for (const width of [1440, 390]) for (const theme of ["light", "dark"]) {
     await view.cdp("Page.addScriptToEvaluateOnNewDocument", { source: `
       localStorage.setItem("omo-web-theme", ${JSON.stringify(theme)});
       window.skillReads = [];
+      window.skillStreamReady = false;
+      window.EventSource = new Proxy(window.EventSource, {
+        construct(Type, args) {
+          const source = new Type(...args);
+          source.addEventListener("omo", event => {
+            if (JSON.parse(event.data).type === "ready") window.skillStreamReady = true;
+          });
+          return source;
+        },
+      });
       const performFetch = window.fetch;
       window.fetch = (input, options) => {
         const url = new URL(input instanceof Request ? input.url : input, location.href);
@@ -152,6 +162,8 @@ for (const width of [1440, 390]) for (const theme of ["light", "dark"]) {
     if (width === 390) await view.click("#open-navigation");
     const session = `#session-list button[data-session="${app.id}"]`;
     await waitFor(view, `document.querySelector(${JSON.stringify(session)})?.getClientRects().length`);
+    // Opening before the first SSE ready frame legitimately reconciles the first snapshot.
+    await waitFor(view, "window.skillStreamReady");
     await view.click(session);
     await waitFor(view, `document.querySelector(${JSON.stringify(pagedRow)})?.textContent.includes("large")`);
     const key = `${width}-${theme}`;
