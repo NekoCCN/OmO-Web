@@ -1,12 +1,12 @@
 # 分发选型
 
-**公开 npm 与 GitHub 发行独立更新。** 有仓库访问权限时，可从 GitHub [v0.1.5](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5) 下载 `0.1.5`，或从源码构建。本项目采用 [MIT 许可证](../LICENSE)，主 `package.json` 仍标记 `private: true`，避免误发源码目录。
+**公开 npm 与 GitHub 发行独立更新。** 有仓库访问权限时，可从 GitHub [v0.1.6](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.6) 下载 `0.1.6`，或从源码构建。本项目采用 [MIT 许可证](../LICENSE)，主 `package.json` 仍标记 `private: true`，避免误发源码目录。
 
 ## 首发：GitHub Releases + SHA-256
 
 - 不是包管理器：用户从 Releases 页或 `gh release download` 取两个文件，自行 `sha256sum -c` 校验后解压运行。
 - 发行资产遵循仓库访问权限。未上传资产的版本可从源码安装。
-- 校验可确认下载文件匹配发布的校验值，不证明发布者身份或其他平台可用；当前版本的验证范围见 [0.1.5 发行说明](releases/0.1.5.md#verification--验证范围)。
+- 校验可确认下载文件匹配发布的校验值，不证明发布者身份或其他平台可用；当前版本的验证范围见 [0.1.6 发行说明](releases/0.1.6.md#verification--验证范围)。
 
 安装与发版命令见 [安装与发版](install-release.md)。
 
@@ -21,7 +21,7 @@
 ## npm 安装格式
 
 - 公开作用域包的发布流程见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages)；私有 npm 包是付费套餐，见 [npm 官方文档](https://docs.npmjs.com/creating-and-publishing-private-packages)。
-- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。`npm install -g omo-web` 安装 [npm](https://www.npmjs.com/package/omo-web) 的 `latest`；不使用 registry 时，从 [GitHub v0.1.5](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5) 下载并校验 `.tgz`，再运行 `npm install -g ./omo-web-0.1.5.tgz`。启动器需要 Node.js 18+ 和 Bun，运行会话还需要 OmO Native。
+- `bun run npm:pack` 将运行文件组装为 `dist/npm/omo-web-<version>.tgz`。`npm install -g omo-web` 安装 [npm](https://www.npmjs.com/package/omo-web) 的 `latest`；不使用 registry 时，从 [GitHub v0.1.6](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.6) 下载并校验 `.tgz`，再运行 `npm install -g ./omo-web-0.1.6.tgz`。启动器需要 Node.js 18+ 和 Bun，运行会话还需要 OmO Native。
 - 独立 npm 包包含 MIT 与第三方许可；源码根目录保持私有标记，不直接向 registry 发布。维护者正式发布时应核对 SHA-256、登录的账号及 npm 的 2FA 要求，发布验证过的 `.tgz`。
 
 ## Homebrew：tap 与 core 是两回事
@@ -41,6 +41,6 @@
 | --- | --- |
 | GitHub Releases + SHA-256 | 有仓库访问权限可下载 |
 | GitHub Packages 私有 registry | 下一步候选，接受认证负担时 |
-| npm 安装 | `npm install -g omo-web` 安装 registry 的 `latest`；[GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5) 提供 `0.1.5` 的本地安装包 |
+| npm 安装 | `npm install -g omo-web` 安装 registry 的 `latest`；[GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.6) 提供 `0.1.6` 的本地安装包 |
 | Homebrew tap | 维护者自建 tap，不进 core；暂不做 |
 | Docker / GHCR | 有项目需要才评估 |

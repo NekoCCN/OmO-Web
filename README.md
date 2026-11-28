@@ -22,7 +22,7 @@ cd /path/to/your/project
 omo-web
 ```
 
-The npm command installs the registry's `latest`. To install `0.1.5` without the registry, [download the `.tgz` and its checksum from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.5), verify it, and run `npm install -g ./omo-web-0.1.5.tgz`. GitHub downloads require repository access.
+The npm command installs the registry's `latest`. To install `0.1.6` without the registry, [download the `.tgz` and its checksum from GitHub](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.6), verify it, and run `npm install -g ./omo-web-0.1.6.tgz`. GitHub downloads require repository access.
 
 In an interactive terminal, `omo-web` opens a launcher. Use the arrow keys and Enter to pick a working directory, edit **Access settings**, or start the service. Open the printed address (default `http://127.0.0.1:4317`). Stop the service from the launcher before changing settings. Access settings persist; directory edits apply only to the current launcher session. For scripts use `omo-web serve`. The launcher follows the system language (English / 简体中文, English fallback).
 
@@ -38,10 +38,10 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 
 Replace the example path with a directory that exists. `bun start` builds first and then starts; repeat runs can use `bun run serve` to skip the rebuild.
 
-Prefer the Bun-only archive? If you have repository access, download `omo-web-0.1.5.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
+Prefer the Bun-only archive? If you have repository access, download `omo-web-0.1.6.tar.gz` plus its `.sha256` from [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases), verify, and run the bundled server. No npm dependencies to install, but Bun and `omo` are still required:
 
 ```sh
-VERSION="0.1.5"
+VERSION="0.1.6"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
@@ -152,7 +152,7 @@ bun run build     # browser assets
 bun run serve     # start without rebuilding
 ```
 
-[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.5 notes](docs/releases/0.1.5.md) · [Distribution options](docs/distribution.md)
+[Usage details](docs/usage.md) · [Install, upgrade, and release](docs/install-release.md) · [0.1.6 notes](docs/releases/0.1.6.md) · [Distribution options](docs/distribution.md)
 
 [Web API](docs/web-api.md) · [CLI parity matrix](docs/parity/local-cli-web-matrix.md) · [Interface conventions](DESIGN.md)
 
