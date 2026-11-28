@@ -1,11 +1,34 @@
 import { expect, spyOn, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { sessionKey } from "../src/protocol.ts";
 import { AttachmentStore } from "../src/send-file.ts";
 import { startApp } from "../src/server.ts";
 import { WorkspaceAccess } from "../src/workspace-access.ts";
+
+test("attachment storage opens at the canonical data root and still rejects an aliased attachment directory", async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "omo-attachment-alias-")));
+  const data = join(root, "数据目录");
+  const alias = join(root, "data-alias");
+  const store = new AttachmentStore(alias);
+  const app = () => startApp({ dataDir: alias, workspaces: [root], port: 0, sendFile: true,
+    engineCommand: ["native-must-not-start"] });
+  const linkType = process.platform === "win32" ? "junction" : "dir";
+  try {
+    await mkdir(data, { mode: 0o700 });
+    await symlink(data, alias, linkType);
+    const server = await app();
+    try { expect((await fetch(server.url)).status).toBe(200); }
+    finally { await server.stop(); }
+    await store.load();
+    await store.close();
+    const attachments = join(data, "attachments");
+    await rename(attachments, join(data, "other"));
+    await symlink(join(data, "other"), attachments, linkType);
+    await expect(app()).rejects.toMatchObject({ code: "attachment_refused" });
+  } finally { await store.close(); await rm(root, { recursive: true, force: true }); }
+});
 
 test.each(["0", "-1", "1e6", "9007199254740992"])("invalid quota %s fails before the attachment service starts", async value => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "omo-attachment-config-")));

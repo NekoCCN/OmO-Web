@@ -32,7 +32,8 @@ function privateDirectory(info: Stats): boolean {
 }
 
 export class AttachmentStore {
-  readonly #directory: string;
+  readonly #dataDir: string;
+  #directory = "";
   #used = 0n;
   readonly #quota: bigint | undefined;
   #queue: Promise<unknown> = Promise.resolve();
@@ -40,11 +41,15 @@ export class AttachmentStore {
   #identity: { readonly dev: number; readonly ino: number } | undefined;
 
   constructor(dataDir: string, quotaBytes?: number) {
-    this.#directory = resolve(dataDir, "attachments");
+    this.#dataDir = resolve(dataDir);
     this.#quota = quotaBytes === undefined ? undefined : BigInt(quotaBytes);
   }
 
   async load(): Promise<void> {
+    await mkdir(this.#dataDir, { recursive: true, mode: 0o700 });
+    // The configured root can be a Windows short path or a mounted alias;
+    // the store itself must still be a real, stable private directory.
+    this.#directory = join(await realpath(this.#dataDir), "attachments");
     await mkdir(this.#directory, { recursive: true, mode: 0o700 });
     const directory = await lstat(this.#directory);
     if (!privateDirectory(directory) || await realpath(this.#directory) !== this.#directory) throw refused();
@@ -78,8 +83,9 @@ export class AttachmentStore {
   }
 
   async #verifyDirectory(): Promise<void> {
+    if (!this.#identity) throw refused();
     const directory = await lstat(this.#directory);
-    if (!this.#identity || !privateDirectory(directory) || directory.dev !== this.#identity.dev ||
+    if (!privateDirectory(directory) || directory.dev !== this.#identity.dev ||
       directory.ino !== this.#identity.ino || await realpath(this.#directory) !== this.#directory) throw refused();
   }
 
