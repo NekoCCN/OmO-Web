@@ -20,11 +20,11 @@ cd /path/to/your/project
 omo-web
 ```
 
-上面的命令安装公开 [npm](https://www.npmjs.com/package/omo-web) 的 `latest`。若不走 npm registry，可从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.8) 下载 `0.1.8` 的 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.8.tgz`。
+上面的命令安装公开 [npm](https://www.npmjs.com/package/omo-web) 的 `latest`。若不走 npm registry，可从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.9) 下载 `0.1.9` 的 `.tgz` 和校验文件，校验后运行 `npm install -g ./omo-web-0.1.9.tgz`。
 
 在交互终端运行 `omo-web`，用方向键和回车选择工作目录、进入「访问设置」或启动服务。打开它打印的地址，默认是 [http://127.0.0.1:4317](http://127.0.0.1:4317)。运行中要改设置，先停止服务；访问设置会保留，工作目录编辑只对本次 TUI 会话有效。脚本用 `omo-web serve` 直接启动。
 
-也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.8) 下载 Bun 运行包，或从源码运行：
+也可以从 [GitHub Release](https://github.com/NekoCCN/OmO-Web/releases/tag/v0.1.9) 下载 Bun 运行包，或从源码运行：
 
 ```sh
 git clone https://github.com/NekoCCN/OmO-Web.git
@@ -95,6 +95,6 @@ bun run release:pack
 bun run npm:pack
 ```
 
-[使用详解](docs/usage.md) · [安装与升级](docs/install-release.md) · [0.1.8 发行说明](docs/releases/0.1.8.md) · [发行方式](docs/distribution.md) · [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md)
+[使用详解](docs/usage.md) · [安装与升级](docs/install-release.md) · [0.1.9 发行说明](docs/releases/0.1.9.md) · [发行方式](docs/distribution.md) · [Web API](docs/web-api.md) · [CLI 功能对照](docs/parity/local-cli-web-matrix.md)
 
 OmO Web 采用 [MIT 许可证](LICENSE)。构建产物也包含所用第三方组件的许可。

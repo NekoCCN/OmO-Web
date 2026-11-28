@@ -27,7 +27,7 @@ OMO_WEB_WORKSPACES="$HOME/path/to/your-project" bun start
 有仓库访问权限时，可以从 [GitHub Releases](https://github.com/NekoCCN/OmO-Web/releases) 下载对应版本的 tar.gz 与同名 `.sha256`。校验后解压，用 Bun 直接跑包内入口，不装 npm 依赖：
 
 ```sh
-VERSION="0.1.8"
+VERSION="0.1.9"
 ARCHIVE="omo-web-$VERSION.tar.gz"
 sha256sum -c "$ARCHIVE.sha256" &&
   tar xzf "$ARCHIVE" &&
@@ -189,6 +189,7 @@ omo-web serve
 - **OmO 未连接**：在同一个终端确认 `omo --version` 能运行；必要时设置 `OMO_WEB_BIN`，再刷新页面。
 - **模型不存在或认证失败**：先用 Native CLI 配置模型和登录。Web 端不会收集或转存密钥。
 - **会话无法恢复**：确认保存的工作目录仍存在，并且依旧在 `OMO_WEB_WORKSPACES` 中；已经保存的记录不会被自动挪到其他目录。
+- **数据目录已被占用**：启动报错「数据目录 … 已被另一个 OmO Web 进程占用」表示同一数据目录上已经有一个服务在运行。先停止旧的 `omo-web serve` 再启动，或用 `OMO_WEB_DATA` 指向其他目录并行；报错里会给出占用进程的 PID（`~/.omo-web/omo-web.pid`）。多个实例不要共用同一数据目录，附件锁不会按进程互让。
 
 ## 开发与验证
 
